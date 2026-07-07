@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+from px4_vio_bridge.basalt_odometry_test import main
+
+
+if __name__ == "__main__":
+    main()

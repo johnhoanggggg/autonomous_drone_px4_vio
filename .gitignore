@@ -1,0 +1,30 @@
+# ROS 2 build outputs
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Local runtime output
+*.tlog
+*.tlog.raw
+*.ulg
+*.bag
+*.db3
+*.mcap
+ros2_ws/vslam_trajectory.txt
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+env/
+
+# Large local dependency checkouts/builds
+tools/
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+*~
