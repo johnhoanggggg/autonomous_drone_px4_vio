@@ -903,3 +903,31 @@ Full backup of all 1127 params saved to `params_backup_20260707_*.params` via ne
 
 ### Current running processes (healthy)
 `MicroXRCEAgent` (system v3.0.1 on `/dev/ttyAMA0`, launched via `xrce_agent:=/usr/local/bin/MicroXRCEAgent`), `rtabmap_vio_ros2.py` (stable ~10 Hz), `vio_to_px4_odometry` (rebuilt), `px4_local_position_to_ros`, `foxglove_bridge`. PX4 `uxrce_dds_client` `Running, connected`.
+
+## Latest Update - 2026-07-07 EV YAW FUSION ENABLED + VALIDATED
+
+External-vision **yaw** fusion is now enabled and validated on the bench (props off).
+
+### Change
+- `EKF2_EV_CTRL`: `3` (HPOS+VPOS) -> **`11`** (HPOS=1 + VPOS=2 + YAW=8). Set as a correct **integer** via NSH `param set EKF2_EV_CTRL 11; param save`, then `ekf2 stop; ekf2 start`. Verified with NSH `param show EKF2_EV_CTRL` -> `: 11` (saved). Do NOT set this over MAVLink/QGC float — see the int-param float-corruption note above; this session set it via NSH so it stored cleanly.
+
+### NSH access finally working from the Pi (important tooling win)
+New helper: `scripts/nsh.py` runs PX4 NSH commands over MAVLink `SERIAL_CONTROL` on `/dev/ttyACM0` @115200 (uses `.venv-mavlink`). Usage: `.venv-mavlink/bin/python scripts/nsh.py "param show EKF2_EV_CTRL" "ekf2 status"`. Each arg is one NSH line.
+- The prior blocker was the SERIAL_CONTROL flags: must send `RESPOND(2)|EXCLUSIVE(4)|MULTI(16)`, and must **NOT** set `REPLY(1)` (that marks the frame as an autopilot reply and PX4 ignores it as a command).
+- pymavlink on this box occasionally throws a `_instances`/`NoneType` parse error on connect — just retry (the helper's callers loop up to 3x).
+- Note: `/dev/ttyACM0` is single-reader. Don't run a MAVLink monitor (e.g. yaw watcher) and `nsh.py` at the same time — they conflict on the port.
+
+### Reading int params over MAVLink without NSH (verified this session)
+PX4 packs INT32 params into the PARAM_VALUE float field by **bit-reinterpret**. To recover the true int from pymavlink's `param_value` float: `struct.unpack('<i', struct.pack('<f', v))[0]`. Confirmed `EKF2_EV_CTRL`(type 6/INT32) read back as int `3` before the change while raw float showed `4.2e-45` (= bits `0x00000003`). This is the non-NSH way to check int params correctly.
+
+### Validation results (EKF2_EV_CTRL=11)
+- `estimator_aid_src_ev_yaw`: `fused: True`, `innovation ~0.01-0.04 rad`, `test_ratio < 0.003`, `innovation_rejected: False`.
+- `vehicle_local_position`: `heading` switched from mag (`3.13 rad`) to vision (`~1.54 rad`, = EV observation); `heading_var` dropped `0.00115 -> 0.00058`; **`heading_good_for_control` flipped `False -> True`**. `xy_valid`/`z_valid`/`v_xy_valid` stayed true; `ekf2 status` `local position: 1`, healthy. `heading_reset_counter` bumped 1->3 (expected reset-to-vision on fusion start).
+- **Physical rotation test:** rotated the drone in place; PX4 fused heading (watched live via MAVLink `ATTITUDE.yaw`, helper `scratchpad/yaw_watch.py`) tracked smoothly out to ~180deg and back to baseline with correct magnitude and correct direction, no jumps. Sign/frame convention in `vio_to_px4_odometry` (ENU/FLU -> NED/FRD) is therefore correct for yaw.
+
+### Persistent PX4 params now (flash)
+`UXRCE_DDS_SYNCC=0`, `UXRCE_DDS_SYNCT=0`, `EKF2_HGT_REF=3` (Vision), `EKF2_EV_CTRL=11` (HPOS+VPOS+YAW), `EKF2_GPS_CTRL=0`.
+
+### Notes / next steps
+- DDS came up `Running, connected` on this session's launch without needing the `uxrce_dds_client stop/start` dance (FCU had not rebooted).
+- Still bench-only. Before any flight, re-confirm `heading_good_for_control: True` and that EV yaw innovation stays low during sustained motion; watch for VIO yaw drift over longer runs.
