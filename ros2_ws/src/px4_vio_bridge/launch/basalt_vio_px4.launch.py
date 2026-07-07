@@ -52,9 +52,11 @@ def generate_launch_description():
             DeclareLaunchArgument("vio_yaw_offset_deg", default_value="0.0"),
             DeclareLaunchArgument("px4_local_path_size", default_value="300"),
             DeclareLaunchArgument("px4_local_path_publish_stride", default_value="10"),
+            # System v3.0.1 agent is the confirmed-working one on this serial link.
+            # The project-local v2.4.3 build did not complete a PX4 handshake (2026-07-07).
             DeclareLaunchArgument(
                 "xrce_agent",
-                default_value="/home/john/autonomous_drone_px4_vio/tools/Micro-XRCE-DDS-Agent-v2.4.3/build_static/MicroXRCEAgent",
+                default_value="/usr/local/bin/MicroXRCEAgent",
             ),
             DeclareLaunchArgument("xrce_device", default_value="/dev/ttyAMA0"),
             DeclareLaunchArgument("xrce_baud", default_value="921600"),

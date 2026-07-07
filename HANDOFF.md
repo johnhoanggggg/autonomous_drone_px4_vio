@@ -829,3 +829,77 @@ Cleanup done:
 - Restored `basalt_vio_rtabmap_slam_ros2.py` to its original pre-test shape.
 
 Current recommendation: keep the main launch on RTAB-Map VIO and do not spend more time on Basalt unless specifically debugging DepthAI/Basalt timestamp and shutdown behavior.
+
+## Latest Update - 2026-07-07 xy_valid Diagnosis
+
+Started from: `/fmu/out/vehicle_local_position_v1` had `xy_valid: false`, blocking position control.
+
+Ran the main launch:
+
+```bash
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge basalt_vio_px4.launch.py
+```
+
+Found two separate problems stacked on top of each other:
+
+1. **uXRCE-DDS client stuck disconnected (recurrence of the earlier documented issue).**
+   - The launch file's default `xrce_agent` is the project-local v2.4.3 static build. It attached to `/dev/ttyAMA0` (`lsof` confirmed fd open) but produced zero session/log output even at `-v 4` and stayed idle — it was not actually completing a handshake with PX4.
+   - Switched to the system agent with `xrce_agent:=/usr/local/bin/MicroXRCEAgent` (v3.0.1). This one logged real activity but got stuck in a `timeout during time synchronization` / `session setup failed, will retry now` loop. PX4 NSH showed `uxrce_dds_client status` -> `Running, disconnected`, `timesync converged: false`.
+   - Checked PX4 params over MAVLink USB NSH (`/dev/ttyACM0`, 115200, via `SERIAL_CONTROL` MAVLink shell + pymavlink): `UXRCE_DDS_SYNCC` and `UXRCE_DDS_SYNCT` were both still `1` (enabled).
+   - Fix (same as the earlier documented one, re-applied): 
+     ```sh
+     param set UXRCE_DDS_SYNCC 0
+     param set UXRCE_DDS_SYNCT 0
+     param save
+     uxrce_dds_client stop
+     uxrce_dds_client start -t serial -d /dev/ttyS2 -b 921600
+     ```
+   - After this, PX4 immediately created the full `rt/fmu/out/...` data-writer graph and ROS 2 showed `/fmu/out/vehicle_local_position_v1` and `/fmu/in/vehicle_visual_odometry` both with `Publisher count: 1, Subscription count: 1`. `z_valid` became `true`.
+   - Takeaway: prefer the system v3.0.1 agent (`/usr/local/bin/MicroXRCEAgent`) over the project-local v2.4.3 build going forward — the v2.4.3 build did not visibly attempt a handshake in this session. Also: `UXRCE_DDS_SYNCC`/`UXRCE_DDS_SYNCT` can silently revert/persist as enabled across sessions and are worth checking first whenever `uxrce_dds_client status` shows `disconnected` with `timesync converged: false`.
+
+2. **`xy_valid` stayed `false` even after the DDS link was healthy, because the OAK-D Lite VIO camera itself was crash-looping.**
+   - `rtabmap_vio_ros2.py` logs showed a repeating ~10s cycle: `Couldn't read data from stream ... (X_LINK_ERROR)` -> `Closed connection` -> `Device ... has crashed` (crash dumps written under `ros2_ws/.cache/depthai/crashdumps/`) -> `Reconnection successful` -> crash again.
+   - Confirmed `/basalt/pose` had zero messages (`ros2 topic hz /basalt/pose` timed out with nothing received), so `vio_to_px4_odometry` never actually called `.publish()` — its output topic existed (declared publisher) but carried no real data. With no vision source being fused and (presumably) no GPS on this indoor bench setup, EKF2 has nothing to fuse for horizontal position, hence `xy_valid: false`.
+   - Ruled out a USB-speed cause: `lsusb -t` shows the OAK-D Lite enumerating on the Bus 003 xhci-hcd SuperSpeed root hub at `5000M`, not downgraded to USB2 (`480M`), so this is not the classic OAK-D "wrong port" bandwidth problem.
+   - `python3 -c "import depthai as dai; dai.Device.getAllAvailableDevices()"` returned 0 devices while `rtabmap_vio_ros2.py` was still running/crash-looping, consistent with the process still holding a (crashing) handle to the device rather than the device being absent from the bus.
+   - Not yet resolved. This looks like the same category of OAK-D Lite instability already logged above for Basalt (native DepthAI/XLink crashes), just now also affecting the RTAB-Map path. Likely next steps: physically unplug/replug the OAK-D Lite (check USB cable/power, this Pi 5's USB3 ports can brown out sketchy cables/hubs under load), retry after a clean device state, and if it recurs, try lowering `rtabmap_fps` from the 30 default or capture a DepthAI crash dump for inspection (`ros2_ws/.cache/depthai/crashdumps/*.tar.gz`).
+
+Processes left running at end of this session: `MicroXRCEAgent` (system v3.0.1, `/dev/ttyAMA0`), `rtabmap_vio_ros2.py` (crash-looping), `vio_to_px4_odometry`, `px4_local_position_to_ros`, `foxglove_bridge`. PX4 param changes (`UXRCE_DDS_SYNCC=0`, `UXRCE_DDS_SYNCT=0`) were saved to PX4 flash via `param save`.
+
+## Latest Update - 2026-07-07 xy_valid RESOLVED
+
+`xy_valid` is now **`true`**. Two follow-on problems from the section above were fixed, and then the real root cause was found.
+
+### 1. OAK-D Lite crash-loop fixed by power cycle
+The `X_LINK_ERROR` crash-loop cleared after the user physically power-cycled the OAK-D Lite (the whole Pi rebooted). After reboot, `/basalt/pose` (RTAB-Map VIO) was rock-solid: measured 256 samples over 25 s, mean gap 97.8 ms, max 126.6 ms, **zero gaps > 200 ms**. So the VIO source is stable; the earlier crash-loop was a transient device/USB state, not a persistent fault.
+
+### 2. uXRCE-DDS reconnect (same procedure as before)
+After reboot the client again came up `Running, disconnected`. Fixed with the documented sequence over NSH (`UXRCE_DDS_SYNCC 0`, `UXRCE_DDS_SYNCT 0` were already saved; just needed `uxrce_dds_client stop` then `start -t serial -d /dev/ttyS2 -b 921600`). Note: `timesync converged: false` is shown **even when the session is fully connected and working** — with `SYNCT=0`, PX4 falls back to stamping inbound messages with local reception time, which is fine. Confirmed that re-enabling `SYNCT=1` makes the timesync handshake time out and the session never connects on this serial link, so `SYNCT=0` must stay.
+
+### 3. ROOT CAUSE of xy_valid=false: corrupted `EKF2_EV_CTRL` param
+Even with the DDS link healthy and valid VIO streaming into `/fmu/in/vehicle_visual_odometry` at ~10 Hz, EKF2 computed EV innovations every cycle (`estimator_aid_src_ev_pos` populated, `innovation_rejected: false`, tiny test ratios) but **never started fusion** (`fused: false`, `time_last_fuse: 0`, `cs_ev_pos: false`, event flag `starting_vision_pos_fusion: false`, EKF stuck in `const_pos_mode`).
+
+The cause: **`EKF2_EV_CTRL` was stored as `1077936128`, not `3`.** `1077936128` = `0x40400000` = the IEEE-754 float bit pattern of `3.0`. `EKF2_EV_CTRL` is an INT32 bitmask (bit0=HPOS, bit1=VPOS, bit2=VEL, bit3=YAW); `1077936128 & 0b1111 == 0`, so **no EV control bit was set** and EKF2 did zero EV fusion. This happened because the param was previously "set to 3" over **MAVLink using REAL32 (float) encoding** for an INT32 param, so PX4 stored the float's raw bits as the integer.
+
+Diagnostic tell: on NSH, `param show EKF2_EV_CTRL` printed `1077936128` while every other int param printed clean (`EKF2_HGT_REF: 3`, `EKF2_GPS_CTRL: 0`, `EKF2_MULTI_IMU: 1`). A MAVLink `PARAM_VALUE` dump **hides this** — it reads the int32 back as float and shows `3.0`, which looks correct. Always verify EKF2 int params via the NSH `param show`, not a MAVLink/QGC float readout.
+
+**Fix (set the integer correctly via NSH, not MAVLink float):**
+```sh
+param set EKF2_EV_CTRL 3
+param save
+ekf2 stop
+ekf2 start
+```
+Immediately after: `estimator_event_flags` showed `reset_pos_to_vision: true`, `starting_vision_pos_fusion: true`; `ekf2 status` went to `local position: 1`; both `estimator_aid_src_ev_pos` and `estimator_aid_src_ev_hgt` show `fused: true`; and `/fmu/out/vehicle_local_position_v1` now reports `xy_valid: true`, `v_xy_valid: true`, `z_valid: true` (stable across reads, position tracks camera motion).
+
+### Bridge code change
+`vio_to_px4_odometry.py`: `angular_velocity` and the first-sample/out-of-range velocity now publish `0.0` instead of `NaN` (finite-sample hygiene for EKF ingestion). Rebuilt with `colcon build --packages-select px4_vio_bridge`. (This was not the root cause but is correct to keep.)
+
+### PX4 param backup
+Full backup of all 1127 params saved to `params_backup_20260707_*.params` via new helper `scripts/dump_params.py`. NOTE: that dump reads int params as float over MAVLink, so it does not reveal the `EKF2_EV_CTRL` corruption — it's a restore backup, not a source of truth for int-param values.
+
+### Persistent PX4 params now saved to flash
+`UXRCE_DDS_SYNCC=0`, `UXRCE_DDS_SYNCT=0`, `EKF2_EV_CTRL=3` (corrected), `EKF2_HGT_REF=3` (Vision).
+
+### Current running processes (healthy)
+`MicroXRCEAgent` (system v3.0.1 on `/dev/ttyAMA0`, launched via `xrce_agent:=/usr/local/bin/MicroXRCEAgent`), `rtabmap_vio_ros2.py` (stable ~10 Hz), `vio_to_px4_odometry` (rebuilt), `px4_local_position_to_ros`, `foxglove_bridge`. PX4 `uxrce_dds_client` `Running, connected`.
