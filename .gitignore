@@ -10,6 +10,7 @@ ros2_ws/log/
 *.bag
 *.db3
 *.mcap
+*.params
 ros2_ws/vslam_trajectory.txt
 .cache/
 
