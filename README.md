@@ -54,6 +54,7 @@ Useful topics:
 ```text
 /rtabmap/path
 /rtabmap/odometry
+/rtabmap/image/compressed
 /rtabmap/image
 /basalt/pose
 /vio/yaw_offset/pose
@@ -80,7 +81,27 @@ ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge rtabmap_oak_foxglove.launch.py
 
 Observed RTAB-Map VIO rate is about `14-15 Hz` even with camera input requested at `30 fps`.
 
-This Foxglove-only launch keeps `/rtabmap/image` enabled for debugging.
+This Foxglove-only launch keeps the camera feed enabled for debugging.
+
+### Low-latency camera feed
+
+The camera feed defaults to **JPEG-compressed** `sensor_msgs/CompressedImage` on
+`/rtabmap/image/compressed`, published on a **best-effort, keep-last-1** QoS. This is what
+keeps Foxglove real-time: a 640x400 mono frame drops from ~256 KB raw to ~15-25 KB
+(~15x less over the WebSocket), and stale frames are dropped instead of queued — queueing
+is what makes the raw feed's delay grow without bound. Add an **Image** panel in Foxglove
+and point it at `/rtabmap/image/compressed`.
+
+Tuning knobs (launch args, apply to both `rtabmap_oak_foxglove.launch.py` and
+`basalt_vio_px4.launch.py`):
+
+- `rtabmap_image_format:=jpeg` (default) or `raw` (legacy `/rtabmap/image`, heavy — backs up).
+- `rtabmap_image_jpeg_quality:=60` (1-95; lower = smaller/faster).
+- `rtabmap_image_publish_stride:=1` (publish every Nth frame, e.g. `2` to halve the rate).
+
+Still laggy? Drop quality (`:=40`), raise the stride (`:=2`), or lower `rtabmap_width`/`rtabmap_height`.
+The pose/VIO path is unaffected — the image now uses a non-blocking `tryGet`, so the feed can
+never stall the `/basalt/pose` stream that feeds PX4.
 
 ## Basalt Foxglove Only
 

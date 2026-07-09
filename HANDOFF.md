@@ -129,6 +129,14 @@ Node confirms arm/offboard from `/fmu/out/vehicle_control_mode` (this build does
 - **OAK-D `X_LINK_ERROR` crash-loop** is cleared by physically power-cycling the camera. Healthy VIO
   is ~10–15 Hz RTAB-Map on `/basalt/pose`.
 
+- **Camera feed in Foxglove: use the compressed topic.** The feed now defaults to JPEG
+  `CompressedImage` on `/rtabmap/image/compressed` (best-effort, keep-last-1) — raw `/rtabmap/image`
+  (256 KB/frame) backed up over the WebSocket and the delay grew unbounded. In Foxglove point an
+  Image panel at `/rtabmap/image/compressed`. Tune via launch args `rtabmap_image_format`
+  (`jpeg`/`raw`), `rtabmap_image_jpeg_quality`, `rtabmap_image_publish_stride`. Image publish uses a
+  non-blocking `tryGet`, so it can't stall the `/basalt/pose` → PX4 path. Enabled in the Foxglove-only
+  launches; opt-in in the main launch (`rtabmap_publish_image:=true`).
+
 - **ROS 2 CLI is flaky here** (`ros2 topic list/echo` miss BEST_EFFORT topics / hang). Prefer a small
   rclpy probe with matching QoS, or the launch-log grep checks above.
 

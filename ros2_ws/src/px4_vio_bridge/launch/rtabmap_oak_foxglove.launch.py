@@ -12,6 +12,10 @@ def generate_launch_description():
     rtabmap_width = LaunchConfiguration("rtabmap_width")
     rtabmap_height = LaunchConfiguration("rtabmap_height")
     rtabmap_publish_image = LaunchConfiguration("rtabmap_publish_image")
+    rtabmap_image_format = LaunchConfiguration("rtabmap_image_format")
+    rtabmap_image_publish_stride = LaunchConfiguration("rtabmap_image_publish_stride")
+    rtabmap_image_jpeg_quality = LaunchConfiguration("rtabmap_image_jpeg_quality")
+    rtabmap_num_features = LaunchConfiguration("rtabmap_num_features")
     rtabmap_path_publish_stride = LaunchConfiguration("rtabmap_path_publish_stride")
     rtabmap_path_size = LaunchConfiguration("rtabmap_path_size")
     rtabmap_trajectory_log = LaunchConfiguration("rtabmap_trajectory_log")
@@ -29,6 +33,10 @@ def generate_launch_description():
             DeclareLaunchArgument("rtabmap_width", default_value="640"),
             DeclareLaunchArgument("rtabmap_height", default_value="400"),
             DeclareLaunchArgument("rtabmap_publish_image", default_value="true"),
+            DeclareLaunchArgument("rtabmap_image_format", default_value="jpeg"),
+            DeclareLaunchArgument("rtabmap_image_publish_stride", default_value="1"),
+            DeclareLaunchArgument("rtabmap_image_jpeg_quality", default_value="60"),
+            DeclareLaunchArgument("rtabmap_num_features", default_value="1000"),
             DeclareLaunchArgument("rtabmap_path_publish_stride", default_value="1"),
             DeclareLaunchArgument("rtabmap_path_size", default_value="5000"),
             DeclareLaunchArgument("rtabmap_trajectory_log", default_value="vslam_trajectory.txt"),
@@ -47,6 +55,14 @@ def generate_launch_description():
                     rtabmap_height,
                     "--publish-image",
                     rtabmap_publish_image,
+                    "--image-format",
+                    rtabmap_image_format,
+                    "--image-publish-stride",
+                    rtabmap_image_publish_stride,
+                    "--image-jpeg-quality",
+                    rtabmap_image_jpeg_quality,
+                    "--num-features",
+                    rtabmap_num_features,
                     "--path-publish-stride",
                     rtabmap_path_publish_stride,
                     "--path-size",
@@ -72,7 +88,7 @@ def generate_launch_description():
                 condition=IfCondition(foxglove),
                 launch_arguments={
                     "port": foxglove_port,
-                    "topic_whitelist": "['^/rtabmap/(path|image|odometry)$', '^/basalt/pose$']",
+                    "topic_whitelist": "['^/rtabmap/(path|image|odometry)$', '^/rtabmap/image/compressed$', '^/basalt/pose$']",
                     "service_whitelist": "['^$']",
                     "param_whitelist": "['^$']",
                     "client_topic_whitelist": "['^$']",
