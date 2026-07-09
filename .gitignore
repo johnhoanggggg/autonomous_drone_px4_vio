@@ -17,6 +17,7 @@ ros2_ws/vslam_trajectory.txt
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv*/
 venv/
 env/

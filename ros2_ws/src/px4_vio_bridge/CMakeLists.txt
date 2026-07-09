@@ -8,6 +8,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/basalt_odometry_test
+  scripts/offboard_hover
   scripts/px4_local_position_to_ros
   scripts/vio_to_px4_odometry
   DESTINATION lib/${PROJECT_NAME}
