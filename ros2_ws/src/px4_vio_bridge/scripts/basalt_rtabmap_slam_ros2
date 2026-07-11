@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+import argparse
+import io
+import time
+import threading
+import struct
+import numpy as np
+from PIL import Image as PILImage
+import depthai as dai
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import PointCloud2, PointField, Image, CompressedImage
+
+
+def parse_bool(value):
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
+parser = argparse.ArgumentParser(description='Publish OAK-D Basalt VIO feeding RTAB-Map SLAM to ROS 2.')
+parser.add_argument('--fps', type=int, default=30, help='Stereo camera FPS.')
+parser.add_argument('--width', type=int, default=640, help='Stereo image width.')
+parser.add_argument('--height', type=int, default=400, help='Stereo image height.')
+parser.add_argument('--publish-image', type=parse_bool, default=True, help='Publish the SLAM camera feed.')
+parser.add_argument('--image-format', choices=['jpeg', 'raw'], default='jpeg')
+parser.add_argument('--image-publish-stride', type=int, default=1)
+parser.add_argument('--image-jpeg-quality', type=int, default=60)
+parser.add_argument('--path-publish-stride', type=int, default=10)
+parser.add_argument('--path-size', type=int, default=1000)
+parser.add_argument('--publish-clouds', type=parse_bool, default=False,
+                    help='Publish obstacle/ground pointclouds. Heavy over Foxglove.')
+parser.add_argument('--publish-grid', type=parse_bool, default=False,
+                    help='Publish the RTAB-Map occupancy grid from DepthAI. Usually too heavy.')
+args = parser.parse_args()
+
+rclpy.init()
+
+class Ros2Node(dai.node.ThreadedHostNode):
+    def __init__(self):
+        dai.node.ThreadedHostNode.__init__(self)
+        self.inputTrans = dai.Node.Input(self)
+        self.inputBasaltTrans = dai.Node.Input(self)
+        self.inputImg = dai.Node.Input(self)
+        self.inputObstaclePCL = dai.Node.Input(self)
+        self.inputGroundPCL = dai.Node.Input(self)
+        self.inputGrid = dai.Node.Input(self)
+
+        self.ros_node = Node('basalt_slam_bridge')
+        self.path_pub = self.ros_node.create_publisher(Path, '/rtabmap/path', 10)
+        self.pose_pub = self.ros_node.create_publisher(PoseStamped, '/rtabmap/pose', 10)
+        self.odom_pub = self.ros_node.create_publisher(Odometry, '/rtabmap/odometry', 10)
+        self.basalt_pose_pub = self.ros_node.create_publisher(PoseStamped, '/basalt/pose', 10)
+        self.obstacle_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/obstacle_cloud', 10)
+        self.ground_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/ground_cloud', 10)
+
+        self.publish_image = args.publish_image
+        self.image_format = args.image_format
+        self.image_publish_stride = max(1, args.image_publish_stride)
+        self.jpeg_quality = min(95, max(1, args.image_jpeg_quality))
+        self.image_count = 0
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.img_pub = None
+        self.img_compressed_pub = None
+        if self.publish_image:
+            if self.image_format == 'jpeg':
+                self.img_compressed_pub = self.ros_node.create_publisher(
+                    CompressedImage, '/rtabmap/image/compressed', sensor_qos)
+            else:
+                self.img_pub = self.ros_node.create_publisher(Image, '/rtabmap/image', sensor_qos)
+
+        self.path_publish_stride = max(1, args.path_publish_stride)
+        self.path_size = max(1, args.path_size)
+        self.publish_clouds = args.publish_clouds
+        self.pose_count = 0
+        self.path = Path()
+        self.path.header.frame_id = 'world'
+
+        self.ros_thread = threading.Thread(target=rclpy.spin, args=(self.ros_node,), daemon=True)
+        self.ros_thread.start()
+
+    def _make_pointcloud(self, points):
+        msg = PointCloud2()
+        msg.header.stamp = self.ros_node.get_clock().now().to_msg()
+        msg.header.frame_id = 'world'
+        msg.height = 1
+        msg.width = len(points)
+        msg.fields = [
+            PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 12 * len(points)
+        msg.is_dense = True
+        data = bytearray()
+        for p in points:
+            data += struct.pack('fff', float(p[0]), float(p[1]), float(p[2]))
+        msg.data = bytes(data)
+        return msg
+
+    def run(self):
+        while self.mainLoop():
+            transData = self.inputTrans.get()
+            basaltTransData = self.inputBasaltTrans.tryGet()
+            imgFrame = self.inputImg.tryGet() if self.publish_image else None
+            pclObstData = self.inputObstaclePCL.tryGet() if self.publish_clouds else None
+            pclGrndData = self.inputGroundPCL.tryGet() if self.publish_clouds else None
+            # grid received but not published (too large for XLink)
+
+            now = self.ros_node.get_clock().now().to_msg()
+
+            if basaltTransData is not None:
+                self.basalt_pose_pub.publish(self._make_pose(basaltTransData, now))
+
+            if transData is not None:
+                pose = self._make_pose(transData, now)
+                self.pose_pub.publish(pose)
+
+                odom = Odometry()
+                odom.header = pose.header
+                odom.child_frame_id = 'rtabmap_body'
+                odom.pose.pose = pose.pose
+                self.odom_pub.publish(odom)
+
+                self.path.header.stamp = now
+                self.path.poses.append(pose)
+                if len(self.path.poses) > self.path_size:
+                    self.path.poses = self.path.poses[-self.path_size:]
+                self.pose_count += 1
+                if self.pose_count % self.path_publish_stride == 0:
+                    self.path_pub.publish(self.path)
+
+            if imgFrame is not None:
+                self.image_count += 1
+                if self.image_count % self.image_publish_stride == 0:
+                    self.publish_frame(imgFrame, now)
+
+            if pclObstData is not None:
+                try:
+                    points, _ = pclObstData.getPointsRGB()
+                    if len(points) > 0:
+                        self.obstacle_pub.publish(self._make_pointcloud(points))
+                except Exception:
+                    pass
+
+            if pclGrndData is not None:
+                try:
+                    points, _ = pclGrndData.getPointsRGB()
+                    if len(points) > 0:
+                        self.ground_pub.publish(self._make_pointcloud(points))
+                except Exception:
+                    pass
+
+    def _make_pose(self, trans_data, now):
+        trans = trans_data.getTranslation()
+        quat = trans_data.getQuaternion()
+
+        pose = PoseStamped()
+        pose.header.stamp = now
+        pose.header.frame_id = 'world'
+        pose.pose.position.x = trans.x
+        pose.pose.position.y = trans.y
+        pose.pose.position.z = trans.z
+        pose.pose.orientation.x = quat.qx
+        pose.pose.orientation.y = quat.qy
+        pose.pose.orientation.z = quat.qz
+        pose.pose.orientation.w = quat.qw
+        return pose
+
+    def publish_frame(self, imgFrame, now):
+        width = imgFrame.getWidth()
+        height = imgFrame.getHeight()
+        raw = bytes(imgFrame.getData())
+
+        if self.img_compressed_pub is not None:
+            try:
+                arr = np.frombuffer(raw, dtype=np.uint8)
+                if arr.size == width * height:
+                    arr = arr.reshape(height, width)
+                    buf = io.BytesIO()
+                    PILImage.fromarray(arr, mode='L').save(
+                        buf, format='JPEG', quality=self.jpeg_quality)
+                    msg = CompressedImage()
+                    msg.header.stamp = now
+                    msg.header.frame_id = 'camera'
+                    msg.format = 'mono8; jpeg compressed'
+                    msg.data = buf.getvalue()
+                    self.img_compressed_pub.publish(msg)
+            except Exception as exc:
+                print(f"image encode error: {exc}")
+        elif self.img_pub is not None:
+            img_msg = Image()
+            img_msg.header.stamp = now
+            img_msg.header.frame_id = 'camera'
+            img_msg.height = height
+            img_msg.width = width
+            img_msg.encoding = 'mono8'
+            img_msg.step = width
+            img_msg.data = raw
+            self.img_pub.publish(img_msg)
+
+
+# Create pipeline
+with dai.Pipeline() as p:
+    fps = args.fps
+    width = args.width
+    height = args.height
+
+    left = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B, sensorFps=fps)
+    right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C, sensorFps=fps)
+    imu = p.create(dai.node.IMU)
+    odom = p.create(dai.node.BasaltVIO)
+    slam = p.create(dai.node.RTABMapSLAM)
+    stereo = p.create(dai.node.StereoDepth)
+
+    params = {"RGBD/CreateOccupancyGrid": "true",
+              "Grid/3D": "true",
+              "Rtabmap/SaveWMState": "true"}
+    slam.setParams(params)
+    slam.setPublishObstacleCloud(args.publish_clouds)
+    slam.setPublishGroundCloud(args.publish_clouds)
+    slam.setPublishGrid(args.publish_grid)
+
+    ros2Viewer = p.create(Ros2Node)
+
+    imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
+    imu.setBatchReportThreshold(1)
+    imu.setMaxBatchReports(10)
+
+    stereo.setExtendedDisparity(False)
+    stereo.setLeftRightCheck(True)
+    stereo.setSubpixel(True)
+    stereo.setRectifyEdgeFillColor(0)
+    stereo.enableDistortionCorrection(True)
+    stereo.initialConfig.setLeftRightCheckThreshold(10)
+    stereo.setDepthAlign(dai.CameraBoardSocket.CAM_B)
+
+    # Linking
+    left.requestOutput((width, height)).link(stereo.left)
+    right.requestOutput((width, height)).link(stereo.right)
+    stereo.syncedLeft.link(odom.left)
+    stereo.syncedRight.link(odom.right)
+    stereo.depth.link(slam.depth)
+    stereo.rectifiedLeft.link(slam.rect)
+    imu.out.link(odom.imu)
+
+    odom.transform.link(slam.odom)
+    odom.transform.link(ros2Viewer.inputBasaltTrans)
+    slam.transform.link(ros2Viewer.inputTrans)
+    if args.publish_image:
+        slam.passthroughRect.link(ros2Viewer.inputImg)
+    if args.publish_grid:
+        slam.occupancyGridMap.link(ros2Viewer.inputGrid)
+    slam.obstaclePCL.link(ros2Viewer.inputObstaclePCL)
+    slam.groundPCL.link(ros2Viewer.inputGroundPCL)
+
+    p.start()
+    while p.isRunning():
+        time.sleep(1)

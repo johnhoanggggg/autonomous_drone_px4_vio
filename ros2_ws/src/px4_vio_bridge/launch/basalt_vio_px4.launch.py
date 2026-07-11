@@ -17,6 +17,7 @@ def generate_launch_description():
     rtabmap_image_publish_stride = LaunchConfiguration("rtabmap_image_publish_stride")
     rtabmap_image_jpeg_quality = LaunchConfiguration("rtabmap_image_jpeg_quality")
     rtabmap_num_features = LaunchConfiguration("rtabmap_num_features")
+    rtabmap_usb_speed = LaunchConfiguration("rtabmap_usb_speed")
     rtabmap_path_publish_stride = LaunchConfiguration("rtabmap_path_publish_stride")
     rtabmap_path_size = LaunchConfiguration("rtabmap_path_size")
     rtabmap_trajectory_log = LaunchConfiguration("rtabmap_trajectory_log")
@@ -50,6 +51,7 @@ def generate_launch_description():
             DeclareLaunchArgument("rtabmap_image_publish_stride", default_value="1"),
             DeclareLaunchArgument("rtabmap_image_jpeg_quality", default_value="60"),
             DeclareLaunchArgument("rtabmap_num_features", default_value="1000"),
+            DeclareLaunchArgument("rtabmap_usb_speed", default_value="high"),
             DeclareLaunchArgument("rtabmap_path_publish_stride", default_value="10"),
             DeclareLaunchArgument("rtabmap_path_size", default_value="1000"),
             DeclareLaunchArgument("rtabmap_trajectory_log", default_value="none"),
@@ -110,6 +112,8 @@ def generate_launch_description():
                     rtabmap_image_jpeg_quality,
                     "--num-features",
                     rtabmap_num_features,
+                    "--usb-speed",
+                    rtabmap_usb_speed,
                     "--path-publish-stride",
                     rtabmap_path_publish_stride,
                     "--path-size",
