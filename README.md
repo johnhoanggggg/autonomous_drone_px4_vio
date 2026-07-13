@@ -83,6 +83,53 @@ Observed RTAB-Map VIO rate is about `14-15 Hz` even with camera input requested 
 
 This Foxglove-only launch keeps the camera feed enabled for debugging.
 
+### RTAB-Map VIO + RTAB-Map SLAM
+
+Use this comparison launch to feed `RTABMapVIO` odometry into `RTABMapSLAM` and publish
+the SLAM pose, path, image, and optional obstacle/ground point clouds:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge \
+  rtabmap_vio_slam_foxglove.launch.py \
+  slam_publish_clouds:=true
+```
+
+The raw VIO pose is on `/rtabmap/vio_pose`; SLAM-corrected outputs are on
+`/rtabmap/pose`, `/rtabmap/odometry`, and `/rtabmap/path`.
+
+### RTAB-Map SLAM + PX4 bridge
+
+Use the combined Raspberry Pi launch to run RTAB-Map VIO/SLAM, the serial XRCE-DDS
+agent, the PX4 visual-odometry bridge, PX4 local-position visualization, and one
+Foxglove bridge:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge \
+  rtabmap_slam_px4.launch.py \
+  slam_publish_clouds:=true
+```
+
+Important pose distinction:
+
+- **PX4 does not receive the loop-corrected SLAM pose.** The PX4 bridge consumes the
+  continuous raw VIO pose on `/rtabmap/vio_pose` and publishes it to
+  `/fmu/in/vehicle_visual_odometry`. This avoids injecting loop-closure position/yaw
+  jumps into EKF2.
+- **Foxglove's SLAM visualization is loop-corrected.** `/rtabmap/pose`,
+  `/rtabmap/odometry`, `/rtabmap/path`, and the obstacle/ground clouds use RTAB-Map's
+  optimized SLAM frame.
+- `/px4/local_position/*` shows PX4/EKF2's estimated vehicle position. It should be
+  compared with `/rtabmap/vio_pose`, not expected to follow a later SLAM loop closure.
+
+The `input_pose_topic` launch argument can select `/rtabmap/pose` experimentally, but
+feeding a discontinuous loop-corrected pose to PX4 is not the flight default.
+
 ### Low-latency camera feed
 
 The camera feed defaults to **JPEG-compressed** `sensor_msgs/CompressedImage` on

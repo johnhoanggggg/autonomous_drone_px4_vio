@@ -3,23 +3,28 @@ import argparse
 import io
 import time
 import threading
-import struct
 import numpy as np
 from PIL import Image as PILImage
 import depthai as dai
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import PointCloud2, PointField, Image, CompressedImage
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from sensor_msgs.msg import CameraInfo, PointCloud2, PointField, Image, CompressedImage
+from tf2_ros import TransformBroadcaster
 
 
 def parse_bool(value):
     return str(value).lower() in ("1", "true", "yes", "on")
 
 
-parser = argparse.ArgumentParser(description='Publish OAK-D Basalt VIO feeding RTAB-Map SLAM to ROS 2.')
+parser = argparse.ArgumentParser(description='Publish OAK-D VIO feeding RTAB-Map SLAM to ROS 2.')
+parser.add_argument('--vio-backend', choices=['basalt', 'rtabmap'], default='basalt',
+                    help='DepthAI odometry backend used to feed RTAB-Map SLAM.')
+parser.add_argument('--vio-pose-topic', default='/basalt/pose',
+                    help='ROS topic for the raw VIO pose before SLAM correction.')
 parser.add_argument('--fps', type=int, default=30, help='Stereo camera FPS.')
 parser.add_argument('--width', type=int, default=640, help='Stereo image width.')
 parser.add_argument('--height', type=int, default=400, help='Stereo image height.')
@@ -27,15 +32,25 @@ parser.add_argument('--publish-image', type=parse_bool, default=True, help='Publ
 parser.add_argument('--image-format', choices=['jpeg', 'raw'], default='jpeg')
 parser.add_argument('--image-publish-stride', type=int, default=1)
 parser.add_argument('--image-jpeg-quality', type=int, default=60)
+parser.add_argument('--publish-depth', type=parse_bool, default=False,
+                    help='Publish RAW16 metric depth for Foxglove.')
+parser.add_argument('--depth-publish-hz', type=float, default=3.0,
+                    help='Maximum depth publish rate in Hz.')
+parser.add_argument('--num-features', type=int, default=1000,
+                    help='RTAB-Map VIO FeatureTracker target feature count.')
 parser.add_argument('--path-publish-stride', type=int, default=10)
 parser.add_argument('--path-size', type=int, default=1000)
 parser.add_argument('--publish-clouds', type=parse_bool, default=False,
                     help='Publish obstacle/ground pointclouds. Heavy over Foxglove.')
+parser.add_argument('--grid-3d', type=parse_bool, default=True,
+                    help='Keep RTAB-Map occupancy cells in 3D instead of projecting to XY.')
+parser.add_argument('--cloud-coordinate-limit', type=float, default=100.0,
+                    help='Reject cloud coordinates outside +/- this many metres.')
 parser.add_argument('--publish-grid', type=parse_bool, default=False,
                     help='Publish the RTAB-Map occupancy grid from DepthAI. Usually too heavy.')
-args = parser.parse_args()
+args, ros_args = parser.parse_known_args()
 
-rclpy.init()
+rclpy.init(args=ros_args)
 
 class Ros2Node(dai.node.ThreadedHostNode):
     def __init__(self):
@@ -43,6 +58,9 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.inputTrans = dai.Node.Input(self)
         self.inputBasaltTrans = dai.Node.Input(self)
         self.inputImg = dai.Node.Input(self)
+        self.inputDepth = dai.Node.Input(self)
+        self.inputDepth.setBlocking(False)
+        self.inputDepth.setMaxSize(1)
         self.inputObstaclePCL = dai.Node.Input(self)
         self.inputGroundPCL = dai.Node.Input(self)
         self.inputGrid = dai.Node.Input(self)
@@ -51,9 +69,10 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.path_pub = self.ros_node.create_publisher(Path, '/rtabmap/path', 10)
         self.pose_pub = self.ros_node.create_publisher(PoseStamped, '/rtabmap/pose', 10)
         self.odom_pub = self.ros_node.create_publisher(Odometry, '/rtabmap/odometry', 10)
-        self.basalt_pose_pub = self.ros_node.create_publisher(PoseStamped, '/basalt/pose', 10)
+        self.vio_pose_pub = self.ros_node.create_publisher(PoseStamped, args.vio_pose_topic, 10)
         self.obstacle_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/obstacle_cloud', 10)
         self.ground_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/ground_cloud', 10)
+        self.tf_broadcaster = TransformBroadcaster(self.ros_node)
 
         self.publish_image = args.publish_image
         self.image_format = args.image_format
@@ -75,35 +94,99 @@ class Ros2Node(dai.node.ThreadedHostNode):
             else:
                 self.img_pub = self.ros_node.create_publisher(Image, '/rtabmap/image', sensor_qos)
 
+        self.publish_depth = args.publish_depth
+        self.depth_publish_period = 1.0 / max(0.1, args.depth_publish_hz)
+        self.last_depth_publish = 0.0
+        self.depth_pub = None
+        self.camera_info_pub = None
+        self.camera_info = None
+        if self.publish_depth:
+            self.depth_pub = self.ros_node.create_publisher(
+                Image, '/rtabmap/depth', sensor_qos)
+            self.camera_info_pub = self.ros_node.create_publisher(
+                CameraInfo, '/rtabmap/camera_info', sensor_qos)
+
         self.path_publish_stride = max(1, args.path_publish_stride)
         self.path_size = max(1, args.path_size)
         self.publish_clouds = args.publish_clouds
+        self.cloud_coordinate_limit = max(1.0, args.cloud_coordinate_limit)
+        self.last_cloud_filter_report = 0.0
         self.pose_count = 0
         self.path = Path()
         self.path.header.frame_id = 'world'
 
-        self.ros_thread = threading.Thread(target=rclpy.spin, args=(self.ros_node,), daemon=True)
+        self.ros_thread = threading.Thread(target=self._spin_ros, daemon=True)
         self.ros_thread.start()
 
-    def _make_pointcloud(self, points):
+    def _spin_ros(self):
+        try:
+            rclpy.spin(self.ros_node)
+        except (ExternalShutdownException, KeyboardInterrupt):
+            pass
+
+    def _make_pointcloud(self, points, colors):
+        # getPointsRGB() exposes DepthAI-owned storage which may be reused by its
+        # native thread. Snapshot it before validating so values cannot change
+        # between the validity mask and ROS serialization.
+        points = np.array(points, dtype='<f4', copy=True).reshape(-1, 3)
+        colors = np.array(colors, dtype=np.uint8, copy=True).reshape(-1, 4)
+        if len(points) != len(colors):
+            raise ValueError(
+                f'point/color count mismatch: {len(points)} points, {len(colors)} colors')
+
+        valid = (
+            np.isfinite(points).all(axis=1)
+            & (np.abs(points) <= self.cloud_coordinate_limit).all(axis=1)
+        )
+        rejected = int(len(points) - np.count_nonzero(valid))
+        if rejected:
+            points = points[valid]
+            colors = colors[valid]
+            monotonic_now = time.monotonic()
+            if monotonic_now - self.last_cloud_filter_report >= 5.0:
+                self.last_cloud_filter_report = monotonic_now
+                self.ros_node.get_logger().warning(
+                    f'Filtered {rejected} invalid/out-of-range cloud points '
+                    f'(limit +/-{self.cloud_coordinate_limit:g} m)')
+
+        cloud = np.empty(
+            len(points),
+            dtype=np.dtype([
+                ('x', '<f4'),
+                ('y', '<f4'),
+                ('z', '<f4'),
+                ('rgba', '<u4'),
+            ]),
+        )
+        cloud['x'] = points[:, 0]
+        cloud['y'] = points[:, 1]
+        cloud['z'] = points[:, 2]
+        # DepthAI returns RGBA bytes. PointCloud2/Foxglove uses an RViz-compatible
+        # packed uint32: 0xAARRGGBB (bytes B, G, R, A on this little-endian host).
+        rgba = colors.astype(np.uint32)
+        cloud['rgba'] = (
+            rgba[:, 2]
+            | (rgba[:, 1] << 8)
+            | (rgba[:, 0] << 16)
+            | (rgba[:, 3] << 24)
+        )
+
         msg = PointCloud2()
         msg.header.stamp = self.ros_node.get_clock().now().to_msg()
         msg.header.frame_id = 'world'
         msg.height = 1
-        msg.width = len(points)
+        msg.width = len(cloud)
         msg.fields = [
             PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
             PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
             PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='rgba', offset=12, datatype=PointField.UINT32, count=1),
         ]
         msg.is_bigendian = False
-        msg.point_step = 12
-        msg.row_step = 12 * len(points)
+        msg.point_step = cloud.dtype.itemsize
+        msg.row_step = msg.point_step * len(cloud)
         msg.is_dense = True
-        data = bytearray()
-        for p in points:
-            data += struct.pack('fff', float(p[0]), float(p[1]), float(p[2]))
-        msg.data = bytes(data)
+        msg.data = cloud.tobytes()
         return msg
 
     def run(self):
@@ -111,6 +194,7 @@ class Ros2Node(dai.node.ThreadedHostNode):
             transData = self.inputTrans.get()
             basaltTransData = self.inputBasaltTrans.tryGet()
             imgFrame = self.inputImg.tryGet() if self.publish_image else None
+            depthFrame = self.inputDepth.tryGet() if self.publish_depth else None
             pclObstData = self.inputObstaclePCL.tryGet() if self.publish_clouds else None
             pclGrndData = self.inputGroundPCL.tryGet() if self.publish_clouds else None
             # grid received but not published (too large for XLink)
@@ -118,15 +202,16 @@ class Ros2Node(dai.node.ThreadedHostNode):
             now = self.ros_node.get_clock().now().to_msg()
 
             if basaltTransData is not None:
-                self.basalt_pose_pub.publish(self._make_pose(basaltTransData, now))
+                self.vio_pose_pub.publish(self._make_pose(basaltTransData, now))
 
             if transData is not None:
                 pose = self._make_pose(transData, now)
                 self.pose_pub.publish(pose)
+                self._publish_camera_transform(pose)
 
                 odom = Odometry()
                 odom.header = pose.header
-                odom.child_frame_id = 'rtabmap_body'
+                odom.child_frame_id = 'camera'
                 odom.pose.pose = pose.pose
                 self.odom_pub.publish(odom)
 
@@ -143,19 +228,25 @@ class Ros2Node(dai.node.ThreadedHostNode):
                 if self.image_count % self.image_publish_stride == 0:
                     self.publish_frame(imgFrame, now)
 
+            if depthFrame is not None:
+                monotonic_now = time.monotonic()
+                if monotonic_now - self.last_depth_publish >= self.depth_publish_period:
+                    self.last_depth_publish = monotonic_now
+                    self.publish_depth_frame(depthFrame, now)
+
             if pclObstData is not None:
                 try:
-                    points, _ = pclObstData.getPointsRGB()
+                    points, colors = pclObstData.getPointsRGB()
                     if len(points) > 0:
-                        self.obstacle_pub.publish(self._make_pointcloud(points))
+                        self.obstacle_pub.publish(self._make_pointcloud(points, colors))
                 except Exception:
                     pass
 
             if pclGrndData is not None:
                 try:
-                    points, _ = pclGrndData.getPointsRGB()
+                    points, colors = pclGrndData.getPointsRGB()
                     if len(points) > 0:
-                        self.ground_pub.publish(self._make_pointcloud(points))
+                        self.ground_pub.publish(self._make_pointcloud(points, colors))
                 except Exception:
                     pass
 
@@ -174,6 +265,16 @@ class Ros2Node(dai.node.ThreadedHostNode):
         pose.pose.orientation.z = quat.qz
         pose.pose.orientation.w = quat.qw
         return pose
+
+    def _publish_camera_transform(self, pose):
+        transform = TransformStamped()
+        transform.header = pose.header
+        transform.child_frame_id = 'camera'
+        transform.transform.translation.x = pose.pose.position.x
+        transform.transform.translation.y = pose.pose.position.y
+        transform.transform.translation.z = pose.pose.position.z
+        transform.transform.rotation = pose.pose.orientation
+        self.tf_broadcaster.sendTransform(transform)
 
     def publish_frame(self, imgFrame, now):
         width = imgFrame.getWidth()
@@ -207,6 +308,47 @@ class Ros2Node(dai.node.ThreadedHostNode):
             img_msg.data = raw
             self.img_pub.publish(img_msg)
 
+    def publish_depth_frame(self, depth_frame, now):
+        width = depth_frame.getWidth()
+        height = depth_frame.getHeight()
+        raw = bytes(depth_frame.getData())
+        expected_size = width * height * 2
+        if len(raw) != expected_size:
+            print(f'depth frame size mismatch: got {len(raw)}, expected {expected_size}')
+            return
+
+        msg = Image()
+        msg.header.stamp = now
+        msg.header.frame_id = 'camera'
+        msg.height = height
+        msg.width = width
+        msg.encoding = '16UC1'
+        msg.is_bigendian = 0
+        msg.step = width * 2
+        msg.data = raw
+        self.depth_pub.publish(msg)
+
+        if self.camera_info is None:
+            calibration = self.getParentPipeline().getDefaultDevice().readCalibration()
+            intrinsics = calibration.getCameraIntrinsics(
+                dai.CameraBoardSocket.CAM_B, width, height)
+            fx, fy = float(intrinsics[0][0]), float(intrinsics[1][1])
+            cx, cy = float(intrinsics[0][2]), float(intrinsics[1][2])
+
+            self.camera_info = CameraInfo()
+            self.camera_info.height = height
+            self.camera_info.width = width
+            self.camera_info.distortion_model = 'plumb_bob'
+            self.camera_info.d = [0.0] * 5
+            self.camera_info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+            self.camera_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            self.camera_info.p = [fx, 0.0, cx, 0.0,
+                                  0.0, fy, cy, 0.0,
+                                  0.0, 0.0, 1.0, 0.0]
+
+        self.camera_info.header = msg.header
+        self.camera_info_pub.publish(self.camera_info)
+
 
 # Create pipeline
 with dai.Pipeline() as p:
@@ -214,16 +356,44 @@ with dai.Pipeline() as p:
     width = args.width
     height = args.height
 
-    left = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B, sensorFps=fps)
-    right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C, sensorFps=fps)
+    # Pin the native mono sensor mode instead of relying on automatic mode
+    # selection. This device reports 640x480 as the maximum supported sensor
+    # resolution; the requested 640x400 processing output below is derived from
+    # that mode.
+    left = p.create(dai.node.Camera).build(
+        dai.CameraBoardSocket.CAM_B,
+        sensorResolution=(640, 480),
+        sensorFps=fps,
+    )
+    right = p.create(dai.node.Camera).build(
+        dai.CameraBoardSocket.CAM_C,
+        sensorResolution=(640, 480),
+        sensorFps=fps,
+    )
     imu = p.create(dai.node.IMU)
-    odom = p.create(dai.node.BasaltVIO)
+    featureTracker = None
+    if args.vio_backend == 'basalt':
+        odom = p.create(dai.node.BasaltVIO)
+    else:
+        featureTracker = p.create(dai.node.FeatureTracker)
+        odom = p.create(dai.node.RTABMapVIO)
     slam = p.create(dai.node.RTABMapSLAM)
     stereo = p.create(dai.node.StereoDepth)
 
-    params = {"RGBD/CreateOccupancyGrid": "true",
-              "Grid/3D": "true",
-              "Rtabmap/SaveWMState": "true"}
+    params = {
+        "RGBD/CreateOccupancyGrid": "true",
+        "Grid/3D": str(args.grid_3d).lower(),
+        "Grid/DepthDecimation": "8",
+        "Grid/CellSize": "0.10",
+        "Grid/PreVoxelFiltering": "true",
+        "Grid/RangeMin": "0.30",
+        "Grid/RangeMax": "4.0",
+        "Grid/NoiseFilteringRadius": "0.15",
+        "Grid/NoiseFilteringMinNeighbors": "4",
+        "Grid/ClusterRadius": "0.20",
+        "Grid/MinClusterSize": "20",
+        "Rtabmap/SaveWMState": "true",
+    }
     slam.setParams(params)
     slam.setPublishObstacleCloud(args.publish_clouds)
     slam.setPublishGroundCloud(args.publish_clouds)
@@ -234,6 +404,14 @@ with dai.Pipeline() as p:
     imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
     imu.setBatchReportThreshold(1)
     imu.setMaxBatchReports(10)
+
+    if featureTracker is not None:
+        featureTracker.setHardwareResources(1, 2)
+        featureTracker.initialConfig.setCornerDetector(
+            dai.FeatureTrackerConfig.CornerDetector.Type.HARRIS)
+        featureTracker.initialConfig.setNumTargetFeatures(args.num_features)
+        featureTracker.initialConfig.setMotionEstimator(False)
+        featureTracker.initialConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 49
 
     stereo.setExtendedDisparity(False)
     stereo.setLeftRightCheck(True)
@@ -246,10 +424,18 @@ with dai.Pipeline() as p:
     # Linking
     left.requestOutput((width, height)).link(stereo.left)
     right.requestOutput((width, height)).link(stereo.right)
-    stereo.syncedLeft.link(odom.left)
-    stereo.syncedRight.link(odom.right)
-    stereo.depth.link(slam.depth)
-    stereo.rectifiedLeft.link(slam.rect)
+    if args.vio_backend == 'basalt':
+        stereo.syncedLeft.link(odom.left)
+        stereo.syncedRight.link(odom.right)
+        stereo.depth.link(slam.depth)
+        stereo.rectifiedLeft.link(slam.rect)
+    else:
+        stereo.rectifiedLeft.link(featureTracker.inputImage)
+        featureTracker.passthroughInputImage.link(odom.rect)
+        stereo.depth.link(odom.depth)
+        featureTracker.outputFeatures.link(odom.features)
+        odom.passthroughRect.link(slam.rect)
+        odom.passthroughDepth.link(slam.depth)
     imu.out.link(odom.imu)
 
     odom.transform.link(slam.odom)
@@ -257,11 +443,19 @@ with dai.Pipeline() as p:
     slam.transform.link(ros2Viewer.inputTrans)
     if args.publish_image:
         slam.passthroughRect.link(ros2Viewer.inputImg)
+    if args.publish_depth:
+        slam.passthroughDepth.link(ros2Viewer.inputDepth)
     if args.publish_grid:
         slam.occupancyGridMap.link(ros2Viewer.inputGrid)
     slam.obstaclePCL.link(ros2Viewer.inputObstaclePCL)
     slam.groundPCL.link(ros2Viewer.inputGroundPCL)
 
-    p.start()
-    while p.isRunning():
-        time.sleep(1)
+    try:
+        p.start()
+        while p.isRunning():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
