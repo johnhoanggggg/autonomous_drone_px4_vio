@@ -50,6 +50,14 @@ parser.add_argument('--publish-grid', type=parse_bool, default=False,
                     help='Publish the RTAB-Map occupancy grid from DepthAI. Usually too heavy.')
 args, ros_args = parser.parse_known_args()
 
+if dai.__version__ == '3.7.1':
+    parser.error(
+        'DepthAI 3.7.1 is blocked on this OAK-D Lite: it repeatedly crashes '
+        'CAM_B during MIPI startup. Install the validated pin with '
+        '`python3 -m pip install --user --break-system-packages '
+        '-r requirements-depthai.txt`.'
+    )
+
 rclpy.init(args=ros_args)
 
 class Ros2Node(dai.node.ThreadedHostNode):

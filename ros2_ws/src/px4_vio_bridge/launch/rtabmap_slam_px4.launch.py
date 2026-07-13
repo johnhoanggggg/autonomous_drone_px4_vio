@@ -22,11 +22,15 @@ def generate_launch_description():
     px4_local_path_publish_stride = LaunchConfiguration(
         "px4_local_path_publish_stride"
     )
+    start_xrce_agent = LaunchConfiguration("start_xrce_agent")
     xrce_agent = LaunchConfiguration("xrce_agent")
     xrce_device = LaunchConfiguration("xrce_device")
     xrce_baud = LaunchConfiguration("xrce_baud")
     xrce_verbosity = LaunchConfiguration("xrce_verbosity")
+    oak_startup_delay = LaunchConfiguration("oak_startup_delay")
     px4_startup_delay = LaunchConfiguration("px4_startup_delay")
+    slam_publish_image = LaunchConfiguration("slam_publish_image")
+    slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
     foxglove = LaunchConfiguration("foxglove")
     foxglove_port = LaunchConfiguration("foxglove_port")
     foxglove_topic_whitelist = LaunchConfiguration("foxglove_topic_whitelist")
@@ -52,22 +56,27 @@ def generate_launch_description():
                 "px4_local_path_publish_stride", default_value="10"
             ),
             # System v3.0.1 is the version confirmed to handshake with PX4 over
-            # this Raspberry Pi serial link.
+            # this Raspberry Pi serial link. The systemd service owns the agent
+            # by default; start_xrce_agent is a manual fallback.
+            DeclareLaunchArgument("start_xrce_agent", default_value="false"),
             DeclareLaunchArgument(
                 "xrce_agent", default_value="/usr/local/bin/MicroXRCEAgent"
             ),
             DeclareLaunchArgument("xrce_device", default_value="/dev/ttyAMA0"),
             DeclareLaunchArgument("xrce_baud", default_value="921600"),
             DeclareLaunchArgument("xrce_verbosity", default_value="4"),
+            DeclareLaunchArgument("oak_startup_delay", default_value="5.0"),
             DeclareLaunchArgument("px4_startup_delay", default_value="0.0"),
+            DeclareLaunchArgument("slam_publish_image", default_value="true"),
+            DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
             DeclareLaunchArgument("foxglove", default_value="true"),
             DeclareLaunchArgument("foxglove_port", default_value="8765"),
             DeclareLaunchArgument(
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf$', "
-                    "'^/rtabmap/(vio_pose|pose|odometry|path|depth|camera_info)$', "
-                    "'^/rtabmap/image/compressed$', '^/rtabmap/image$', "
+                    "'^/rtabmap/(vio_pose|pose|odometry|path)$', "
+                    "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
                     "'^/vio/yaw_offset/(pose|odometry|path)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
@@ -78,43 +87,55 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "foxglove_capabilities", default_value="[connectionGraph]"
             ),
-            GroupAction(
-                scoped=True,
+            # Keep the optional launch-owned agent independent of all delayed
+            # camera, bridge, and Foxglove startup work.
+            ExecuteProcess(
+                cmd=[
+                    xrce_agent,
+                    "serial",
+                    "-D",
+                    xrce_device,
+                    "-b",
+                    xrce_baud,
+                    "-v",
+                    xrce_verbosity,
+                ],
+                name="micro_xrce_agent",
+                output="screen",
+                condition=IfCondition(start_xrce_agent),
+            ),
+            TimerAction(
+                period=oak_startup_delay,
                 actions=[
-                    IncludeLaunchDescription(
-                        AnyLaunchDescriptionSource(
-                            PathJoinSubstitution(
-                                [
-                                    FindPackageShare("px4_vio_bridge"),
-                                    "launch",
-                                    "rtabmap_vio_slam_foxglove.launch.py",
-                                ]
+                    GroupAction(
+                        scoped=True,
+                        actions=[
+                            IncludeLaunchDescription(
+                                AnyLaunchDescriptionSource(
+                                    PathJoinSubstitution(
+                                        [
+                                            FindPackageShare("px4_vio_bridge"),
+                                            "launch",
+                                            "rtabmap_vio_slam_foxglove.launch.py",
+                                        ]
+                                    )
+                                ),
+                                # This launch owns the single combined Foxglove bridge below.
+                                launch_arguments={
+                                    "foxglove": "false",
+                                    "slam_publish_image": slam_publish_image,
+                                    "slam_publish_depth": "false",
+                                    "slam_publish_clouds": slam_publish_clouds,
+                                }.items(),
                             )
-                        ),
-                        # This launch owns the single combined Foxglove bridge below.
-                        launch_arguments={"foxglove": "false"}.items(),
+                        ],
                     )
                 ],
             ),
-            # Give the OAK pipeline time to boot before adding PX4/DDS and
-            # Foxglove startup load.
+            # PX4 conversion nodes and Foxglove have their own independent delay.
             TimerAction(
                 period=px4_startup_delay,
                 actions=[
-                    ExecuteProcess(
-                        cmd=[
-                            xrce_agent,
-                            "serial",
-                            "-D",
-                            xrce_device,
-                            "-b",
-                            xrce_baud,
-                            "-v",
-                            xrce_verbosity,
-                        ],
-                        name="micro_xrce_agent",
-                        output="screen",
-                    ),
                     Node(
                         package="px4_vio_bridge",
                         executable="vio_to_px4_odometry",

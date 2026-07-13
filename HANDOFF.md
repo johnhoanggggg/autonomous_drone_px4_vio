@@ -3,12 +3,12 @@
 Authoritative current-state doc. Full chronological history is in `HANDOFF_ARCHIVE.md`
 (kept for forensics; some of it is superseded — trust this file).
 
-Last updated: 2026-07-09.
+Last updated: 2026-07-13.
 
 ## What this project is
 
-Raspberry Pi 5 + OAK-D Lite + Pixhawk 4 (PX4 v1.17.0). OAK-D **RTAB-Map VIO** →
-`/basalt/pose` (compat topic) → `vio_to_px4_odometry` bridge → PX4
+Raspberry Pi 5 + OAK-D Lite + Pixhawk 4 (PX4 v1.17.0). OAK-D **RTAB-Map VIO/SLAM** →
+`/rtabmap/vio_pose` (continuous VIO pose) → `vio_to_px4_odometry` bridge → PX4
 `/fmu/in/vehicle_visual_odometry` over uXRCE-DDS on TELEM2. EKF2 fuses external vision
 for horizontal position, height, and yaw (no GPS). Goal: indoor autonomous flight.
 
@@ -32,13 +32,40 @@ for horizontal position, height, and yaw (no GPS). Goal: indoor autonomous fligh
 cd /home/john/autonomous_drone_px4_vio/ros2_ws
 source /opt/ros/jazzy/setup.bash && source /home/john/ros2_ws/install/setup.bash && source install/setup.bash
 export ROS_DOMAIN_ID=42
-ros2 launch px4_vio_bridge basalt_vio_px4.launch.py   # legacy name; runs RTAB-Map, not Basalt
+ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py
 ```
-Starts: system MicroXRCEAgent on `/dev/ttyAMA0` @921600, RTAB-Map VIO, `vio_to_px4_odometry`,
-`px4_local_position_to_ros`, Foxglove (:8765). Foxglove-only variants:
+Starts: RTAB-Map VIO/SLAM, `vio_to_px4_odometry`, `px4_local_position_to_ros`, and
+Foxglove (:8765). The systemd-owned MicroXRCEAgent runs independently on
+`/dev/ttyAMA0` @921600. Foxglove-only variants:
 `rtabmap_oak_foxglove.launch.py`, `basalt_oak_foxglove.launch.py`.
 
 Rebuild: `colcon build --packages-select px4_vio_bridge` (note: **ament_cmake** — see Gotchas).
+
+### Micro XRCE-DDS Agent ownership (important)
+
+There must be exactly one owner of `/dev/ttyAMA0`. The normal configuration is the
+system v3.0.1 MicroXRCEAgent managed by systemd. Accordingly,
+`rtabmap_slam_px4.launch.py` defaults to `start_xrce_agent:=false`; enabling its
+launch-owned fallback while the service is active creates serial-port contention
+and can prevent the PX4 DDS session from connecting.
+
+The repository service file is `systemd/micro-xrce-agent.service`. Install it once:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio
+sudo install -m 0644 systemd/micro-xrce-agent.service \
+  /etc/systemd/system/micro-xrce-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now micro-xrce-agent.service
+systemctl status micro-xrce-agent.service
+```
+
+Logs: `journalctl -u micro-xrce-agent.service -f`.
+
+Manual fallback only: first run `sudo systemctl stop micro-xrce-agent.service`, then
+launch with `start_xrce_agent:=true`. Never use both owners together. The legacy
+`basalt_vio_px4.launch.py` still starts an agent unconditionally, so its use also
+requires stopping the systemd service until that launch is migrated.
 
 ## PX4 params (saved to flash — the ones that matter)
 
@@ -126,8 +153,16 @@ Node confirms arm/offboard from `/fmu/out/vehicle_control_mode` (this build does
   deliberate pre-arm move-to-initialize a checklist step. A *repeatable residual* offset after
   convergence = static camera mount → bake into bridge `vio_yaw_offset_deg`.
 
-- **OAK-D `X_LINK_ERROR` crash-loop** is cleared by physically power-cycling the camera. Healthy VIO
-  is ~10–15 Hz RTAB-Map on `/basalt/pose`.
+- **DepthAI 3.7.1 is the isolated OAK startup failure.** There are 244 saved OAK
+  crash dumps across multiple days; at least 185 contain the same device-side
+  `RTEMS_FATAL_SOURCE_INVALID_HEAP_FREE` / MIPI `Invalid config steps` assertion. On 2026-07-13 a
+  camera-only test reproduced it with no StereoDepth, VIO, SLAM, ROS, image/depth publication, or
+  point clouds. Under 3.7.1, CAM_B failed at both 640x400 and native 640x480, and at 30, 15, and
+  10 FPS, without producing a frame; CAM_C worked. The identical CAM_B test and a two-mono-camera
+  test both worked immediately under DepthAI 3.5.0. The full RTAB-Map VIO/SLAM executable then ran
+  at ~13.4 Hz on `/rtabmap/vio_pose`. Keep `depthai==3.5.0` from `requirements-depthai.txt`; the
+  executable fails fast if 3.7.1 is installed. The host-side `X_LINK_ERROR` messages are consequences
+  of the device firmware crash, not an XRCE failure or evidence that the OAK hardware needs an RMA.
 
 - **Camera feed in Foxglove: use the compressed topic.** The feed now defaults to JPEG
   `CompressedImage` on `/rtabmap/image/compressed` (best-effort, keep-last-1) — raw `/rtabmap/image`

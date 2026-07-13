@@ -1,0 +1,13 @@
+[Unit]
+Description=PX4 Micro XRCE-DDS Agent on TELEM2
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=ROS_DOMAIN_ID=42
+ExecStart=/usr/local/bin/MicroXRCEAgent serial -D /dev/ttyAMA0 -b 921600 -v 4
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

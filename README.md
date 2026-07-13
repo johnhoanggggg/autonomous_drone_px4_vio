@@ -2,7 +2,19 @@
 
 ROS 2 Jazzy workspace for sending OAK-D Lite VIO into PX4 visual odometry.
 
-Current default: RTAB-Map VIO from the OAK-D Lite publishes a compatibility pose on `/basalt/pose`; `px4_vio_bridge` converts that pose into PX4 `VehicleOdometry` on `/fmu/in/vehicle_visual_odometry`.
+Current default: RTAB-Map VIO/SLAM from the OAK-D Lite publishes its continuous VIO
+pose on `/rtabmap/vio_pose`; `px4_vio_bridge` converts that pose into PX4
+`VehicleOdometry` on `/fmu/in/vehicle_visual_odometry`.
+
+DepthAI is pinned to 3.5.0. Version 3.7.1 repeatedly crashes this OAK-D Lite's
+CAM_B during device-side MIPI startup. Install the validated version with:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio
+python3 -m pip install --user --break-system-packages \
+  -r requirements-depthai.txt
+python3 -c "import depthai; print(depthai.__version__)"  # must print 3.5.0
+```
 
 ## Main Launch
 
@@ -11,25 +23,28 @@ cd /home/john/autonomous_drone_px4_vio/ros2_ws
 source /opt/ros/jazzy/setup.bash
 source /home/john/ros2_ws/install/setup.bash
 source install/setup.bash
-ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge basalt_vio_px4.launch.py
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py
 ```
-
-Despite the legacy filename, `basalt_vio_px4.launch.py` now starts RTAB-Map VIO, not Basalt.
 
 It starts:
 
-- `/usr/local/bin/MicroXRCEAgent serial -D /dev/ttyAMA0 -b 921600 -v 4`
 - OAK-D Lite RTAB-Map VIO
 - `vio_to_px4_odometry`
 - PX4 local-position-to-ROS converter
 - Foxglove bridge on port `8765`
 
+The Micro XRCE-DDS Agent is owned by systemd, independently of the ROS launch. See
+"Micro XRCE-DDS Agent ownership" below.
+
 Performance defaults in the main launch:
 
-- `/rtabmap/image` publishing is disabled.
+- `/rtabmap/depth` publishing is disabled.
+- The compressed RGB camera feed is enabled and available to Foxglove by default;
+  disable it with `slam_publish_image:=false`.
+- Point clouds are available to Foxglove when enabled with
+  `slam_publish_clouds:=true`.
 - `/rtabmap/path` publishes every 10 odometry poses.
 - `/rtabmap/path` is capped at 1000 poses.
-- Per-frame trajectory file logging is disabled.
 
 EV yaw fusion (enabled 2026-07-07):
 
@@ -40,7 +55,7 @@ EV yaw fusion (enabled 2026-07-07):
 Yaw-offset tester (kept for re-alignment work):
 
 - Relaunch with `vio_yaw_offset_deg:=90.0` or `vio_yaw_offset_deg:=-90.0`.
-- Compare raw `/basalt/pose` with corrected `/vio/yaw_offset/pose` and `/vio/yaw_offset/path` in Foxglove.
+- Compare raw `/rtabmap/vio_pose` with corrected `/vio/yaw_offset/pose` and `/vio/yaw_offset/path` in Foxglove.
 - The corrected VIO pose is what the bridge sends toward `/fmu/in/vehicle_visual_odometry`.
 
 Foxglove URL:
@@ -54,9 +69,7 @@ Useful topics:
 ```text
 /rtabmap/path
 /rtabmap/odometry
-/rtabmap/image/compressed
-/rtabmap/image
-/basalt/pose
+/rtabmap/vio_pose
 /vio/yaw_offset/pose
 /vio/yaw_offset/path
 /vio/yaw_offset/odometry
@@ -102,9 +115,9 @@ The raw VIO pose is on `/rtabmap/vio_pose`; SLAM-corrected outputs are on
 
 ### RTAB-Map SLAM + PX4 bridge
 
-Use the combined Raspberry Pi launch to run RTAB-Map VIO/SLAM, the serial XRCE-DDS
-agent, the PX4 visual-odometry bridge, PX4 local-position visualization, and one
-Foxglove bridge:
+Use the combined Raspberry Pi launch to run RTAB-Map VIO/SLAM, the PX4
+visual-odometry bridge, PX4 local-position visualization, and one Foxglove bridge.
+The serial XRCE-DDS agent is normally already running as a systemd service:
 
 ```bash
 cd /home/john/autonomous_drone_px4_vio/ros2_ws
@@ -122,13 +135,49 @@ Important pose distinction:
   `/fmu/in/vehicle_visual_odometry`. This avoids injecting loop-closure position/yaw
   jumps into EKF2.
 - **Foxglove's SLAM visualization is loop-corrected.** `/rtabmap/pose`,
-  `/rtabmap/odometry`, `/rtabmap/path`, and the obstacle/ground clouds use RTAB-Map's
-  optimized SLAM frame.
+  `/rtabmap/odometry`, and `/rtabmap/path` use RTAB-Map's optimized SLAM frame.
 - `/px4/local_position/*` shows PX4/EKF2's estimated vehicle position. It should be
   compared with `/rtabmap/vio_pose`, not expected to follow a later SLAM loop closure.
 
 The `input_pose_topic` launch argument can select `/rtabmap/pose` experimentally, but
 feeding a discontinuous loop-corrected pose to PX4 is not the flight default.
+
+### Micro XRCE-DDS Agent ownership
+
+Exactly one process may own `/dev/ttyAMA0`. The normal flight configuration uses
+the system v3.0.1 agent as a systemd service; `rtabmap_slam_px4.launch.py` therefore
+defaults to `start_xrce_agent:=false`. Starting a second agent from ROS while the
+service is active causes serial-port contention and can leave PX4 DDS disconnected.
+
+Install and start the supplied service once:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio
+sudo install -m 0644 systemd/micro-xrce-agent.service \
+  /etc/systemd/system/micro-xrce-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now micro-xrce-agent.service
+systemctl status micro-xrce-agent.service
+```
+
+Inspect its logs with:
+
+```bash
+journalctl -u micro-xrce-agent.service -f
+```
+
+For a temporary launch-owned-agent fallback, stop the service first, then opt in:
+
+```bash
+sudo systemctl stop micro-xrce-agent.service
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge \
+  rtabmap_slam_px4.launch.py start_xrce_agent:=true
+```
+
+Do not use `start_xrce_agent:=true` while the service is active. The legacy
+`basalt_vio_px4.launch.py` still starts an agent unconditionally, so stop the
+systemd service before using that launch until it is migrated to the same ownership
+model.
 
 ### Low-latency camera feed
 

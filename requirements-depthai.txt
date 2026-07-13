@@ -1,0 +1,3 @@
+# DepthAI 3.7.1 repeatedly crashes this OAK-D Lite's CAM_B during MIPI startup.
+# Version 3.5.0 was validated with both mono cameras and the full RTAB-Map stack.
+depthai==3.5.0
