@@ -37,7 +37,7 @@ def generate_launch_description():
             DeclareLaunchArgument("rtabmap_image_format", default_value="jpeg"),
             DeclareLaunchArgument("rtabmap_image_publish_stride", default_value="1"),
             DeclareLaunchArgument("rtabmap_image_jpeg_quality", default_value="60"),
-            DeclareLaunchArgument("rtabmap_num_features", default_value="1000"),
+            DeclareLaunchArgument("rtabmap_num_features", default_value="400"),
             DeclareLaunchArgument("rtabmap_usb_speed", default_value="high"),
             DeclareLaunchArgument("rtabmap_path_publish_stride", default_value="1"),
             DeclareLaunchArgument("rtabmap_path_size", default_value="5000"),

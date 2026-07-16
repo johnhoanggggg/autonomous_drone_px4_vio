@@ -30,7 +30,10 @@ def generate_launch_description():
     oak_startup_delay = LaunchConfiguration("oak_startup_delay")
     px4_startup_delay = LaunchConfiguration("px4_startup_delay")
     slam_publish_image = LaunchConfiguration("slam_publish_image")
+    slam_publish_depth = LaunchConfiguration("slam_publish_depth")
+    slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
     slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
+    slam_num_features = LaunchConfiguration("slam_num_features")
     foxglove = LaunchConfiguration("foxglove")
     foxglove_port = LaunchConfiguration("foxglove_port")
     foxglove_topic_whitelist = LaunchConfiguration("foxglove_topic_whitelist")
@@ -68,7 +71,10 @@ def generate_launch_description():
             DeclareLaunchArgument("oak_startup_delay", default_value="5.0"),
             DeclareLaunchArgument("px4_startup_delay", default_value="0.0"),
             DeclareLaunchArgument("slam_publish_image", default_value="true"),
+            DeclareLaunchArgument("slam_publish_depth", default_value="false"),
+            DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
+            DeclareLaunchArgument("slam_num_features", default_value="400"),
             DeclareLaunchArgument("foxglove", default_value="true"),
             DeclareLaunchArgument("foxglove_port", default_value="8765"),
             DeclareLaunchArgument(
@@ -77,6 +83,7 @@ def generate_launch_description():
                     "['^/tf$', "
                     "'^/rtabmap/(vio_pose|pose|odometry|path)$', "
                     "'^/rtabmap/image(/compressed)?$', "
+                    "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
                     "'^/vio/yaw_offset/(pose|odometry|path)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
@@ -124,8 +131,10 @@ def generate_launch_description():
                                 launch_arguments={
                                     "foxglove": "false",
                                     "slam_publish_image": slam_publish_image,
-                                    "slam_publish_depth": "false",
+                                    "slam_publish_depth": slam_publish_depth,
+                                    "slam_depth_publish_hz": slam_depth_publish_hz,
                                     "slam_publish_clouds": slam_publish_clouds,
+                                    "slam_num_features": slam_num_features,
                                 }.items(),
                             )
                         ],

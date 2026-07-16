@@ -37,7 +37,7 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_image_jpeg_quality", default_value="60"),
             DeclareLaunchArgument("slam_publish_depth", default_value="true"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
-            DeclareLaunchArgument("slam_num_features", default_value="1000"),
+            DeclareLaunchArgument("slam_num_features", default_value="400"),
             DeclareLaunchArgument("slam_path_publish_stride", default_value="10"),
             DeclareLaunchArgument("slam_path_size", default_value="1000"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),

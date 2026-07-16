@@ -36,8 +36,9 @@ parser.add_argument('--publish-depth', type=parse_bool, default=False,
                     help='Publish RAW16 metric depth for Foxglove.')
 parser.add_argument('--depth-publish-hz', type=float, default=3.0,
                     help='Maximum depth publish rate in Hz.')
-parser.add_argument('--num-features', type=int, default=1000,
-                    help='RTAB-Map VIO FeatureTracker target feature count.')
+parser.add_argument('--num-features', type=int, default=400,
+                    help='RTAB-Map VIO FeatureTracker target feature count. 400 is validated '
+                         'on this OAK-D Lite; 700 can still exceed XLink metadata limits.')
 parser.add_argument('--path-publish-stride', type=int, default=10)
 parser.add_argument('--path-size', type=int, default=1000)
 parser.add_argument('--publish-clouds', type=parse_bool, default=False,
@@ -447,7 +448,7 @@ with dai.Pipeline() as p:
     imu.out.link(odom.imu)
 
     odom.transform.link(slam.odom)
-    odom.transform.link(ros2Viewer.inputBasaltTrans)
+    slam.passthroughOdom.link(ros2Viewer.inputBasaltTrans)
     slam.transform.link(ros2Viewer.inputTrans)
     if args.publish_image:
         slam.passthroughRect.link(ros2Viewer.inputImg)

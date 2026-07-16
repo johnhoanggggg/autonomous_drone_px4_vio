@@ -12,9 +12,16 @@ Safety:
   OFFBOARD+ARM is not confirmed within engage_timeout; hard max_flight_time
   watchdog forces LAND; climb_timeout forces the hold/land timeline to proceed so
   the vehicle always reaches the LAND phase.
+- When run in an interactive terminal, pressing K immediately sends PX4's forced
+  disarm command repeatedly. This stops the motors; it does NOT attempt to land.
 - On shutdown while armed it commands AUTO.LAND rather than disarming in air.
 """
 import math
+import os
+import select
+import sys
+import termios
+import tty
 
 import rclpy
 from px4_msgs.msg import (
@@ -41,6 +48,7 @@ class OffboardHover(Node):
         self.declare_parameter("reach_tol", 0.07)         # m, "reached" altitude band
         self.declare_parameter("max_flight_time", 40.0)   # armed watchdog -> force land
         self.declare_parameter("auto_arm", False)         # MUST be true to actually fly
+        self.declare_parameter("keyboard_kill", True)     # K force-disarms (interactive TTY only)
 
         self.hover_height = float(self.get_parameter("hover_height").value)
         self.hold_time = float(self.get_parameter("hold_time").value)
@@ -51,6 +59,7 @@ class OffboardHover(Node):
         self.reach_tol = float(self.get_parameter("reach_tol").value)
         self.max_flight_time = float(self.get_parameter("max_flight_time").value)
         self.auto_arm = bool(self.get_parameter("auto_arm").value)
+        self.keyboard_kill = bool(self.get_parameter("keyboard_kill").value)
 
         pub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -86,6 +95,8 @@ class OffboardHover(Node):
         self.hold_t = 0.0
         self.reached = False
         self.last_cmd_t = 0.0
+        self.stdin_fd = None
+        self.stdin_termios = None
 
         self.dt = 1.0 / self.rate_hz
         self.timer = self.create_timer(self.dt, self.tick)
@@ -93,6 +104,62 @@ class OffboardHover(Node):
             f"offboard_hover: auto_arm={self.auto_arm} hover={self.hover_height}m hold={self.hold_time}s "
             f"({'ARMED FLIGHT' if self.auto_arm else 'DRY RUN - will not arm'})"
         )
+        self.setup_keyboard_kill()
+
+    # --- keyboard emergency stop -----------------------------------------
+    def setup_keyboard_kill(self):
+        if not self.keyboard_kill:
+            self.get_logger().warn("keyboard kill switch disabled by parameter")
+            return
+        if not sys.stdin.isatty():
+            self.get_logger().warn(
+                "keyboard kill unavailable: stdin is not an interactive terminal; keep the RC kill ready"
+            )
+            return
+
+        try:
+            self.stdin_fd = sys.stdin.fileno()
+            self.stdin_termios = termios.tcgetattr(self.stdin_fd)
+            tty.setcbreak(self.stdin_fd)
+        except (OSError, termios.error) as exc:
+            self.stdin_fd = None
+            self.stdin_termios = None
+            self.get_logger().error(f"could not enable keyboard kill switch: {exc}")
+            return
+
+        self.get_logger().fatal(
+            "KEYBOARD KILL ARMED: press K in this terminal to FORCE-DISARM immediately (motors stop)"
+        )
+
+    def restore_terminal(self):
+        if self.stdin_fd is not None and self.stdin_termios is not None:
+            try:
+                termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.stdin_termios)
+            except (OSError, termios.error):
+                pass
+        self.stdin_fd = None
+        self.stdin_termios = None
+
+    def poll_keyboard_kill(self):
+        if self.stdin_fd is None:
+            return
+        try:
+            readable, _, _ = select.select([self.stdin_fd], [], [], 0.0)
+            if readable and b"k" in os.read(self.stdin_fd, 64).lower():
+                self.trigger_kill()
+        except OSError as exc:
+            self.get_logger().error(f"keyboard kill switch read failed: {exc}")
+            self.restore_terminal()
+
+    def trigger_kill(self):
+        if self.state == "KILL":
+            return
+        self.get_logger().fatal("KILL KEY PRESSED -> PX4 FORCED DISARM; MOTORS STOPPING")
+        self.set_state("KILL")
+        # Send an immediate burst as well as repeating in tick(), since this is a
+        # BEST_EFFORT link and a single command must not be relied upon.
+        for _ in range(5):
+            self.force_disarm()
 
     # --- subscriptions -----------------------------------------------------
     def on_local_position(self, msg):
@@ -156,6 +223,10 @@ class OffboardHover(Node):
     def arm(self):
         self.send_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
 
+    def force_disarm(self):
+        # PX4/MAVLink magic value 21196 bypasses the normal in-air disarm denial.
+        self.send_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0, 21196.0)
+
     def land(self):
         self.send_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
@@ -167,6 +238,16 @@ class OffboardHover(Node):
 
     def tick(self):
         self.t += self.dt
+        self.poll_keyboard_kill()
+
+        if self.state == "KILL":
+            # Stop offboard streaming and repeat for one second for transport
+            # robustness. Forced disarm is intentionally effective in the air.
+            self.force_disarm()
+            if self.t >= 1.0:
+                self.set_state("DONE")
+            return
+
         if self.is_armed:
             self.armed_t += self.dt
 
@@ -268,6 +349,7 @@ class OffboardHover(Node):
             return
 
     def on_shutdown(self):
+        self.restore_terminal()
         if self.is_armed:
             self.get_logger().error("shutdown while armed -> commanding AUTO.LAND")
             for _ in range(5):
@@ -282,6 +364,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.on_shutdown()
     finally:
+        node.restore_terminal()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

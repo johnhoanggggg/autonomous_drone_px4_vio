@@ -3,7 +3,7 @@
 Authoritative current-state doc. Full chronological history is in `HANDOFF_ARCHIVE.md`
 (kept for forensics; some of it is superseded — trust this file).
 
-Last updated: 2026-07-13.
+Last updated: 2026-07-14.
 
 ## What this project is
 
@@ -99,6 +99,9 @@ ros2 run px4_vio_bridge offboard_hover --ros-args -p auto_arm:=true  -p hover_he
 Node confirms arm/offboard from `/fmu/out/vehicle_control_mode` (this build does NOT publish
 `vehicle_status`). Safety: `auto_arm` default false; aborts if OFFBOARD+ARM not confirmed in time;
 `max_flight_time` watchdog → LAND; lost position in flight → LAND; Ctrl-C while armed → AUTO.LAND.
+When the node runs in an interactive terminal, pressing **K** (no Enter) sends PX4 forced-disarm
+commands for one second: the motors stop immediately, even in the air. This Pi-side switch depends
+on the terminal process and TELEM2/DDS link, so it supplements rather than replaces the RC kill switch.
 
 ## Pre-flight gate (all green before `auto_arm:=true`)
 
@@ -171,6 +174,17 @@ Node confirms arm/offboard from `/fmu/out/vehicle_control_mode` (this build does
   (`jpeg`/`raw`), `rtabmap_image_jpeg_quality`, `rtabmap_image_publish_stride`. Image publish uses a
   non-blocking `tryGet`, so it can't stall the `/basalt/pose` → PX4 path. Enabled in the Foxglove-only
   launches; opt-in in the main launch (`rtabmap_publish_image:=true`).
+
+- **RTAB-Map VIO feature metadata must fit XLink.** With `slam_num_features:=1000`,
+  `FeatureTracker.outputFeatures` produced about 59 KB of metadata at 30 Hz and XLink dropped every
+  message because its metadata limit is 51,200 bytes. On 2026-07-14, `700` also left VIO stuck at
+  the identity pose while `400` initialized immediately under the same motion. The feature target
+  now defaults to `400` on this OAK-D Lite.
+
+- **Keep `RTABMapVIO.transform` single-consumer in the combined SLAM graph.** Fan-out directly to
+  both `RTABMapSLAM.odom` and the ROS bridge left VIO publishing identity poses. Publish raw VIO to
+  ROS from `RTABMapSLAM.passthroughOdom` instead. With that wiring, the live obstacle map grew from
+  3,090 to 3,900 points with nine distinct updates over 20 seconds.
 
 - **ROS 2 CLI is flaky here** (`ros2 topic list/echo` miss BEST_EFFORT topics / hang). Prefer a small
   rclpy probe with matching QoS, or the launch-log grep checks above.

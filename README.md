@@ -43,6 +43,9 @@ Performance defaults in the main launch:
   disable it with `slam_publish_image:=false`.
 - Point clouds are available to Foxglove when enabled with
   `slam_publish_clouds:=true`.
+- RTAB-Map VIO defaults to `slam_num_features:=400`. A target of 1000 produced
+  about 59 KB of tracked-feature metadata at 30 Hz, exceeding DepthAI's
+  51,200-byte XLink metadata limit; 700 also left VIO stuck at identity in live testing.
 - `/rtabmap/path` publishes every 10 odometry poses.
 - `/rtabmap/path` is capped at 1000 poses.
 
@@ -272,8 +275,9 @@ Node `offboard_hover` (`px4_vio_bridge`) flies a short position-controlled hover
 Safety design:
 
 - `auto_arm` defaults to **false**: the node runs the whole sequence but never sends an arm command, so you can dry-run (props off) and confirm setpoint streaming + the OFFBOARD request without flying.
-- Aborts (never arms) if OFFBOARD+ARM are not confirmed via `vehicle_status` within `engage_timeout`.
+- Aborts (never arms) if OFFBOARD+ARM are not confirmed via `vehicle_control_mode` within `engage_timeout`.
 - `max_flight_time` watchdog forces LAND; lost local position in flight forces LAND; Ctrl-C while armed commands AUTO.LAND (never a mid-air disarm).
+- **Keyboard kill:** while the command's terminal has focus, press **K** (no Enter). The node immediately sends PX4's forced-disarm command repeatedly for one second. This is a true motor kill, not a landing command; using it airborne will make the vehicle fall.
 - Fly only with an RC transmitter bound as manual-override / kill switch (`COM_RC_IN_MODE=0`).
 
 Dry run (props off) — walks `STREAM -> ENGAGE -> CLIMB_HOLD -> LAND -> DONE` without arming:
@@ -290,6 +294,11 @@ Live flight (props on, area clear, RC ready, hand on the kill switch):
 ```bash
 ros2 run px4_vio_bridge offboard_hover --ros-args -p auto_arm:=true -p hover_height:=0.30 -p hold_time:=10.0
 ```
+
+At startup, verify the terminal prints `KEYBOARD KILL ARMED`. If stdin is redirected or the node is
+started without an interactive terminal, the keyboard switch is unavailable. It can be explicitly
+disabled with `-p keyboard_kill:=false`. The Pi-side switch relies on the ROS process and TELEM2/DDS
+link, so it is not a replacement for the independent RC kill switch.
 
 Pre-flight gate (all must be green, via `scripts/nsh.py`):
 
