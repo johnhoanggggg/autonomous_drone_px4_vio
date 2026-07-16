@@ -3,7 +3,7 @@
 Authoritative current-state doc. Full chronological history is in `HANDOFF_ARCHIVE.md`
 (kept for forensics; some of it is superseded — trust this file).
 
-Last updated: 2026-07-14.
+Last updated: 2026-07-16.
 
 ## What this project is
 
@@ -21,6 +21,8 @@ for horizontal position, height, and yaw (no GPS). Goal: indoor autonomous fligh
 
 - **EV position + yaw fusion working and validated.** `xy_valid`, `z_valid`, `v_xy_valid`,
   `heading_good_for_control` all true; EV yaw tracked physical rotation with correct sign/magnitude.
+- **EV/VIO pipeline delay measured at about 260 ms.** Two props-off yaw-reversal captures against
+  PX4 gyro measured 245 ms and 270 ms. `EKF2_EV_DELAY` is still `0.0` (measurement only; not tuned).
 - **Autonomous hover node built (`offboard_hover`); props-off dry run PASSED.** Full sequence
   `latch → STREAM → ENGAGE → CLIMB_HOLD → LAND → DONE` with no arming; PX4 accepts OFFBOARD while
   disarmed. Only the actual arm+climb is unexercised. **Not yet flown with props.**
@@ -74,6 +76,7 @@ requires stopping the systemd service until that launch is migrated.
 | `EKF2_EV_CTRL` | `11` | HPOS(1)+VPOS(2)+YAW(8). Must be a true **integer** (set via NSH, never MAVLink float). |
 | `EKF2_HGT_REF` | `3` | Height reference = Vision. |
 | `EKF2_GPS_CTRL` | `0` | No GPS. |
+| `EKF2_EV_DELAY` | `0.0` | Not yet tuned; measured VIO pipeline delay is about 260 ms. |
 | `UXRCE_DDS_SYNCC` | `0` | Timesync off — required or the uXRCE session never connects on this serial link. |
 | `UXRCE_DDS_SYNCT` | `0` | Same. `timesync converged: false` is normal/OK even when fully connected. |
 | `COM_ARM_WO_GPS` | `1` | Allow arming without GPS. |
@@ -99,9 +102,12 @@ ros2 run px4_vio_bridge offboard_hover --ros-args -p auto_arm:=true  -p hover_he
 Node confirms arm/offboard from `/fmu/out/vehicle_control_mode` (this build does NOT publish
 `vehicle_status`). Safety: `auto_arm` default false; aborts if OFFBOARD+ARM not confirmed in time;
 `max_flight_time` watchdog → LAND; lost position in flight → LAND; Ctrl-C while armed → AUTO.LAND.
-When the node runs in an interactive terminal, pressing **K** (no Enter) sends PX4 forced-disarm
-commands for one second: the motors stop immediately, even in the air. This Pi-side switch depends
-on the terminal process and TELEM2/DDS link, so it supplements rather than replaces the RC kill switch.
+While armed, stale `/rtabmap/vio_pose` (0.75 s), stale `/rtabmap/vio_feature_count` (1.0 s), or fewer
+than 15 tracked features for 1.0 s also commands AUTO.LAND (with a 1.0 s post-arm grace period).
+When the node runs in an interactive terminal, press **L** (no Enter) for controlled AUTO.LAND.
+Pressing **K** sends PX4 forced-disarm commands for one second: the motors stop immediately, even in
+the air. These Pi-side controls depend on the terminal process and TELEM2/DDS link, so they supplement
+rather than replace the RC kill switch.
 
 ## Pre-flight gate (all green before `auto_arm:=true`)
 
@@ -120,6 +126,14 @@ on the terminal process and TELEM2/DDS link, so it supplements rather than repla
 3. Live arm+climb never exercised yet.
 
 ## Known Issues & Gotchas
+
+- **Measured EV/VIO delay is about 260 ms.** On 2026-07-16, two hand-yaw captures correlated
+  `/fmu/in/vehicle_visual_odometry` yaw rate with PX4 `/fmu/out/sensor_combined` gyro Z. Peaks were
+  245 ms (correlation 0.582, 135.6 deg excitation) and 270 ms (correlation 0.985, 54.7 deg), so use
+  about 260 ms as the current estimate. The peak-widths overlapped from 195 to 320 ms. Do not infer
+  delay by correlating EV with `vehicle_local_position`: EKF IMU propagation can make local position
+  lead the delayed EV observation. Repeat with `scripts/measure_ev_fusion_delay.py`; `EKF2_EV_DELAY`
+  was deliberately left at 0.0 pending a separate tuning/validation step.
 
 - **TELEM2/DDS link is marginal.** USB `/dev/ttyACM0` is dev/debug; flight comms is TELEM2/uXRCE
   `/dev/ttyAMA0` @921600. A cold uXRCE session sometimes gets stuck re-establishing its whole

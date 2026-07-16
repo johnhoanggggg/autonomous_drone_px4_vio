@@ -251,6 +251,23 @@ Subscription count: 1
 
 If `Subscription count` is `0` after restarting the XRCE agent, reboot/replug the Pixhawk or restart PX4 `uxrce_dds_client` while the agent is already running.
 
+### Measure EV/VIO delay
+
+With props removed and the main launch running, make several distinct hand-yaw reversals while this
+helper records EV yaw and PX4 gyro Z:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/john/ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
+python3 scripts/measure_ev_fusion_delay.py --duration 30
+```
+
+Two captures on 2026-07-16 measured 245 ms and 270 ms, giving a practical current estimate of
+about **260 ms** (overlapping peak-width 195-320 ms). `EKF2_EV_DELAY` remains `0.0`; the measurement
+did not change PX4 parameters. The helper's gyro-referenced result is the relevant one because EKF
+IMU propagation can make `vehicle_local_position` lead the delayed vision observation.
+
 ## NSH Access (PX4 shell from the Pi)
 
 `scripts/nsh.py` runs PX4 NSH commands over MAVLink `SERIAL_CONTROL` on the Pixhawk USB link (`/dev/ttyACM0` @115200), using the `.venv-mavlink` interpreter. Each argument is one NSH command line:
@@ -277,6 +294,8 @@ Safety design:
 - `auto_arm` defaults to **false**: the node runs the whole sequence but never sends an arm command, so you can dry-run (props off) and confirm setpoint streaming + the OFFBOARD request without flying.
 - Aborts (never arms) if OFFBOARD+ARM are not confirmed via `vehicle_control_mode` within `engage_timeout`.
 - `max_flight_time` watchdog forces LAND; lost local position in flight forces LAND; Ctrl-C while armed commands AUTO.LAND (never a mid-air disarm).
+- **Tracking-loss landing:** while armed, the node monitors `/rtabmap/vio_pose` and `/rtabmap/vio_feature_count`. A stale VIO pose (default `0.75 s`), stale feature data (`1.0 s`), or fewer than 15 tracked features for `1.0 s` commands AUTO.LAND. The first second after arming is a grace period.
+- **Keyboard land:** while the command's terminal has focus, press **L** (no Enter) to request AUTO.LAND.
 - **Keyboard kill:** while the command's terminal has focus, press **K** (no Enter). The node immediately sends PX4's forced-disarm command repeatedly for one second. This is a true motor kill, not a landing command; using it airborne will make the vehicle fall.
 - Fly only with an RC transmitter bound as manual-override / kill switch (`COM_RC_IN_MODE=0`).
 
@@ -295,10 +314,16 @@ Live flight (props on, area clear, RC ready, hand on the kill switch):
 ros2 run px4_vio_bridge offboard_hover --ros-args -p auto_arm:=true -p hover_height:=0.30 -p hold_time:=10.0
 ```
 
-At startup, verify the terminal prints `KEYBOARD KILL ARMED`. If stdin is redirected or the node is
-started without an interactive terminal, the keyboard switch is unavailable. It can be explicitly
-disabled with `-p keyboard_kill:=false`. The Pi-side switch relies on the ROS process and TELEM2/DDS
-link, so it is not a replacement for the independent RC kill switch.
+At startup, verify the terminal prints `KEYBOARD CONTROLS: press L for AUTO.LAND; press K to
+FORCE-DISARM immediately`. If stdin is redirected or the node is started without an interactive
+terminal, both keyboard controls are unavailable. They can be disabled independently with
+`-p keyboard_land:=false` and `-p keyboard_kill:=false`. The Pi-side controls and automatic
+tracking-loss landing rely on the ROS process and TELEM2/DDS link, so they are not replacements for
+the independent RC kill switch.
+
+Tracking-loss thresholds are configurable with `vio_pose_timeout`, `vio_feature_timeout`,
+`min_vio_features`, `vio_feature_loss_time`, and `tracking_arm_grace`. Disable this monitor only for
+diagnosis with `-p tracking_loss_land:=false`.
 
 Pre-flight gate (all must be green, via `scripts/nsh.py`):
 

@@ -81,7 +81,7 @@ def generate_launch_description():
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf$', "
-                    "'^/rtabmap/(vio_pose|pose|odometry|path)$', "
+                    "'^/rtabmap/(vio_pose|pose|odometry|path|vio_feature_count)$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "

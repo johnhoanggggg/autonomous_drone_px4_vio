@@ -12,8 +12,11 @@ Safety:
   OFFBOARD+ARM is not confirmed within engage_timeout; hard max_flight_time
   watchdog forces LAND; climb_timeout forces the hold/land timeline to proceed so
   the vehicle always reaches the LAND phase.
-- When run in an interactive terminal, pressing K immediately sends PX4's forced
-  disarm command repeatedly. This stops the motors; it does NOT attempt to land.
+- When run in an interactive terminal, L requests AUTO.LAND and K immediately
+  sends PX4's forced-disarm command repeatedly. K stops the motors; it does NOT
+  attempt to land.
+- While armed, stale RTAB-Map VIO poses, stale feature-count data, or a sustained
+  low tracked-feature count request AUTO.LAND.
 - On shutdown while armed it commands AUTO.LAND rather than disarming in air.
 """
 import math
@@ -21,9 +24,11 @@ import os
 import select
 import sys
 import termios
+import time
 import tty
 
 import rclpy
+from geometry_msgs.msg import PoseStamped
 from px4_msgs.msg import (
     OffboardControlMode,
     TrajectorySetpoint,
@@ -33,6 +38,7 @@ from px4_msgs.msg import (
 )
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Int32
 
 
 class OffboardHover(Node):
@@ -49,6 +55,15 @@ class OffboardHover(Node):
         self.declare_parameter("max_flight_time", 40.0)   # armed watchdog -> force land
         self.declare_parameter("auto_arm", False)         # MUST be true to actually fly
         self.declare_parameter("keyboard_kill", True)     # K force-disarms (interactive TTY only)
+        self.declare_parameter("keyboard_land", True)     # L requests AUTO.LAND (interactive TTY only)
+        self.declare_parameter("tracking_loss_land", True)
+        self.declare_parameter("vio_pose_topic", "/rtabmap/vio_pose")
+        self.declare_parameter("vio_feature_topic", "/rtabmap/vio_feature_count")
+        self.declare_parameter("vio_pose_timeout", 0.75)       # seconds without a VIO pose
+        self.declare_parameter("vio_feature_timeout", 1.0)     # seconds without feature data
+        self.declare_parameter("min_vio_features", 15)         # sustained count below this is lost
+        self.declare_parameter("vio_feature_loss_time", 1.0)   # low-count persistence before LAND
+        self.declare_parameter("tracking_arm_grace", 1.0)      # settle time after arm confirmation
 
         self.hover_height = float(self.get_parameter("hover_height").value)
         self.hold_time = float(self.get_parameter("hold_time").value)
@@ -60,6 +75,13 @@ class OffboardHover(Node):
         self.max_flight_time = float(self.get_parameter("max_flight_time").value)
         self.auto_arm = bool(self.get_parameter("auto_arm").value)
         self.keyboard_kill = bool(self.get_parameter("keyboard_kill").value)
+        self.keyboard_land = bool(self.get_parameter("keyboard_land").value)
+        self.tracking_loss_land = bool(self.get_parameter("tracking_loss_land").value)
+        self.vio_pose_timeout = float(self.get_parameter("vio_pose_timeout").value)
+        self.vio_feature_timeout = float(self.get_parameter("vio_feature_timeout").value)
+        self.min_vio_features = int(self.get_parameter("min_vio_features").value)
+        self.vio_feature_loss_time = float(self.get_parameter("vio_feature_loss_time").value)
+        self.tracking_arm_grace = float(self.get_parameter("tracking_arm_grace").value)
 
         pub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -84,6 +106,18 @@ class OffboardHover(Node):
         # so arm/offboard state is confirmed from its flags.
         self.create_subscription(VehicleControlMode, "/fmu/out/vehicle_control_mode",
                                  self.on_control_mode, sub_qos)
+        self.create_subscription(
+            PoseStamped,
+            str(self.get_parameter("vio_pose_topic").value),
+            self.on_vio_pose,
+            10,
+        )
+        self.create_subscription(
+            Int32,
+            str(self.get_parameter("vio_feature_topic").value),
+            self.on_vio_feature_count,
+            10,
+        )
 
         self.pos = None            # latest VehicleLocalPosition
         self.vcm = None            # latest VehicleControlMode
@@ -97,6 +131,10 @@ class OffboardHover(Node):
         self.last_cmd_t = 0.0
         self.stdin_fd = None
         self.stdin_termios = None
+        self.last_vio_pose_time = None
+        self.last_vio_feature_time = None
+        self.vio_feature_count = None
+        self.low_features_since = None
 
         self.dt = 1.0 / self.rate_hz
         self.timer = self.create_timer(self.dt, self.tick)
@@ -104,16 +142,16 @@ class OffboardHover(Node):
             f"offboard_hover: auto_arm={self.auto_arm} hover={self.hover_height}m hold={self.hold_time}s "
             f"({'ARMED FLIGHT' if self.auto_arm else 'DRY RUN - will not arm'})"
         )
-        self.setup_keyboard_kill()
+        self.setup_keyboard_controls()
 
-    # --- keyboard emergency stop -----------------------------------------
-    def setup_keyboard_kill(self):
-        if not self.keyboard_kill:
-            self.get_logger().warn("keyboard kill switch disabled by parameter")
+    # --- keyboard flight controls ----------------------------------------
+    def setup_keyboard_controls(self):
+        if not self.keyboard_kill and not self.keyboard_land:
+            self.get_logger().warn("keyboard kill and land controls disabled by parameters")
             return
         if not sys.stdin.isatty():
             self.get_logger().warn(
-                "keyboard kill unavailable: stdin is not an interactive terminal; keep the RC kill ready"
+                "keyboard controls unavailable: stdin is not an interactive terminal; keep the RC kill ready"
             )
             return
 
@@ -124,11 +162,11 @@ class OffboardHover(Node):
         except (OSError, termios.error) as exc:
             self.stdin_fd = None
             self.stdin_termios = None
-            self.get_logger().error(f"could not enable keyboard kill switch: {exc}")
+            self.get_logger().error(f"could not enable keyboard controls: {exc}")
             return
 
-        self.get_logger().fatal(
-            "KEYBOARD KILL ARMED: press K in this terminal to FORCE-DISARM immediately (motors stop)"
+        self.get_logger().warn(
+            "KEYBOARD CONTROLS: press L for AUTO.LAND; press K to FORCE-DISARM immediately"
         )
 
     def restore_terminal(self):
@@ -140,15 +178,20 @@ class OffboardHover(Node):
         self.stdin_fd = None
         self.stdin_termios = None
 
-    def poll_keyboard_kill(self):
+    def poll_keyboard_controls(self):
         if self.stdin_fd is None:
             return
         try:
             readable, _, _ = select.select([self.stdin_fd], [], [], 0.0)
-            if readable and b"k" in os.read(self.stdin_fd, 64).lower():
-                self.trigger_kill()
+            if readable:
+                keys = os.read(self.stdin_fd, 64).lower()
+                # K takes precedence if both keys are present in one read.
+                if self.keyboard_kill and b"k" in keys:
+                    self.trigger_kill()
+                elif self.keyboard_land and b"l" in keys:
+                    self.trigger_landing("LAND KEY PRESSED")
         except OSError as exc:
-            self.get_logger().error(f"keyboard kill switch read failed: {exc}")
+            self.get_logger().error(f"keyboard control read failed: {exc}")
             self.restore_terminal()
 
     def trigger_kill(self):
@@ -167,6 +210,22 @@ class OffboardHover(Node):
 
     def on_control_mode(self, msg):
         self.vcm = msg
+
+    def monotonic_time(self):
+        return time.monotonic()
+
+    def on_vio_pose(self, _msg):
+        self.last_vio_pose_time = self.monotonic_time()
+
+    def on_vio_feature_count(self, msg):
+        now = self.monotonic_time()
+        self.last_vio_feature_time = now
+        self.vio_feature_count = int(msg.data)
+        if self.vio_feature_count < self.min_vio_features:
+            if self.low_features_since is None:
+                self.low_features_since = now
+        else:
+            self.low_features_since = None
 
     @property
     def is_armed(self):
@@ -227,8 +286,38 @@ class OffboardHover(Node):
         # PX4/MAVLink magic value 21196 bypasses the normal in-air disarm denial.
         self.send_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0, 21196.0)
 
-    def land(self):
+    def request_land(self):
         self.send_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+
+    def trigger_landing(self, reason):
+        if self.state in ("LAND", "KILL", "DONE"):
+            return
+        if not self.is_armed:
+            self.get_logger().warn(f"{reason}, but vehicle is not armed; LAND ignored")
+            return
+        self.get_logger().error(f"{reason} -> AUTO.LAND")
+        self.request_land()
+        self.set_state("LAND")
+
+    def tracking_loss_reason(self):
+        if not self.tracking_loss_land or not self.is_armed:
+            return None
+        if self.armed_t < self.tracking_arm_grace:
+            return None
+
+        now = self.monotonic_time()
+        if self.last_vio_pose_time is None or now - self.last_vio_pose_time > self.vio_pose_timeout:
+            return f"RTAB-Map VIO pose stale for >{self.vio_pose_timeout:.2f}s"
+        if (self.last_vio_feature_time is None
+                or now - self.last_vio_feature_time > self.vio_feature_timeout):
+            return f"RTAB-Map feature data stale for >{self.vio_feature_timeout:.2f}s"
+        if (self.low_features_since is not None
+                and now - self.low_features_since >= self.vio_feature_loss_time):
+            return (
+                f"RTAB-Map tracking features stayed below {self.min_vio_features} "
+                f"for {self.vio_feature_loss_time:.2f}s (latest={self.vio_feature_count})"
+            )
+        return None
 
     # --- state machine -----------------------------------------------------
     def set_state(self, name):
@@ -238,7 +327,7 @@ class OffboardHover(Node):
 
     def tick(self):
         self.t += self.dt
-        self.poll_keyboard_kill()
+        self.poll_keyboard_controls()
 
         if self.state == "KILL":
             # Stop offboard streaming and repeat for one second for transport
@@ -250,6 +339,10 @@ class OffboardHover(Node):
 
         if self.is_armed:
             self.armed_t += self.dt
+
+        tracking_loss = self.tracking_loss_reason()
+        if tracking_loss is not None and self.state not in ("LAND", "KILL", "DONE"):
+            self.trigger_landing(tracking_loss)
 
         # global armed watchdog
         if self.is_armed and self.armed_t > self.max_flight_time and self.state not in ("LAND", "DONE"):
@@ -323,9 +416,10 @@ class OffboardHover(Node):
 
         if self.state == "LAND":
             # keep streaming a couple cycles then hand to AUTO.LAND
-            self.publish_setpoint(self.hover_height)
+            if self.x0 is not None:
+                self.publish_setpoint(self.hover_height)
             if self.t < 0.2:
-                self.land()
+                self.request_land()
             if not self.is_armed and self.t > 1.0:
                 self.get_logger().warn("disarmed on ground -> DONE")
                 self.set_state("DONE")
@@ -337,7 +431,7 @@ class OffboardHover(Node):
         if self.state == "ABORT":
             # never flew (or engage failed). If somehow armed, land; else just stop.
             if self.is_armed:
-                self.land()
+                self.request_land()
             if self.t > 1.0:
                 self.set_state("DONE")
             return
@@ -353,7 +447,7 @@ class OffboardHover(Node):
         if self.is_armed:
             self.get_logger().error("shutdown while armed -> commanding AUTO.LAND")
             for _ in range(5):
-                self.land()
+                self.request_land()
 
 
 def main(args=None):

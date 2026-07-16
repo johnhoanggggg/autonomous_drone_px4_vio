@@ -13,6 +13,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import CameraInfo, PointCloud2, PointField, Image, CompressedImage
+from std_msgs.msg import Int32
 from tf2_ros import TransformBroadcaster
 
 
@@ -73,6 +74,9 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.inputObstaclePCL = dai.Node.Input(self)
         self.inputGroundPCL = dai.Node.Input(self)
         self.inputGrid = dai.Node.Input(self)
+        self.inputFeatures = dai.Node.Input(self)
+        self.inputFeatures.setBlocking(False)
+        self.inputFeatures.setMaxSize(1)
 
         self.ros_node = Node('basalt_slam_bridge')
         self.path_pub = self.ros_node.create_publisher(Path, '/rtabmap/path', 10)
@@ -81,6 +85,9 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.vio_pose_pub = self.ros_node.create_publisher(PoseStamped, args.vio_pose_topic, 10)
         self.obstacle_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/obstacle_cloud', 10)
         self.ground_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/ground_cloud', 10)
+        self.feature_count_pub = self.ros_node.create_publisher(
+            Int32, '/rtabmap/vio_feature_count', 10)
+        self.last_feature_report = 0.0
         self.tf_broadcaster = TransformBroadcaster(self.ros_node)
 
         self.publish_image = args.publish_image
@@ -206,9 +213,19 @@ class Ros2Node(dai.node.ThreadedHostNode):
             depthFrame = self.inputDepth.tryGet() if self.publish_depth else None
             pclObstData = self.inputObstaclePCL.tryGet() if self.publish_clouds else None
             pclGrndData = self.inputGroundPCL.tryGet() if self.publish_clouds else None
+            featuresData = self.inputFeatures.tryGet()
             # grid received but not published (too large for XLink)
 
             now = self.ros_node.get_clock().now().to_msg()
+
+            if featuresData is not None:
+                feature_count = len(featuresData.trackedFeatures)
+                self.feature_count_pub.publish(Int32(data=feature_count))
+                monotonic_now = time.monotonic()
+                if monotonic_now - self.last_feature_report >= 1.0:
+                    self.last_feature_report = monotonic_now
+                    self.ros_node.get_logger().info(
+                        f'VIO tracked features: {feature_count}/{args.num_features}')
 
             if basaltTransData is not None:
                 self.vio_pose_pub.publish(self._make_pose(basaltTransData, now))
@@ -419,8 +436,10 @@ with dai.Pipeline() as p:
         featureTracker.initialConfig.setCornerDetector(
             dai.FeatureTrackerConfig.CornerDetector.Type.HARRIS)
         featureTracker.initialConfig.setNumTargetFeatures(args.num_features)
-        featureTracker.initialConfig.setMotionEstimator(False)
+        featureTracker.initialConfig.setOpticalFlow()
+        featureTracker.initialConfig.setMotionEstimator(True)
         featureTracker.initialConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 49
+        odom.setUseFeatures(True)
 
     stereo.setExtendedDisparity(False)
     stereo.setLeftRightCheck(True)
@@ -443,6 +462,7 @@ with dai.Pipeline() as p:
         featureTracker.passthroughInputImage.link(odom.rect)
         stereo.depth.link(odom.depth)
         featureTracker.outputFeatures.link(odom.features)
+        featureTracker.outputFeatures.link(ros2Viewer.inputFeatures)
         odom.passthroughRect.link(slam.rect)
         odom.passthroughDepth.link(slam.depth)
     imu.out.link(odom.imu)

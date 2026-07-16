@@ -12,6 +12,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import Int32
 
 
 def parse_bool(value):
@@ -46,12 +47,18 @@ class Ros2Node(dai.node.ThreadedHostNode):
         dai.node.ThreadedHostNode.__init__(self)
         self.inputTrans = dai.Node.Input(self)
         self.inputImg = dai.Node.Input(self)
+        self.inputFeatures = dai.Node.Input(self)
+        self.inputFeatures.setBlocking(False)
+        self.inputFeatures.setMaxSize(1)
         self.initialized = False  # add this
 
         self.ros_node = Node('rtabmap_vio_bridge')
         self.path_pub = self.ros_node.create_publisher(Path, '/rtabmap/path', 10)
         self.odom_pub = self.ros_node.create_publisher(Odometry, '/rtabmap/odometry', 10)
         self.pose_pub = self.ros_node.create_publisher(PoseStamped, '/basalt/pose', 10)
+        self.feature_count_pub = self.ros_node.create_publisher(
+            Int32, '/rtabmap/vio_feature_count', 10)
+        self.last_feature_report = 0.0
 
         self.publish_image = args.publish_image
         self.image_format = args.image_format
@@ -101,8 +108,18 @@ class Ros2Node(dai.node.ThreadedHostNode):
             # tryGet (non-blocking): never let the camera feed stall the pose
             # stream that feeds PX4 if the image queue runs dry.
             imgFrame = self.inputImg.tryGet() if self.publish_image else None
+            featuresData = self.inputFeatures.tryGet()
 
             now = self.ros_node.get_clock().now().to_msg()
+
+            if featuresData is not None:
+                feature_count = len(featuresData.trackedFeatures)
+                self.feature_count_pub.publish(Int32(data=feature_count))
+                monotonic_now = time.monotonic()
+                if monotonic_now - self.last_feature_report >= 1.0:
+                    self.last_feature_report = monotonic_now
+                    self.ros_node.get_logger().info(
+                        f'VIO tracked features: {feature_count}/{args.num_features}')
 
             if transData is not None:
                 trans = transData.getTranslation()
@@ -216,8 +233,10 @@ with dai.Pipeline() as p:
     featureTracker.setHardwareResources(1, 2)
     featureTracker.initialConfig.setCornerDetector(dai.FeatureTrackerConfig.CornerDetector.Type.HARRIS)
     featureTracker.initialConfig.setNumTargetFeatures(args.num_features)
-    featureTracker.initialConfig.setMotionEstimator(False)
+    featureTracker.initialConfig.setOpticalFlow()
+    featureTracker.initialConfig.setMotionEstimator(True)
     featureTracker.initialConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 49
+    odom.setUseFeatures(True)
 
     stereo.setExtendedDisparity(False)
     stereo.setLeftRightCheck(True)
@@ -233,6 +252,7 @@ with dai.Pipeline() as p:
     featureTracker.passthroughInputImage.link(odom.rect)
     stereo.depth.link(odom.depth)
     featureTracker.outputFeatures.link(odom.features)
+    featureTracker.outputFeatures.link(ros2Viewer.inputFeatures)
     imu.out.link(odom.imu)
 
     if args.publish_image:
