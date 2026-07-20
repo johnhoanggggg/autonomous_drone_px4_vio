@@ -74,7 +74,7 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_publish_depth", default_value="false"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
-            DeclareLaunchArgument("slam_num_features", default_value="400"),
+            DeclareLaunchArgument("slam_num_features", default_value="500"),
             DeclareLaunchArgument("foxglove", default_value="true"),
             DeclareLaunchArgument("foxglove_port", default_value="8765"),
             DeclareLaunchArgument(

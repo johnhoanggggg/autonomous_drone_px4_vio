@@ -25,6 +25,9 @@ env/
 # Large local dependency checkouts/builds
 tools/
 
+# DepthAI downloaded model cache
+.depthai_cached_models/
+
 # Editor/OS noise
 .vscode/
 .idea/

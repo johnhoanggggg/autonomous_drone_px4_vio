@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+from collections import deque
+from datetime import timedelta
 import io
 import time
 import threading
 import numpy as np
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageDraw
 import depthai as dai
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -50,6 +52,23 @@ parser.add_argument('--cloud-coordinate-limit', type=float, default=100.0,
                     help='Reject cloud coordinates outside +/- this many metres.')
 parser.add_argument('--publish-grid', type=parse_bool, default=False,
                     help='Publish the RTAB-Map occupancy grid from DepthAI. Usually too heavy.')
+parser.add_argument('--detect-people', type=parse_bool, default=False,
+                    help='Run RGB person detection and publish RGB-aligned person points.')
+parser.add_argument('--person-model', default='luxonis/yolov6-nano:r2-coco-512x288',
+                    help='DepthAI model-zoo detector compatible with this RVC2 OAK.')
+parser.add_argument('--person-detection-fps', type=float, default=2.0,
+                    help='RGB neural-network rate. Keep below VIO rate to preserve resources.')
+parser.add_argument('--person-nn-shaves', type=int, default=2,
+                    help='RVC2 SHAVEs assigned to the person detector (1-16).')
+parser.add_argument('--person-confidence', type=float, default=0.5)
+parser.add_argument('--person-label', type=int, default=0,
+                    help='Model class index for person (COCO models use 0).')
+parser.add_argument('--person-depth-min-m', type=float, default=0.3)
+parser.add_argument('--person-depth-max-m', type=float, default=8.0)
+parser.add_argument('--person-depth-band-m', type=float, default=0.45,
+                    help='Keep bbox depths within this distance of its median to reject background.')
+parser.add_argument('--person-point-stride', type=int, default=2,
+                    help='Use every Nth RGB-D pixel inside a person box.')
 args, ros_args = parser.parse_known_args()
 
 if dai.__version__ == '3.7.1':
@@ -61,6 +80,35 @@ if dai.__version__ == '3.7.1':
     )
 
 rclpy.init(args=ros_args)
+
+
+class PoseTimestampNode(dai.node.ThreadedHostNode):
+    """Attach the matching stereo-frame timestamp to VIO TransformData.
+
+    RTABMapVIO 3.5 emits its transform and rectified frame together, but the
+    transform currently has no timestamp. Pairing those ordered outputs here
+    lets RGB detections select the vehicle pose from the same capture time.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.inputTransform = self.createInput()
+        self.inputFrame = self.createInput()
+        self.outputTransform = self.createOutput()
+        self.inputTransform.setMaxSize(1)
+        self.inputFrame.setMaxSize(1)
+
+    def run(self):
+        while self.mainLoop():
+            transform = self.inputTransform.get()
+            frame = self.inputFrame.get()
+            if transform is None or frame is None:
+                continue
+            transform.setTimestamp(frame.getTimestamp())
+            transform.setTimestampDevice(
+                frame.getTimestampDevice(dai.CameraExposureOffset.MIDDLE))
+            self.outputTransform.send(transform)
+
 
 class Ros2Node(dai.node.ThreadedHostNode):
     def __init__(self):
@@ -77,6 +125,9 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.inputFeatures = dai.Node.Input(self)
         self.inputFeatures.setBlocking(False)
         self.inputFeatures.setMaxSize(1)
+        self.inputPersonGroup = dai.Node.Input(self)
+        self.inputPersonGroup.setBlocking(False)
+        self.inputPersonGroup.setMaxSize(1)
 
         self.ros_node = Node('basalt_slam_bridge')
         self.path_pub = self.ros_node.create_publisher(Path, '/rtabmap/path', 10)
@@ -89,18 +140,54 @@ class Ros2Node(dai.node.ThreadedHostNode):
             Int32, '/rtabmap/vio_feature_count', 10)
         self.last_feature_report = 0.0
         self.tf_broadcaster = TransformBroadcaster(self.ros_node)
-
-        self.publish_image = args.publish_image
-        self.image_format = args.image_format
-        self.image_publish_stride = max(1, args.image_publish_stride)
-        self.jpeg_quality = min(95, max(1, args.image_jpeg_quality))
-        self.image_count = 0
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             durability=DurabilityPolicy.VOLATILE,
         )
+
+        self.detect_people = args.detect_people
+        self.person_point_stride = max(1, args.person_point_stride)
+        self.person_depth_min_m = max(0.0, args.person_depth_min_m)
+        self.person_depth_max_m = max(
+            self.person_depth_min_m + 0.01, args.person_depth_max_m)
+        self.person_depth_band_m = max(0.0, args.person_depth_band_m)
+        self.raw_pose_history = deque(maxlen=120)
+        self.person_depth_history = deque(maxlen=30)
+        self.map_correction = np.eye(4, dtype=np.float64)
+        self.rgb_to_left = np.eye(4, dtype=np.float64)
+        self.left_to_rgb = np.eye(4, dtype=np.float64)
+        self.left_optical_to_body = np.array(
+            [[0.0, 0.0, 1.0, 0.0],
+             [-1.0, 0.0, 0.0, 0.0],
+             [0.0, -1.0, 0.0, 0.0],
+             [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+        self.person_image_pub = None
+        self.person_cloud_pub = None
+        self.person_count_pub = None
+        if self.detect_people:
+            self.person_image_pub = self.ros_node.create_publisher(
+                CompressedImage, '/person/image/compressed', sensor_qos)
+            self.person_cloud_pub = self.ros_node.create_publisher(
+                PointCloud2, '/person/points', sensor_qos)
+            self.person_count_pub = self.ros_node.create_publisher(
+                Int32, '/person/count', 10)
+            calibration = self.getParentPipeline().getDefaultDevice().readCalibration()
+            self.rgb_to_left = np.asarray(
+                calibration.getCameraExtrinsics(
+                    dai.CameraBoardSocket.CAM_A,
+                    dai.CameraBoardSocket.CAM_B,
+                    False,
+                    dai.LengthUnit.METER),
+                dtype=np.float64)
+            self.left_to_rgb = np.linalg.inv(self.rgb_to_left)
+
+        self.publish_image = args.publish_image
+        self.image_format = args.image_format
+        self.image_publish_stride = max(1, args.image_publish_stride)
+        self.jpeg_quality = min(95, max(1, args.image_jpeg_quality))
+        self.image_count = 0
         self.img_pub = None
         self.img_compressed_pub = None
         if self.publish_image:
@@ -205,15 +292,198 @@ class Ros2Node(dai.node.ThreadedHostNode):
         msg.data = cloud.tobytes()
         return msg
 
+    @staticmethod
+    def _timestamp_seconds(message):
+        timestamp = message.getTimestampDevice()
+        return timestamp.total_seconds()
+
+    @staticmethod
+    def _transform_matrix(transform_data):
+        trans = transform_data.getTranslation()
+        quat = transform_data.getQuaternion()
+        x, y, z, w = quat.qx, quat.qy, quat.qz, quat.qw
+        norm = x*x + y*y + z*z + w*w
+        if norm <= 1e-12:
+            rotation = np.eye(3, dtype=np.float64)
+        else:
+            scale = 2.0 / norm
+            rotation = np.array([
+                [1.0-scale*(y*y+z*z), scale*(x*y-z*w), scale*(x*z+y*w)],
+                [scale*(x*y+z*w), 1.0-scale*(x*x+z*z), scale*(y*z-x*w)],
+                [scale*(x*z-y*w), scale*(y*z+x*w), 1.0-scale*(x*x+y*y)],
+            ], dtype=np.float64)
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[:3, :3] = rotation
+        matrix[:3, 3] = (trans.x, trans.y, trans.z)
+        return matrix
+
+    def _pose_for_timestamp(self, timestamp):
+        if not self.raw_pose_history:
+            return None, None
+        sample_time, raw_pose = min(
+            self.raw_pose_history, key=lambda item: abs(item[0] - timestamp))
+        return self.map_correction @ raw_pose, abs(sample_time - timestamp)
+
+    def _publish_person_group(self, group, now):
+        try:
+            rgb_frame = group['rgb']
+            detections_msg = group['detections']
+            bgr = np.asarray(rgb_frame.getCvFrame(), dtype=np.uint8)
+        except Exception as exc:
+            self.ros_node.get_logger().warning(f'person RGB decode failed: {exc}')
+            return
+
+        if bgr.ndim != 3:
+            self.ros_node.get_logger().warning(f'person RGB shape is invalid: {bgr.shape}')
+            return
+
+        image = PILImage.fromarray(bgr[:, :, ::-1], mode='RGB')
+        draw = ImageDraw.Draw(image)
+        height, width = bgr.shape[:2]
+        try:
+            rgb_intrinsics = np.asarray(
+                rgb_frame.getTransformation().getIntrinsicMatrix(), dtype=np.float64)
+        except Exception as exc:
+            self.ros_node.get_logger().warning(f'RGB intrinsics unavailable: {exc}')
+            return
+
+        detection_time = self._timestamp_seconds(rgb_frame)
+        world_from_body, pose_delta = self._pose_for_timestamp(detection_time)
+        depth_sample = None
+        depth_delta = None
+        if self.person_depth_history:
+            depth_sample = min(
+                self.person_depth_history,
+                key=lambda item: abs(item[0] - detection_time),
+            )
+            depth_delta = abs(depth_sample[0] - detection_time)
+
+        left_points = None
+        rgb_pixels_u = None
+        rgb_pixels_v = None
+        sampled_colors = None
+        if depth_sample is not None:
+            _, depth_mm, depth_intrinsics = depth_sample
+            depth_height, depth_width = depth_mm.shape
+            stride = self.person_point_stride
+            vv, uu = np.mgrid[0:depth_height:stride, 0:depth_width:stride]
+            depth_m = depth_mm[0:depth_height:stride, 0:depth_width:stride].astype(
+                np.float64) * 0.001
+            valid_depth = (
+                (depth_m >= self.person_depth_min_m)
+                & (depth_m <= self.person_depth_max_m)
+            )
+            if np.any(valid_depth):
+                z = depth_m[valid_depth]
+                fx_d, fy_d = depth_intrinsics[0, 0], depth_intrinsics[1, 1]
+                cx_d, cy_d = depth_intrinsics[0, 2], depth_intrinsics[1, 2]
+                x = (uu[valid_depth].astype(np.float64) - cx_d) * z / fx_d
+                y = (vv[valid_depth].astype(np.float64) - cy_d) * z / fy_d
+                left_points = np.column_stack((x, y, z, np.ones_like(z)))
+                rgb_points = (self.left_to_rgb @ left_points.T).T
+                in_front = rgb_points[:, 2] > 0.01
+                left_points = left_points[in_front]
+                rgb_points = rgb_points[in_front]
+                fx_r, fy_r = rgb_intrinsics[0, 0], rgb_intrinsics[1, 1]
+                cx_r, cy_r = rgb_intrinsics[0, 2], rgb_intrinsics[1, 2]
+                rgb_pixels_u = fx_r * rgb_points[:, 0] / rgb_points[:, 2] + cx_r
+                rgb_pixels_v = fy_r * rgb_points[:, 1] / rgb_points[:, 2] + cy_r
+                color_u = np.rint(rgb_pixels_u).astype(np.int32)
+                color_v = np.rint(rgb_pixels_v).astype(np.int32)
+                inside_rgb = (
+                    (color_u >= 0) & (color_u < width)
+                    & (color_v >= 0) & (color_v < height)
+                )
+                left_points = left_points[inside_rgb]
+                rgb_points = rgb_points[inside_rgb]
+                rgb_pixels_u = rgb_pixels_u[inside_rgb]
+                rgb_pixels_v = rgb_pixels_v[inside_rgb]
+                sampled_colors = bgr[color_v[inside_rgb], color_u[inside_rgb]][:, ::-1]
+
+        person_detections = [
+            detection for detection in detections_msg.detections
+            if detection.label == args.person_label
+            and detection.confidence >= args.person_confidence
+        ]
+        self.person_count_pub.publish(Int32(data=len(person_detections)))
+
+        world_points = []
+        point_colors = []
+        for detection in person_detections:
+            x0 = max(0, min(width - 1, int(np.floor(detection.xmin * width))))
+            y0 = max(0, min(height - 1, int(np.floor(detection.ymin * height))))
+            x1 = max(x0 + 1, min(width, int(np.ceil(detection.xmax * width))))
+            y1 = max(y0 + 1, min(height, int(np.ceil(detection.ymax * height))))
+            draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(255, 64, 64), width=3)
+
+            if left_points is not None:
+                valid = (
+                    (rgb_pixels_u >= x0) & (rgb_pixels_u < x1)
+                    & (rgb_pixels_v >= y0) & (rgb_pixels_v < y1)
+                )
+            else:
+                valid = np.zeros(0, dtype=bool)
+            if np.any(valid):
+                person_depths = left_points[valid, 2]
+                median_depth = float(np.median(person_depths))
+                if self.person_depth_band_m > 0.0:
+                    selected_indices = np.flatnonzero(valid)
+                    keep = np.abs(person_depths - median_depth) <= self.person_depth_band_m
+                    valid[:] = False
+                    valid[selected_indices[keep]] = True
+            else:
+                median_depth = float('nan')
+
+            label = f'person {detection.confidence:.0%}'
+            if np.isfinite(median_depth):
+                label += f' {median_depth:.2f}m'
+            draw.text((x0 + 3, y0 + 3), label, fill=(255, 64, 64))
+
+            if world_from_body is None or not np.any(valid):
+                continue
+            world_from_left = world_from_body @ self.left_optical_to_body
+            points = (world_from_left @ left_points[valid].T).T[:, :3]
+            colors = sampled_colors[valid]
+            colors = np.column_stack(
+                (colors, np.full(len(colors), 255, dtype=np.uint8)))
+            world_points.append(points.astype(np.float32))
+            point_colors.append(colors.astype(np.uint8))
+
+        if world_points:
+            cloud_points = np.concatenate(world_points, axis=0)
+            cloud_colors = np.concatenate(point_colors, axis=0)
+        else:
+            cloud_points = np.empty((0, 3), dtype=np.float32)
+            cloud_colors = np.empty((0, 4), dtype=np.uint8)
+        self.person_cloud_pub.publish(self._make_pointcloud(cloud_points, cloud_colors))
+
+        buffer = io.BytesIO()
+        image.save(buffer, format='JPEG', quality=self.jpeg_quality)
+        image_msg = CompressedImage()
+        image_msg.header.stamp = now
+        image_msg.header.frame_id = 'rgb_camera'
+        image_msg.format = 'rgb8; jpeg compressed'
+        image_msg.data = buffer.getvalue()
+        self.person_image_pub.publish(image_msg)
+
+        if pose_delta is not None and pose_delta > 0.10:
+            self.ros_node.get_logger().warning(
+                f'nearest VIO pose is {pose_delta * 1000.0:.0f} ms from RGB detection')
+        if depth_delta is not None and depth_delta > 0.10:
+            self.ros_node.get_logger().warning(
+                f'nearest SLAM depth is {depth_delta * 1000.0:.0f} ms from RGB detection')
+
     def run(self):
         while self.mainLoop():
             transData = self.inputTrans.get()
             basaltTransData = self.inputBasaltTrans.tryGet()
             imgFrame = self.inputImg.tryGet() if self.publish_image else None
-            depthFrame = self.inputDepth.tryGet() if self.publish_depth else None
+            depthFrame = self.inputDepth.tryGet() if (
+                self.publish_depth or self.detect_people) else None
             pclObstData = self.inputObstaclePCL.tryGet() if self.publish_clouds else None
             pclGrndData = self.inputGroundPCL.tryGet() if self.publish_clouds else None
             featuresData = self.inputFeatures.tryGet()
+            personGroup = self.inputPersonGroup.tryGet() if self.detect_people else None
             # grid received but not published (too large for XLink)
 
             now = self.ros_node.get_clock().now().to_msg()
@@ -228,9 +498,20 @@ class Ros2Node(dai.node.ThreadedHostNode):
                         f'VIO tracked features: {feature_count}/{args.num_features}')
 
             if basaltTransData is not None:
+                raw_pose = self._transform_matrix(basaltTransData)
+                # RTABMapVIO TransformData in DepthAI 3.5 has no useful capture
+                # timestamp. Its SLAM passthrough depth is ordered with that
+                # pose, so use the depth exposure time without inserting a
+                # blocking host node into the VIO-to-SLAM path.
+                raw_time = self._timestamp_seconds(
+                    depthFrame if depthFrame is not None else basaltTransData)
+                self.raw_pose_history.append((raw_time, raw_pose))
                 self.vio_pose_pub.publish(self._make_pose(basaltTransData, now))
 
             if transData is not None:
+                corrected_pose = self._transform_matrix(transData)
+                if basaltTransData is not None:
+                    self.map_correction = corrected_pose @ np.linalg.inv(raw_pose)
                 pose = self._make_pose(transData, now)
                 self.pose_pub.publish(pose)
                 self._publish_camera_transform(pose)
@@ -255,10 +536,27 @@ class Ros2Node(dai.node.ThreadedHostNode):
                     self.publish_frame(imgFrame, now)
 
             if depthFrame is not None:
-                monotonic_now = time.monotonic()
-                if monotonic_now - self.last_depth_publish >= self.depth_publish_period:
-                    self.last_depth_publish = monotonic_now
-                    self.publish_depth_frame(depthFrame, now)
+                if self.detect_people:
+                    try:
+                        depth_data = np.array(
+                            depthFrame.getFrame(), dtype=np.uint16, copy=True)
+                        depth_intrinsics = np.asarray(
+                            depthFrame.getTransformation().getIntrinsicMatrix(),
+                            dtype=np.float64,
+                        )
+                        self.person_depth_history.append((
+                            self._timestamp_seconds(depthFrame),
+                            depth_data,
+                            depth_intrinsics,
+                        ))
+                    except Exception as exc:
+                        self.ros_node.get_logger().warning(
+                            f'person depth buffering failed: {exc}')
+                if self.publish_depth:
+                    monotonic_now = time.monotonic()
+                    if monotonic_now - self.last_depth_publish >= self.depth_publish_period:
+                        self.last_depth_publish = monotonic_now
+                        self.publish_depth_frame(depthFrame, now)
 
             if pclObstData is not None:
                 try:
@@ -275,6 +573,9 @@ class Ros2Node(dai.node.ThreadedHostNode):
                         self.ground_pub.publish(self._make_pointcloud(points, colors))
                 except Exception:
                     pass
+
+            if personGroup is not None:
+                self._publish_person_group(personGroup, now)
 
     def _make_pose(self, trans_data, now):
         trans = trans_data.getTranslation()
@@ -405,6 +706,50 @@ with dai.Pipeline() as p:
         odom = p.create(dai.node.RTABMapVIO)
     slam = p.create(dai.node.RTABMapSLAM)
     stereo = p.create(dai.node.StereoDepth)
+    personDetector = None
+    personSync = None
+    if args.detect_people:
+        person_nn_shaves = min(16, max(1, args.person_nn_shaves))
+        rgb = p.create(dai.node.Camera).build(
+            # This IMX214 crashes the RVC2 firmware in its automatically chosen
+            # 1920x1080 mode. The validated 2x2-binned native mode is stable.
+            dai.CameraBoardSocket.CAM_A,
+            sensorResolution=(2104, 1560),
+            sensorFps=max(1.4, args.person_detection_fps),
+        )
+        model_description = dai.NNModelDescription(args.person_model)
+        model_description.platform = 'RVC2'
+        model_path = dai.getModelFromZoo(model_description, True)
+        model_archive = dai.NNArchive(model_path)
+        model_superblob = model_archive.getSuperBlob()
+        if model_superblob is None:
+            raise RuntimeError(
+                f'{args.person_model} is not an RVC2 superblob; cannot select '
+                'a reduced SHAVE count')
+        person_blob = model_superblob.getBlobWithNumShaves(person_nn_shaves)
+
+        rgb_output = rgb.requestOutput(
+            (model_archive.getInputWidth(), model_archive.getInputHeight()),
+            dai.ImgFrame.Type.BGR888p,
+            dai.ImgResizeMode.CROP,
+            args.person_detection_fps,
+            True,
+        )
+        personDetector = p.create(dai.node.DetectionNetwork).build(
+            rgb_output, model_archive, args.person_confidence,
+        )
+        # NNArchive defaults to the largest fitting superblob variant. Replace
+        # it explicitly; setNumShavesPerInferenceThread() alone does not select
+        # a smaller compiled variant from an RVC2 superblob.
+        personDetector.setBlob(person_blob)
+        personDetector.setConfidenceThreshold(args.person_confidence)
+        personDetector.setNumInferenceThreads(1)
+        personDetector.input.setBlocking(False)
+        personDetector.input.setMaxSize(1)
+
+        personSync = p.create(dai.node.Sync)
+        personSync.setSyncThreshold(timedelta(milliseconds=60))
+        personSync.setSyncAttempts(0)
 
     params = {
         "RGBD/CreateOccupancyGrid": "true",
@@ -472,12 +817,16 @@ with dai.Pipeline() as p:
     slam.transform.link(ros2Viewer.inputTrans)
     if args.publish_image:
         slam.passthroughRect.link(ros2Viewer.inputImg)
-    if args.publish_depth:
+    if args.publish_depth or args.detect_people:
         slam.passthroughDepth.link(ros2Viewer.inputDepth)
     if args.publish_grid:
         slam.occupancyGridMap.link(ros2Viewer.inputGrid)
     slam.obstaclePCL.link(ros2Viewer.inputObstaclePCL)
     slam.groundPCL.link(ros2Viewer.inputGroundPCL)
+    if personDetector is not None:
+        personDetector.passthrough.link(personSync.inputs['rgb'])
+        personDetector.out.link(personSync.inputs['detections'])
+        personSync.out.link(ros2Viewer.inputPersonGroup)
 
     try:
         p.start()

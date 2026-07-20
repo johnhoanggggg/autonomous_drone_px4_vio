@@ -42,8 +42,8 @@ from std_msgs.msg import Int32
 
 
 class OffboardHover(Node):
-    def __init__(self):
-        super().__init__("offboard_hover")
+    def __init__(self, node_name="offboard_hover"):
+        super().__init__(node_name)
 
         self.declare_parameter("hover_height", 0.30)      # meters up
         self.declare_parameter("hold_time", 10.0)         # seconds at altitude
@@ -130,6 +130,7 @@ class OffboardHover(Node):
         self.reached = False
         self.last_cmd_t = 0.0
         self.stdin_fd = None
+        self.stdin_fd_owned = False
         self.stdin_termios = None
         self.last_vio_pose_time = None
         self.last_vio_feature_time = None
@@ -149,20 +150,27 @@ class OffboardHover(Node):
         if not self.keyboard_kill and not self.keyboard_land:
             self.get_logger().warn("keyboard kill and land controls disabled by parameters")
             return
-        if not sys.stdin.isatty():
-            self.get_logger().warn(
-                "keyboard controls unavailable: stdin is not an interactive terminal; keep the RC kill ready"
-            )
-            return
-
         try:
-            self.stdin_fd = sys.stdin.fileno()
+            if sys.stdin.isatty():
+                self.stdin_fd = sys.stdin.fileno()
+            else:
+                # ros2 launch does not forward its stdin to child nodes. Opening
+                # the controlling terminal keeps K/L available from that shell.
+                self.stdin_fd = os.open(
+                    "/dev/tty", os.O_RDONLY | os.O_NONBLOCK
+                )
+                self.stdin_fd_owned = True
             self.stdin_termios = termios.tcgetattr(self.stdin_fd)
             tty.setcbreak(self.stdin_fd)
         except (OSError, termios.error) as exc:
+            if self.stdin_fd_owned and self.stdin_fd is not None:
+                os.close(self.stdin_fd)
             self.stdin_fd = None
+            self.stdin_fd_owned = False
             self.stdin_termios = None
-            self.get_logger().error(f"could not enable keyboard controls: {exc}")
+            self.get_logger().error(
+                f"could not enable K/L keyboard controls: {exc}; keep the RC kill ready"
+            )
             return
 
         self.get_logger().warn(
@@ -175,7 +183,13 @@ class OffboardHover(Node):
                 termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.stdin_termios)
             except (OSError, termios.error):
                 pass
+        if self.stdin_fd_owned and self.stdin_fd is not None:
+            try:
+                os.close(self.stdin_fd)
+            except OSError:
+                pass
         self.stdin_fd = None
+        self.stdin_fd_owned = False
         self.stdin_termios = None
 
     def poll_keyboard_controls(self):
@@ -252,13 +266,13 @@ class OffboardHover(Node):
         m.body_rate = False
         self.ocm_pub.publish(m)
 
-    def publish_setpoint(self, z_up):
+    def publish_setpoint(self, z_up, yaw=None):
         m = TrajectorySetpoint()
         m.timestamp = self.now_us()
         m.position = [float(self.x0), float(self.y0), float(-z_up)]  # NED, z down-negative-up
         m.velocity = [math.nan, math.nan, math.nan]
         m.acceleration = [math.nan, math.nan, math.nan]
-        m.yaw = float(self.yaw0)
+        m.yaw = float(self.yaw0 if yaw is None else yaw)
         m.yawspeed = math.nan
         self.sp_pub.publish(m)
 
@@ -325,6 +339,30 @@ class OffboardHover(Node):
         self.state = name
         self.t = 0.0
 
+    def handle_flight_state(self):
+        """Run the flight-specific portion of the sequence.
+
+        Subclasses can replace this while retaining engagement, safety watchdogs,
+        landing, abort, and keyboard behavior.
+        """
+        if self.state != "CLIMB_HOLD":
+            return False
+
+        self.publish_setpoint(self.hover_height)
+        if self.auto_arm and not self.pos_valid():
+            self.get_logger().error("lost local position in flight -> LAND")
+            self.set_state("LAND")
+            return True
+        if not self.reached and self.pos is not None:
+            if abs((-self.pos.z) - self.hover_height) <= self.reach_tol:
+                self.reached = True
+                self.get_logger().warn("reached hover altitude, starting hold clock")
+        if self.reached or self.t > self.climb_timeout:
+            self.hold_t += self.dt
+            if self.hold_t >= self.hold_time:
+                self.set_state("LAND")
+        return True
+
     def tick(self):
         self.t += self.dt
         self.poll_keyboard_controls()
@@ -365,6 +403,9 @@ class OffboardHover(Node):
         # From STREAM onward, ALWAYS keep the offboard heartbeat + setpoint flowing.
         self.publish_offboard_mode()
 
+        if self.handle_flight_state():
+            return
+
         if self.state == "STREAM":
             self.publish_setpoint(0.0)  # hold on ground
             if not self.pos_valid():
@@ -396,22 +437,6 @@ class OffboardHover(Node):
                 self.get_logger().error(
                     f"engage timeout (offboard={self.is_offboard} armed={self.is_armed}) -> ABORT")
                 self.set_state("ABORT")
-            return
-
-        if self.state == "CLIMB_HOLD":
-            self.publish_setpoint(self.hover_height)
-            if self.auto_arm and not self.pos_valid():
-                self.get_logger().error("lost local position in flight -> LAND")
-                self.set_state("LAND")
-                return
-            if not self.reached and self.pos is not None:
-                if abs((-self.pos.z) - self.hover_height) <= self.reach_tol:
-                    self.reached = True
-                    self.get_logger().warn("reached hover altitude, starting hold clock")
-            if self.reached or self.t > self.climb_timeout:
-                self.hold_t += self.dt
-                if self.hold_t >= self.hold_time:
-                    self.set_state("LAND")
             return
 
         if self.state == "LAND":

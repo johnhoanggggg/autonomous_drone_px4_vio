@@ -268,6 +268,31 @@ about **260 ms** (overlapping peak-width 195-320 ms). `EKF2_EV_DELAY` remains `0
 did not change PX4 parameters. The helper's gyro-referenced result is the relevant one because EKF
 IMU propagation can make `vehicle_local_position` lead the delayed vision observation.
 
+### Calibrate the EV sensor position offset
+
+`EKF2_EV_POS_X/Y/Z` are the external-vision sensor position relative to the vehicle/FC
+origin in body **FRD** coordinates: positive X forward, Y right, Z down. To estimate the
+lever arm from motion rather than a ruler, remove the props, start the main launch, and run:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/john/ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
+python3 scripts/calibrate_ev_position_offset.py --duration 35 --delay-ms 260
+```
+
+Hold the flight controller near one point and repeatedly rock the whole drone through roll,
+pitch, and yaw. Use quick, smooth rotations on all three axes and keep translation slow. The
+script time-aligns `/fmu/in/vehicle_visual_odometry` with FC attitude from
+`/fmu/out/vehicle_odometry`, removes slow hand motion in short windows, and fits the three
+offsets. It is read-only: it only prints suggested parameters and NSH commands.
+
+Repeat the capture at least twice and only use values that agree. Reject any run with warnings
+about excitation, residual, conditioning, or uncertainty. The existing nominal values in
+`mav.parm` are X=0.100 m, Y=0.000 m, Z=0.038 m, which are also a useful physical sanity check.
+Set accepted values through NSH and then `param save`; do not set PX4 parameters through this
+calibration script. Keep the props removed for the entire procedure.
+
 ## NSH Access (PX4 shell from the Pi)
 
 `scripts/nsh.py` runs PX4 NSH commands over MAVLink `SERIAL_CONTROL` on the Pixhawk USB link (`/dev/ttyACM0` @115200), using the `.venv-mavlink` interpreter. Each argument is one NSH command line:
