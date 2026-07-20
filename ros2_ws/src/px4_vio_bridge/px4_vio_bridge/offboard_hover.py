@@ -41,12 +41,17 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_msgs.msg import Int32
 
 
+def wrap_pi(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
 class OffboardHover(Node):
     def __init__(self, node_name="offboard_hover"):
         super().__init__(node_name)
 
         self.declare_parameter("hover_height", 0.30)      # meters up
         self.declare_parameter("hold_time", 10.0)         # seconds at altitude
+        self.declare_parameter("yaw_rate_deg", 20.0)      # deg/s slew of commanded yaw (<=0 disables)
         self.declare_parameter("rate_hz", 50.0)
         self.declare_parameter("stream_time", 1.0)        # setpoint pre-stream before engage
         self.declare_parameter("engage_timeout", 5.0)     # arm+offboard must confirm within
@@ -64,9 +69,15 @@ class OffboardHover(Node):
         self.declare_parameter("min_vio_features", 15)         # sustained count below this is lost
         self.declare_parameter("vio_feature_loss_time", 1.0)   # low-count persistence before LAND
         self.declare_parameter("tracking_arm_grace", 1.0)      # settle time after arm confirmation
+        # VIO relocalization-reset detection: the pose keeps publishing but snaps
+        # back to the exact origin, which staleness/feature checks miss. A reset
+        # writes bit-exact 0.0; real poses are always noisy, so (0,0,0) is a
+        # sufficient signature on its own.
+        self.declare_parameter("vio_reset_persist", 0.2)         # s at origin before it counts as a reset
 
         self.hover_height = float(self.get_parameter("hover_height").value)
         self.hold_time = float(self.get_parameter("hold_time").value)
+        self.yaw_rate = math.radians(float(self.get_parameter("yaw_rate_deg").value))
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         self.stream_time = float(self.get_parameter("stream_time").value)
         self.engage_timeout = float(self.get_parameter("engage_timeout").value)
@@ -82,6 +93,7 @@ class OffboardHover(Node):
         self.min_vio_features = int(self.get_parameter("min_vio_features").value)
         self.vio_feature_loss_time = float(self.get_parameter("vio_feature_loss_time").value)
         self.tracking_arm_grace = float(self.get_parameter("tracking_arm_grace").value)
+        self.vio_reset_persist = float(self.get_parameter("vio_reset_persist").value)
 
         pub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -122,6 +134,7 @@ class OffboardHover(Node):
         self.pos = None            # latest VehicleLocalPosition
         self.vcm = None            # latest VehicleControlMode
         self.x0 = self.y0 = self.yaw0 = None
+        self.yaw_cmd = None        # rate-limited yaw setpoint actually published
 
         self.state = "WAIT_POS"
         self.t = 0.0               # seconds in current state
@@ -136,6 +149,7 @@ class OffboardHover(Node):
         self.last_vio_feature_time = None
         self.vio_feature_count = None
         self.low_features_since = None
+        self.vio_at_origin_since = None  # when the pose snapped back to exact origin
 
         self.dt = 1.0 / self.rate_hz
         self.timer = self.create_timer(self.dt, self.tick)
@@ -228,8 +242,17 @@ class OffboardHover(Node):
     def monotonic_time(self):
         return time.monotonic()
 
-    def on_vio_pose(self, _msg):
-        self.last_vio_pose_time = self.monotonic_time()
+    def on_vio_pose(self, msg):
+        now = self.monotonic_time()
+        self.last_vio_pose_time = now
+        # A relocalization reset writes exactly (0, 0, 0); real poses are always
+        # noisy and never land on bit-exact zero, so this alone flags the reset.
+        p = msg.pose.position
+        if p.x == 0.0 and p.y == 0.0 and p.z == 0.0:
+            if self.vio_at_origin_since is None:
+                self.vio_at_origin_since = now
+        else:
+            self.vio_at_origin_since = None
 
     def on_vio_feature_count(self, msg):
         now = self.monotonic_time()
@@ -267,14 +290,36 @@ class OffboardHover(Node):
         self.ocm_pub.publish(m)
 
     def publish_setpoint(self, z_up, yaw=None):
+        target = float(self.yaw0 if yaw is None else yaw)
+        yaw_sp, yawspeed = self.ramp_yaw(target)
         m = TrajectorySetpoint()
         m.timestamp = self.now_us()
         m.position = [float(self.x0), float(self.y0), float(-z_up)]  # NED, z down-negative-up
         m.velocity = [math.nan, math.nan, math.nan]
         m.acceleration = [math.nan, math.nan, math.nan]
-        m.yaw = float(self.yaw0 if yaw is None else yaw)
-        m.yawspeed = math.nan
+        m.yaw = yaw_sp
+        m.yawspeed = yawspeed
         self.sp_pub.publish(m)
+
+    def ramp_yaw(self, target):
+        """Slew the published yaw toward target at yaw_rate, feeding the rate forward.
+
+        Sending PX4 a bounded yaw setpoint plus a matching yawspeed avoids the
+        step-yaw torque spike that saturates the mixer (a motor drops out) when a
+        new heading is commanded. yaw_rate <= 0 restores the raw step behavior.
+        """
+        if self.yaw_cmd is None:
+            self.yaw_cmd = target
+        if self.yaw_rate <= 0.0:
+            self.yaw_cmd = target
+            return target, math.nan
+        step = self.yaw_rate * self.dt
+        delta = wrap_pi(target - self.yaw_cmd)
+        if abs(delta) <= step:
+            self.yaw_cmd = target
+            return target, 0.0
+        self.yaw_cmd = wrap_pi(self.yaw_cmd + math.copysign(step, delta))
+        return self.yaw_cmd, math.copysign(self.yaw_rate, delta)
 
     def send_command(self, command, p1=0.0, p2=0.0):
         m = VehicleCommand()
@@ -314,11 +359,19 @@ class OffboardHover(Node):
         self.set_state("LAND")
 
     def tracking_loss_reason(self):
+        """Fault reason gated by the conditions under which we actually LAND."""
         if not self.tracking_loss_land or not self.is_armed:
             return None
         if self.armed_t < self.tracking_arm_grace:
             return None
+        return self.vio_fault_reason()
 
+    def vio_fault_reason(self):
+        """Raw VIO fault detection, independent of arm state or grace.
+
+        Kept separate so a dry run (auto_arm=false) can observe that the checks
+        fire without arming, even though LAND itself only happens when armed.
+        """
         now = self.monotonic_time()
         if self.last_vio_pose_time is None or now - self.last_vio_pose_time > self.vio_pose_timeout:
             return f"RTAB-Map VIO pose stale for >{self.vio_pose_timeout:.2f}s"
@@ -330,6 +383,12 @@ class OffboardHover(Node):
             return (
                 f"RTAB-Map tracking features stayed below {self.min_vio_features} "
                 f"for {self.vio_feature_loss_time:.2f}s (latest={self.vio_feature_count})"
+            )
+        if (self.vio_at_origin_since is not None
+                and now - self.vio_at_origin_since >= self.vio_reset_persist):
+            return (
+                f"RTAB-Map VIO pose reset to exact origin "
+                f"for {self.vio_reset_persist:.2f}s"
             )
         return None
 
@@ -381,6 +440,16 @@ class OffboardHover(Node):
         tracking_loss = self.tracking_loss_reason()
         if tracking_loss is not None and self.state not in ("LAND", "KILL", "DONE"):
             self.trigger_landing(tracking_loss)
+        elif (self.tracking_loss_land and not self.is_armed
+                and self.state not in ("WAIT_POS", "STREAM", "ENGAGE",
+                                       "LAND", "KILL", "DONE", "ABORT")):
+            # Dry run: surface that the detector fires, without arming or landing.
+            dry_fault = self.vio_fault_reason()
+            if dry_fault is not None:
+                self.get_logger().warn(
+                    f"[dry run] tracking loss detected (disarmed, no LAND): {dry_fault}",
+                    throttle_duration_sec=1.0,
+                )
 
         # global armed watchdog
         if self.is_armed and self.armed_t > self.max_flight_time and self.state not in ("LAND", "DONE"):
@@ -392,6 +461,7 @@ class OffboardHover(Node):
                 self.x0 = self.pos.x
                 self.y0 = self.pos.y
                 self.yaw0 = self.pos.heading
+                self.yaw_cmd = self.pos.heading
                 self.get_logger().warn(
                     f"latched hold x={self.x0:.2f} y={self.y0:.2f} yaw={math.degrees(self.yaw0):.0f}deg")
                 self.set_state("STREAM")
