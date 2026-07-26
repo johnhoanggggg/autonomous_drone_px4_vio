@@ -20,4 +20,10 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_offboard_hover test/test_offboard_hover.py)
+  ament_add_pytest_test(test_vio_to_px4_odometry test/test_vio_to_px4_odometry.py)
+endif()
+
 ament_package()

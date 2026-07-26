@@ -3,6 +3,21 @@ ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
 
+# Stray colcon workspace at the PROJECT ROOT. Running `colcon build` from here
+# instead of inside ros2_ws creates a second install space that shadows the real
+# one, with launch files copied rather than symlinked -- so they silently stop
+# tracking source edits. This cost a debugging session on 2026-07-26; see
+# HANDOFF.md. Always build from inside ros2_ws.
+/build/
+/install/
+/log/
+
+# Flight logs: rosbags (.mcap + metadata.yaml), PX4 ULogs, and .launchinfo run
+# markers. ~51 MB and growing by a few MB per flight. The .mcap/.ulg extensions
+# are matched below, but metadata.yaml and .launchinfo are not, so ignore the
+# whole tree.
+ros2_ws/flight_logs/
+
 # Local runtime output
 *.tlog
 *.tlog.raw
@@ -11,6 +26,11 @@ ros2_ws/log/
 *.db3
 *.mcap
 *.params
+# MAVProxy drops mav.parm into its working directory automatically. Nothing in
+# this project reads it; the real backups are params_backup_*.params from
+# scripts/dump_params.py (different format). It was committed by accident in the
+# initial import and only escaped the *.params rule by one letter.
+*.parm
 ros2_ws/vslam_trajectory.txt
 .cache/
 

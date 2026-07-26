@@ -31,10 +31,12 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from px4_msgs.msg import (
     OffboardControlMode,
+    SensorCombined,
     TrajectorySetpoint,
     VehicleCommand,
     VehicleControlMode,
     VehicleLocalPosition,
+    VehicleOdometry,
 )
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -45,17 +47,30 @@ def wrap_pi(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def yaw_from_quaternion(q):
+    """Return NED yaw from a PX4 [w, x, y, z] quaternion."""
+    w, x, y, z = q
+    return math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+
 class OffboardHover(Node):
     def __init__(self, node_name="offboard_hover"):
         super().__init__(node_name)
 
         self.declare_parameter("hover_height", 0.30)      # meters up
         self.declare_parameter("hold_time", 10.0)         # seconds at altitude
-        self.declare_parameter("yaw_rate_deg", 20.0)      # deg/s slew of commanded yaw (<=0 disables)
+        self.declare_parameter("yaw_rate_deg", 5.0)       # deg/s slew of commanded yaw (<=0 disables)
+        self.declare_parameter("yaw_feedforward", False)  # publish yawspeed matching the slew (NaN when off)
         self.declare_parameter("rate_hz", 50.0)
         self.declare_parameter("stream_time", 1.0)        # setpoint pre-stream before engage
         self.declare_parameter("engage_timeout", 5.0)     # arm+offboard must confirm within
-        self.declare_parameter("climb_timeout", 8.0)      # start hold clock by here regardless
+        # 2026-07-25 flight: the PX4 takeoff ramp winds the vz integrator down
+        # and thrust needs ~10 s to reach hover after arm; 8 s aborted a healthy
+        # climb. Armed yaw tests LAND on this timeout, so longer is safe.
+        self.declare_parameter("climb_timeout", 15.0)     # start hold clock by here regardless
         self.declare_parameter("reach_tol", 0.07)         # m, "reached" altitude band
         self.declare_parameter("max_flight_time", 40.0)   # armed watchdog -> force land
         self.declare_parameter("auto_arm", False)         # MUST be true to actually fly
@@ -64,10 +79,20 @@ class OffboardHover(Node):
         self.declare_parameter("tracking_loss_land", True)
         self.declare_parameter("vio_pose_topic", "/rtabmap/vio_pose")
         self.declare_parameter("vio_feature_topic", "/rtabmap/vio_feature_count")
+        self.declare_parameter(
+            "vio_odometry_topic", "/fmu/in/vehicle_visual_odometry"
+        )
         self.declare_parameter("vio_pose_timeout", 0.75)       # seconds without a VIO pose
-        self.declare_parameter("vio_feature_timeout", 1.0)     # seconds without feature data
-        self.declare_parameter("min_vio_features", 15)         # sustained count below this is lost
-        self.declare_parameter("vio_feature_loss_time", 1.0)   # low-count persistence before LAND
+        self.declare_parameter("vio_feature_timeout", 0.5)     # seconds without feature data
+        self.declare_parameter("vio_odometry_timeout", 0.5)    # bridge output must keep reaching PX4
+        self.declare_parameter("min_vio_features", 160)        # 40% of the 400-feature target
+        self.declare_parameter("vio_feature_loss_time", 0.25)  # low-count persistence before LAND
+        self.declare_parameter("max_vio_yaw_error_deg", 20.0)  # EV yaw vs EKF propagated heading
+        self.declare_parameter("vio_yaw_error_time", 0.20)
+        self.declare_parameter("max_yaw_rate_deg", 60.0)       # catch violent yaw reversals
+        self.declare_parameter("yaw_rate_loss_time", 0.10)
+        self.declare_parameter("max_horizontal_error", 0.35)   # distance from latched hold point
+        self.declare_parameter("horizontal_error_time", 0.25)
         self.declare_parameter("tracking_arm_grace", 1.0)      # settle time after arm confirmation
         # VIO relocalization-reset detection: the pose keeps publishing but snaps
         # back to the exact origin, which staleness/feature checks miss. A reset
@@ -77,7 +102,11 @@ class OffboardHover(Node):
 
         self.hover_height = float(self.get_parameter("hover_height").value)
         self.hold_time = float(self.get_parameter("hold_time").value)
-        self.yaw_rate = math.radians(float(self.get_parameter("yaw_rate_deg").value))
+        # Configured yaw-setpoint slew rate. Immutable after init: the measured
+        # gyro rate lives in self.measured_yaw_rate and must NEVER be written
+        # here (a past collision fed the gyro back into ramp_yaw -> runaway yaw).
+        self.commanded_yaw_rate = math.radians(float(self.get_parameter("yaw_rate_deg").value))
+        self.yaw_feedforward = bool(self.get_parameter("yaw_feedforward").value)
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         self.stream_time = float(self.get_parameter("stream_time").value)
         self.engage_timeout = float(self.get_parameter("engage_timeout").value)
@@ -90,8 +119,29 @@ class OffboardHover(Node):
         self.tracking_loss_land = bool(self.get_parameter("tracking_loss_land").value)
         self.vio_pose_timeout = float(self.get_parameter("vio_pose_timeout").value)
         self.vio_feature_timeout = float(self.get_parameter("vio_feature_timeout").value)
+        self.vio_odometry_timeout = float(
+            self.get_parameter("vio_odometry_timeout").value
+        )
         self.min_vio_features = int(self.get_parameter("min_vio_features").value)
         self.vio_feature_loss_time = float(self.get_parameter("vio_feature_loss_time").value)
+        self.max_vio_yaw_error = math.radians(
+            float(self.get_parameter("max_vio_yaw_error_deg").value)
+        )
+        self.vio_yaw_error_time = float(
+            self.get_parameter("vio_yaw_error_time").value
+        )
+        self.max_yaw_rate = math.radians(
+            float(self.get_parameter("max_yaw_rate_deg").value)
+        )
+        self.yaw_rate_loss_time = float(
+            self.get_parameter("yaw_rate_loss_time").value
+        )
+        self.max_horizontal_error = float(
+            self.get_parameter("max_horizontal_error").value
+        )
+        self.horizontal_error_time = float(
+            self.get_parameter("horizontal_error_time").value
+        )
         self.tracking_arm_grace = float(self.get_parameter("tracking_arm_grace").value)
         self.vio_reset_persist = float(self.get_parameter("vio_reset_persist").value)
 
@@ -130,6 +180,18 @@ class OffboardHover(Node):
             self.on_vio_feature_count,
             10,
         )
+        self.create_subscription(
+            VehicleOdometry,
+            str(self.get_parameter("vio_odometry_topic").value),
+            self.on_vio_odometry,
+            pub_qos,
+        )
+        self.create_subscription(
+            SensorCombined,
+            "/fmu/out/sensor_combined",
+            self.on_sensor_combined,
+            pub_qos,
+        )
 
         self.pos = None            # latest VehicleLocalPosition
         self.vcm = None            # latest VehicleControlMode
@@ -147,9 +209,16 @@ class OffboardHover(Node):
         self.stdin_termios = None
         self.last_vio_pose_time = None
         self.last_vio_feature_time = None
+        self.last_vio_odometry_time = None
         self.vio_feature_count = None
         self.low_features_since = None
         self.vio_at_origin_since = None  # when the pose snapped back to exact origin
+        self.vio_yaw_error = None
+        self.vio_yaw_error_since = None
+        self.measured_yaw_rate = None   # abs gyro Z from sensor_combined; monitoring only
+        self.excessive_yaw_rate_since = None
+        self.horizontal_error = None
+        self.horizontal_error_since = None
 
         self.dt = 1.0 / self.rate_hz
         self.timer = self.create_timer(self.dt, self.tick)
@@ -235,6 +304,15 @@ class OffboardHover(Node):
     # --- subscriptions -----------------------------------------------------
     def on_local_position(self, msg):
         self.pos = msg
+        if self.x0 is None or self.y0 is None:
+            return
+        now = self.monotonic_time()
+        self.horizontal_error = math.hypot(msg.x - self.x0, msg.y - self.y0)
+        if self.horizontal_error > self.max_horizontal_error:
+            if self.horizontal_error_since is None:
+                self.horizontal_error_since = now
+        else:
+            self.horizontal_error_since = None
 
     def on_control_mode(self, msg):
         self.vcm = msg
@@ -263,6 +341,34 @@ class OffboardHover(Node):
                 self.low_features_since = now
         else:
             self.low_features_since = None
+
+    def on_vio_odometry(self, msg):
+        now = self.monotonic_time()
+        self.last_vio_odometry_time = now
+        if self.pos is None or not math.isfinite(self.pos.heading):
+            self.vio_yaw_error = None
+            self.vio_yaw_error_since = None
+            return
+        q = tuple(float(value) for value in msg.q)
+        if not all(math.isfinite(value) for value in q):
+            self.vio_yaw_error = None
+            self.vio_yaw_error_since = None
+            return
+        self.vio_yaw_error = abs(wrap_pi(self.pos.heading - yaw_from_quaternion(q)))
+        if self.vio_yaw_error > self.max_vio_yaw_error:
+            if self.vio_yaw_error_since is None:
+                self.vio_yaw_error_since = now
+        else:
+            self.vio_yaw_error_since = None
+
+    def on_sensor_combined(self, msg):
+        now = self.monotonic_time()
+        self.measured_yaw_rate = abs(float(msg.gyro_rad[2]))
+        if self.measured_yaw_rate > self.max_yaw_rate:
+            if self.excessive_yaw_rate_since is None:
+                self.excessive_yaw_rate_since = now
+        else:
+            self.excessive_yaw_rate_since = None
 
     @property
     def is_armed(self):
@@ -302,24 +408,28 @@ class OffboardHover(Node):
         self.sp_pub.publish(m)
 
     def ramp_yaw(self, target):
-        """Slew the published yaw toward target at yaw_rate, feeding the rate forward.
+        """Slew the published yaw toward target at the configured commanded_yaw_rate.
 
-        Sending PX4 a bounded yaw setpoint plus a matching yawspeed avoids the
-        step-yaw torque spike that saturates the mixer (a motor drops out) when a
-        new heading is commanded. yaw_rate <= 0 restores the raw step behavior.
+        Sending PX4 a bounded yaw setpoint avoids the step-yaw torque spike that
+        saturates the mixer (a motor drops out) when a new heading is commanded.
+        Uses ONLY self.commanded_yaw_rate — never the measured gyro rate.
+        yaw_feedforward=False publishes yawspeed=NaN (PX4 derives its own rate);
+        commanded_yaw_rate <= 0 restores the raw step behavior.
         """
         if self.yaw_cmd is None:
             self.yaw_cmd = target
-        if self.yaw_rate <= 0.0:
+        if self.commanded_yaw_rate <= 0.0:
             self.yaw_cmd = target
             return target, math.nan
-        step = self.yaw_rate * self.dt
+        step = self.commanded_yaw_rate * self.dt
         delta = wrap_pi(target - self.yaw_cmd)
         if abs(delta) <= step:
             self.yaw_cmd = target
-            return target, 0.0
+            return target, 0.0 if self.yaw_feedforward else math.nan
         self.yaw_cmd = wrap_pi(self.yaw_cmd + math.copysign(step, delta))
-        return self.yaw_cmd, math.copysign(self.yaw_rate, delta)
+        if not self.yaw_feedforward:
+            return self.yaw_cmd, math.nan
+        return self.yaw_cmd, math.copysign(self.commanded_yaw_rate, delta)
 
     def send_command(self, command, p1=0.0, p2=0.0):
         m = VehicleCommand()
@@ -364,7 +474,29 @@ class OffboardHover(Node):
             return None
         if self.armed_t < self.tracking_arm_grace:
             return None
-        return self.vio_fault_reason()
+        reason = self.vio_fault_reason()
+        if reason is not None:
+            return reason
+        now = self.monotonic_time()
+        if (
+            self.excessive_yaw_rate_since is not None
+            and now - self.excessive_yaw_rate_since >= self.yaw_rate_loss_time
+        ):
+            return (
+                f"yaw rate exceeded {math.degrees(self.max_yaw_rate):.0f} deg/s "
+                f"for {self.yaw_rate_loss_time:.2f}s "
+                f"(latest={math.degrees(self.measured_yaw_rate):.0f} deg/s)"
+            )
+        if (
+            self.horizontal_error_since is not None
+            and now - self.horizontal_error_since >= self.horizontal_error_time
+        ):
+            return (
+                f"horizontal hold error exceeded {self.max_horizontal_error:.2f}m "
+                f"for {self.horizontal_error_time:.2f}s "
+                f"(latest={self.horizontal_error:.2f}m)"
+            )
+        return None
 
     def vio_fault_reason(self):
         """Raw VIO fault detection, independent of arm state or grace.
@@ -378,6 +510,11 @@ class OffboardHover(Node):
         if (self.last_vio_feature_time is None
                 or now - self.last_vio_feature_time > self.vio_feature_timeout):
             return f"RTAB-Map feature data stale for >{self.vio_feature_timeout:.2f}s"
+        if (
+            self.last_vio_odometry_time is None
+            or now - self.last_vio_odometry_time > self.vio_odometry_timeout
+        ):
+            return f"PX4 visual odometry input stale for >{self.vio_odometry_timeout:.2f}s"
         if (self.low_features_since is not None
                 and now - self.low_features_since >= self.vio_feature_loss_time):
             return (
@@ -389,6 +526,16 @@ class OffboardHover(Node):
             return (
                 f"RTAB-Map VIO pose reset to exact origin "
                 f"for {self.vio_reset_persist:.2f}s"
+            )
+        if (
+            self.vio_yaw_error_since is not None
+            and now - self.vio_yaw_error_since >= self.vio_yaw_error_time
+        ):
+            return (
+                f"VIO yaw disagreed with PX4 by more than "
+                f"{math.degrees(self.max_vio_yaw_error):.0f}deg "
+                f"for {self.vio_yaw_error_time:.2f}s "
+                f"(latest={math.degrees(self.vio_yaw_error):.1f}deg)"
             )
         return None
 

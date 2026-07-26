@@ -264,9 +264,9 @@ python3 scripts/measure_ev_fusion_delay.py --duration 30
 ```
 
 Two captures on 2026-07-16 measured 245 ms and 270 ms, giving a practical current estimate of
-about **260 ms** (overlapping peak-width 195-320 ms). `EKF2_EV_DELAY` remains `0.0`; the measurement
-did not change PX4 parameters. The helper's gyro-referenced result is the relevant one because EKF
-IMU propagation can make `vehicle_local_position` lead the delayed vision observation.
+about **260 ms** (overlapping peak-width 195-320 ms). `EKF2_EV_DELAY` is now saved at `270.0 ms`.
+The helper's gyro-referenced result is the relevant one because EKF IMU propagation can make
+`vehicle_local_position` lead the delayed vision observation.
 
 ### Calibrate the EV sensor position offset
 
@@ -288,8 +288,8 @@ script time-aligns `/fmu/in/vehicle_visual_odometry` with FC attitude from
 offsets. It is read-only: it only prints suggested parameters and NSH commands.
 
 Repeat the capture at least twice and only use values that agree. Reject any run with warnings
-about excitation, residual, conditioning, or uncertainty. The existing nominal values in
-`mav.parm` are X=0.100 m, Y=0.000 m, Z=0.038 m, which are also a useful physical sanity check.
+about excitation, residual, conditioning, or uncertainty. The values verified live on 2026-07-25
+are X=+0.100 m, Y=-0.036 m, Z=+0.056 m in body FRD.
 Set accepted values through NSH and then `param save`; do not set PX4 parameters through this
 calibration script. Keep the props removed for the entire procedure.
 
@@ -319,7 +319,7 @@ Safety design:
 - `auto_arm` defaults to **false**: the node runs the whole sequence but never sends an arm command, so you can dry-run (props off) and confirm setpoint streaming + the OFFBOARD request without flying.
 - Aborts (never arms) if OFFBOARD+ARM are not confirmed via `vehicle_control_mode` within `engage_timeout`.
 - `max_flight_time` watchdog forces LAND; lost local position in flight forces LAND; Ctrl-C while armed commands AUTO.LAND (never a mid-air disarm).
-- **Tracking-loss landing:** while armed, the node monitors `/rtabmap/vio_pose` and `/rtabmap/vio_feature_count`. A stale VIO pose (default `0.75 s`), stale feature data (`1.0 s`), or fewer than 15 tracked features for `1.0 s` commands AUTO.LAND. The first second after arming is a grace period.
+- **Tracking-loss landing:** while armed, the node monitors the raw VIO pose, feature count, bridge output, VIO/EKF yaw agreement, gyro yaw rate, and horizontal hold error. Defaults trip on fewer than 160 features for 0.25 s, more than 20 degrees yaw disagreement for 0.20 s, yaw rate above 90 deg/s for 0.10 s, or hold error above 0.35 m for 0.25 s. The first second after arming is a grace period.
 - **Keyboard land:** while the command's terminal has focus, press **L** (no Enter) to request AUTO.LAND.
 - **Keyboard kill:** while the command's terminal has focus, press **K** (no Enter). The node immediately sends PX4's forced-disarm command repeatedly for one second. This is a true motor kill, not a landing command; using it airborne will make the vehicle fall.
 - Fly only with an RC transmitter bound as manual-override / kill switch (`COM_RC_IN_MODE=0`).

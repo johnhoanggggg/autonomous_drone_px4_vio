@@ -133,6 +133,38 @@ def covariance_triplet(value: float) -> Iterable[float]:
     return (float(value), float(value), float(value))
 
 
+def pose_rejection_reason(
+    position: Vector3,
+    orientation: Quaternion,
+    reset_position_epsilon: float = 1.0e-6,
+    reset_orientation_epsilon: float = 1.0e-3,
+) -> Optional[str]:
+    """Return why a source pose is unsafe to forward, or None if it is usable.
+
+    RTABMap's DepthAI VIO reports a distinctive all-zero-position/all-0.5
+    quaternion while its transform is reset or unavailable.  The quaternion is
+    normalized, so generic quaternion validation alone cannot catch it.
+    """
+    values = (*position, *orientation)
+    if not all(math.isfinite(value) for value in values):
+        return "pose contains a non-finite value"
+
+    quaternion_norm = math.sqrt(sum(component * component for component in orientation))
+    if quaternion_norm <= 1.0e-6:
+        return "quaternion has zero norm"
+
+    at_origin = all(abs(value) <= reset_position_epsilon for value in position)
+    # q and -q encode the same rotation, so recognize either sign.
+    reset_quaternion = min(
+        max(abs(value - 0.5) for value in orientation),
+        max(abs(value + 0.5) for value in orientation),
+    ) <= reset_orientation_epsilon
+    if at_origin and reset_quaternion:
+        return "RTABMap reset sentinel"
+
+    return None
+
+
 class VioToPx4Odometry(Node):
     def __init__(self) -> None:
         super().__init__("vio_to_px4_odometry")
@@ -150,6 +182,9 @@ class VioToPx4Odometry(Node):
         self.declare_parameter("orientation_variance", 0.01)
         self.declare_parameter("velocity_variance", 0.05)
         self.declare_parameter("quality", 100)
+        self.declare_parameter("reject_rtabmap_reset_pose", True)
+        self.declare_parameter("reset_position_epsilon", 1.0e-6)
+        self.declare_parameter("reset_orientation_epsilon", 1.0e-3)
 
         input_topic = self.get_parameter("input_pose_topic").value
         output_topic = self.get_parameter("output_odometry_topic").value
@@ -179,6 +214,9 @@ class VioToPx4Odometry(Node):
         self.debug_path_size = max(1, int(self.get_parameter("debug_path_size").value))
         self.debug_path_publish_stride = max(1, int(self.get_parameter("debug_path_publish_stride").value))
         self.sent_count = 0
+        self.rejected_count = 0
+        self.reset_counter = 0
+        self.reset_pose_active = False
 
         self.get_logger().info(f"Bridging {input_topic} -> {output_topic}")
 
@@ -194,6 +232,32 @@ class VioToPx4Odometry(Node):
             pose.pose.orientation.y,
             pose.pose.orientation.z,
         )
+        rejection_reason = pose_rejection_reason(
+            position_enu,
+            orientation_enu_flu,
+            float(self.get_parameter("reset_position_epsilon").value),
+            float(self.get_parameter("reset_orientation_epsilon").value),
+        )
+        if (
+            rejection_reason == "RTABMap reset sentinel"
+            and not bool(self.get_parameter("reject_rtabmap_reset_pose").value)
+        ):
+            rejection_reason = None
+
+        if rejection_reason is not None:
+            self.rejected_count += 1
+            self.previous_position = None
+            self.previous_time_us = None
+            if rejection_reason == "RTABMap reset sentinel" and not self.reset_pose_active:
+                self.reset_counter = (self.reset_counter + 1) % 256
+                self.reset_pose_active = True
+            if self.rejected_count == 1 or self.rejected_count % 100 == 0:
+                self.get_logger().warning(
+                    f"Rejected VIO pose #{self.rejected_count}: {rejection_reason}"
+                )
+            return
+
+        self.reset_pose_active = False
         position_enu, orientation_enu_flu = apply_enu_yaw_offset(
             position_enu,
             orientation_enu_flu,
@@ -230,7 +294,7 @@ class VioToPx4Odometry(Node):
         msg.position_variance = list(covariance_triplet(self.get_parameter("position_variance").value))
         msg.orientation_variance = list(covariance_triplet(self.get_parameter("orientation_variance").value))
         msg.velocity_variance = list(covariance_triplet(self.get_parameter("velocity_variance").value))
-        msg.reset_counter = 0
+        msg.reset_counter = self.reset_counter
         msg.quality = int(self.get_parameter("quality").value)
 
         self.publisher.publish(msg)
