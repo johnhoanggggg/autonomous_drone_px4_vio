@@ -360,6 +360,212 @@ Notes:
 
 - `hover_height=0.30` m is very low; height is pure vision (no rangefinder) and ground effect can disturb VIO features near the floor. Confirm Z holds steady in the dry run; consider `0.5-0.6` m if VIO gets jittery low.
 
+## Battery Indicator in Foxglove
+
+`battery_to_ros` flattens `/fmu/out/battery_status_v1` (a `px4_msgs/BatteryStatus`,
+which Foxglove can only render as raw fields, and whose `remaining` is 0..1) into
+plain `std_msgs` that Foxglove panels bind to directly. It starts automatically with
+`rtabmap_slam_px4.launch.py`; disable with `battery_monitor:=false`.
+
+| Topic | Type | Panel |
+|---|---|---|
+| `/battery/percent` | `Float32` (0–100) | **Gauge**, min 0 max 100 |
+| `/battery/voltage` | `Float32` (V) | Gauge or Plot |
+| `/battery/cell_voltage` | `Float32` (V/cell) | Gauge — the honest signal under load |
+| `/battery/current` | `Float32` (A) | Plot |
+| `/battery/power` | `Float32` (W) | Plot |
+| `/battery/level` | `Int32` 0–3 | **Indicator** (0 OK, 1 LOW, 2 CRITICAL, 3 EMPTY) |
+| `/battery/status` | `String` | Raw Message — e.g. `OK 100% 12.12V (4.04V/cell) 0.0A 0W` |
+
+Recommended: a **Gauge** panel on `/battery/percent` field `data`, plus an **Indicator**
+panel on `/battery/level` field `data` with rules for 0/1/2/3.
+
+`level` is the **worse** of three sources — the percent thresholds, the per-cell
+voltage thresholds, and PX4's own `warning` enum — so an optimistic state-of-charge
+estimate can never mask a real low-voltage warning. Thresholds are launch arguments:
+`battery_warn_percent` (40), `battery_critical_percent` (25), `battery_empty_percent`
+(15). Level escalations are also logged to the flight bag via `/rosout`.
+
+Invalid PX4 fields are dropped rather than published: PX4 signals "unknown" with
+`voltage_v=0`, `current_a=-1`, `remaining=-1`, and putting those on a gauge would read
+as 0 V / −100%.
+
+## Interactive Waypoints from Foxglove
+
+Node `offboard_waypoint` (`px4_vio_bridge`) flies to points you click in the Foxglove
+3D panel. It subclasses `OffboardHover`, so engagement, the VIO tracking-loss
+watchdogs, K/L keyboard controls and `max_flight_time` all behave identically.
+
+Foxglove has **no** RViz-style `InteractiveMarker` support — there are no draggable
+6-DOF handles. The interaction is the 3D panel's **Publish** tool: click a point, it
+publishes a `geometry_msgs/PointStamped` on `/waypoint/clicked`.
+
+### One-time Foxglove bridge change
+
+`rtabmap_slam_px4.launch.py` previously ran the bridge with
+`capabilities:=[connectionGraph]` and `client_topic_whitelist:=['^$']`, which blocks
+all publishing from the browser. It now defaults to:
+
+- `foxglove_capabilities:=[clientPublish,connectionGraph]`
+- `foxglove_client_topic_whitelist:=['^/waypoint/clicked(_pose)?$']`
+
+The narrow client whitelist is deliberate: a browser tab may reach the waypoint intake
+topics and nothing else. Do **not** widen it to `['.*']` — that would put `/fmu/in/*`
+(raw setpoints, arm commands) within reach of anything that can open the WebSocket.
+
+### Foxglove panel setup
+
+1. 3D panel → set the **display frame** to `world`. The publish tool stamps whatever
+   frame the panel is following, and the node rejects anything that is not `world`.
+2. Open the panel's **Publish** tool, topic `/waypoint/clicked`, type
+   `geometry_msgs/PointStamped`.
+3. Add topics `/waypoint/target` and `/waypoint/commanded` to the 3D panel to see the
+   accepted goal and the rate-limited point actually being sent to PX4.
+4. Add a Raw Message panel on `/waypoint/status` for accepted/rejected counts,
+   distance to go, live hold error against its current limit, and the idle countdown.
+
+To also command heading, publish a `PoseStamped` on `/waypoint/clicked_pose` and launch
+with `accept_waypoint_yaw:=true`. Off by default — yawing while translating is the
+combination that stresses VIO hardest.
+
+### Running it
+
+Stack first (in one terminal):
+
+```bash
+cd /home/john/autonomous_drone_px4_vio/ros2_ws
+source /opt/ros/jazzy/setup.bash && source /home/john/ros2_ws/install/setup.bash && source install/setup.bash
+export ROS_DOMAIN_ID=42
+ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py
+```
+
+Props-off DRY RUN (never arms; the whole click → geofence → slew → setpoint path is
+exercised and recorded, so you can verify it in Foxglove and in the bag before flying):
+
+```bash
+ros2 launch px4_vio_bridge offboard_waypoint.launch.py auto_arm:=false climb_timeout:=5.0
+```
+
+LIVE (props on, RC bound as kill, area clear, pre-flight gate green):
+
+```bash
+ros2 launch px4_vio_bridge offboard_waypoint.launch.py auto_arm:=true
+```
+
+Both record a flight bag to `flight_logs/offboard_waypoint_<UTC>` with the same
+`fastwrite` MCAP profile and `.launchinfo` sidecar as the yaw test. `/waypoint/*` is in
+the bag, so a session can be replayed click by click.
+
+### What bounds a click
+
+A click is a network message from a browser, so nothing it says is trusted:
+
+| Guard | Default | Behavior |
+|---|---|---|
+| `waypoint_frame` | `world` | wrong `frame_id` → rejected, vehicle does not move |
+| `geofence_radius` | 1.5 m | target clamped into a disc around the **latched takeoff point** |
+| click z | — | **ignored**; altitude is always `hover_height` |
+| `waypoint_speed` | 0.25 m/s | the setpoint slews; PX4 never sees a position step |
+| `idle_timeout` | 20 s | parked at a waypoint with nothing pending → AUTO.LAND |
+| `arrival_tol` | 0.12 m | arrival is **latched** once reached, not re-tested each tick |
+| `max_flight_time` | 90 s | armed watchdog → LAND (launch default, vs 40 s for the yaw test) |
+| `min_vio_features` | 80 | tracking-loss floor — **lower than the 160 used by the hover/yaw tests**, see below |
+
+`min_vio_features` is 80 in this launch rather than 160. Waypoint flight translates and
+repoints the camera at whatever the room offers, so it samples worse scenes than a
+station-keeping hover does; a 2026-07-27 bench run aborted at 134 features. This buys
+tolerance, not tracking quality — if counts are routinely near the floor, fix the scene
+(lighting, texture, no blank walls), because low-feature VIO is what drifts. The hover
+and yaw tests keep 160.
+
+Clicks are **absolute positions in `world`**, not offsets from the drone. A click
+outside the geofence is not ignored — it is pulled onto the fence boundary along its
+own bearing, and the log says `(CLAMPED to geofence)`.
+
+Arrival is latched, not re-tested every tick. The 2026-07-27 flight held station
+0.135 m from target on average against an `arrival_tol` of 0.12 m, so an
+instantaneous test flickered, reset the idle clock every few ticks, and the idle
+timeout could never fire. Once the vehicle touches `arrival_tol` it counts as
+arrived until the next click, and `/waypoint/status` reports `arrived=True/False`.
+
+### The horizontal-error gate during transit
+
+`OffboardHover` measures hold error from the latched takeoff point. Left alone that
+would land a waypoint flight the moment it successfully translated, so `hold_point`
+and `horizontal_error_limit` are now overridable properties; `offboard_waypoint`
+points them at the commanded position.
+
+PX4 trails a moving position setpoint by roughly `waypoint_speed / MPC_XY_P` — about
+0.26 m at the defaults, which sits right on top of the 0.35 m hold gate. So the tight
+gate applies only once the commanded point has been stationary for
+`transit_settle_time` (1.0 s); during transit the looser `transit_horizontal_error`
+(0.60 m) applies. Raising `waypoint_speed` raises that lag proportionally — raise
+`transit_horizontal_error` with it, or turn on `velocity_feedforward:=true`, which
+publishes the slew velocity in `TrajectorySetpoint.velocity` and cancels most of the
+lag. Feedforward is opt-in and has not been flown.
+
+## Square Path (scripted)
+
+Node `offboard_square` flies a closed square: **go straight, turn, go straight, turn,
+go straight, turn, go straight, turn**. It subclasses `OffboardWaypoint`, so the
+position rate limiter, the `hold_point` re-pointing and the settled/transit gate split
+all carry over; only the target source changes — corners are computed up front instead
+of arriving as clicks. Foxglove clicks are refused while a square is running, because a
+stray one would deform the shape.
+
+```bash
+# props-off DRY RUN (never arms; exercises the whole state machine)
+ros2 launch px4_vio_bridge offboard_square.launch.py auto_arm:=false climb_timeout:=5.0
+
+# LIVE
+ros2 launch px4_vio_bridge offboard_square.launch.py auto_arm:=true
+```
+
+Defaults: `side_m:=0.40`, `turn_deg:=90.0` (positive = turn right), `sides:=4`.
+Setting `turn_deg:=-90.0` mirrors the square; `sides:=3 turn_deg:=120.0` gives a
+triangle. The planned shape is published as a `nav_msgs/Path` on `/square/path` — add
+it to the Foxglove 3D panel to see the intended square against the flown one.
+
+### Two things that are different from the other launches
+
+**Yaw rate defaults to 15 deg/s, not 5.** A 90 deg turn at the hold-yaw default of
+5 deg/s takes 18 s; four of those plus four legs do not fit in any sane flight time. 15
+is well inside `MC_YAWRATE_MAX=60` and the 60 deg/s abort, but it is **3x the fastest
+yaw rate flown so far** — the largest previous test was 45 deg at 5 deg/s.
+
+**Timeouts are derived from the geometry, not fixed.** HANDOFF records a near-miss
+where a fixed 6 s yaw timeout would have aborted a 45 deg leg that needed 8.4 s. Here
+`leg_timeout = side/speed + leg_timeout_margin` and `turn_timeout = turn/yaw_rate +
+turn_timeout_margin`. The node logs the worst-case budget at startup and **errors if it
+exceeds `max_flight_time`** (launch default 150 s), so the armed watchdog can never
+land you mid-square. If a leg or turn times out, raise the *margin*, not the timeout.
+
+### Bounds
+
+Corners are computed from the latched start pose and are **not** chained off the
+vehicle's actual position — chaining would fold each leg's tracking error into the next
+corner and walk the square across the room. A 0.40 m square started from a corner
+reaches 0.566 m from the latch, comfortably inside the 1.5 m geofence; if a requested
+square would not fit, the node **refuses and lands rather than clamping**, since
+clamping a corner deforms the shape.
+
+Sequence per side: fly the leg → `leg_settle_time` (1.5 s) parked → turn →
+`turn_settle_time` (1.0 s). A side counts as complete when the vehicle is inside
+`corner_tol` (0.15 m) *and* the setpoint has finished slewing; a turn completes on
+`yaw_tolerance_deg` (5.0). Bench-verified timing at the defaults is ~9.8 s per
+side, ~42 s for the whole square including the climb.
+
+### Before flying it
+
+This is the most demanding manoeuvre in the project so far — 90 deg turns are double
+the largest yaw flown, and it combines yaw with translation, which is what stresses VIO
+hardest. Worth doing in this order:
+
+1. Props-off dry run, confirm all four sides and turns in the log.
+2. `sides:=1` armed, to fly one leg and one 90 deg turn before committing to four.
+3. Full square, on a **full battery** — hover draw is ~262 W and the 2026-07-27
+   waypoint flight finished at 11% SoC. Watch `/battery/level` in Foxglove.
+
 ## Known Issues & Operational Notes
 
 ### TELEM2 / DDS link is marginal (works USB-free, but near the edge)

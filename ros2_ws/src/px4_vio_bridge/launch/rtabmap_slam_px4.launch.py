@@ -39,10 +39,17 @@ def generate_launch_description():
         "map_correction_translation_rate"
     )
     map_correction_yaw_rate_deg = LaunchConfiguration("map_correction_yaw_rate_deg")
+    battery_monitor = LaunchConfiguration("battery_monitor")
+    battery_warn_percent = LaunchConfiguration("battery_warn_percent")
+    battery_critical_percent = LaunchConfiguration("battery_critical_percent")
+    battery_empty_percent = LaunchConfiguration("battery_empty_percent")
     foxglove = LaunchConfiguration("foxglove")
     foxglove_port = LaunchConfiguration("foxglove_port")
     foxglove_topic_whitelist = LaunchConfiguration("foxglove_topic_whitelist")
     foxglove_capabilities = LaunchConfiguration("foxglove_capabilities")
+    foxglove_client_topic_whitelist = LaunchConfiguration(
+        "foxglove_client_topic_whitelist"
+    )
 
     return LaunchDescription(
         [
@@ -88,6 +95,13 @@ def generate_launch_description():
                 "map_correction_translation_rate", default_value="0.03"
             ),
             DeclareLaunchArgument("map_correction_yaw_rate_deg", default_value="1.0"),
+            # Flattens PX4 battery telemetry into std_msgs so Foxglove Gauge and
+            # Indicator panels can bind to it directly. Added 2026-07-27 after a
+            # flight finished at 11% SoC unnoticed.
+            DeclareLaunchArgument("battery_monitor", default_value="true"),
+            DeclareLaunchArgument("battery_warn_percent", default_value="40.0"),
+            DeclareLaunchArgument("battery_critical_percent", default_value="25.0"),
+            DeclareLaunchArgument("battery_empty_percent", default_value="15.0"),
             DeclareLaunchArgument("foxglove", default_value="true"),
             DeclareLaunchArgument("foxglove_port", default_value="8765"),
             DeclareLaunchArgument(
@@ -102,12 +116,26 @@ def generate_launch_description():
                     "'^/vio/map_correction(_target)?$', "
                     "'^/vio/map_correction/(preview_pose|residual_m|residual_deg)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
+                    "'^/waypoint/(clicked|clicked_pose|target|commanded|status)$', "
+                    "'^/battery/(percent|voltage|current|power|cell_voltage|level|status)$', "
                     "'^/fmu/in/vehicle_visual_odometry$', "
                     "'^/fmu/out/(vehicle_local_position_v1|vehicle_odometry|estimator_status_flags)$']"
                 ),
             ),
+            # `clientPublish` is what lets the Foxglove 3D panel's Publish tool
+            # send a clicked waypoint back into ROS; without it the browser
+            # cannot publish anything at all. It is deliberately paired with a
+            # narrow client_topic_whitelist below: a browser tab must be able to
+            # reach offboard_waypoint's intake topics and nothing else -- never
+            # /fmu/in/*, which would put an unvalidated setpoint or an arm
+            # command straight onto the PX4 uplink.
             DeclareLaunchArgument(
-                "foxglove_capabilities", default_value="[connectionGraph]"
+                "foxglove_capabilities",
+                default_value="[clientPublish,connectionGraph]",
+            ),
+            DeclareLaunchArgument(
+                "foxglove_client_topic_whitelist",
+                default_value="['^/waypoint/clicked(_pose)?$']",
             ),
             # Keep the optional launch-owned agent independent of all delayed
             # camera, bridge, and Foxglove startup work.
@@ -190,6 +218,20 @@ def generate_launch_description():
                     ),
                     Node(
                         package="px4_vio_bridge",
+                        executable="battery_to_ros",
+                        name="battery_to_ros",
+                        output="screen",
+                        condition=IfCondition(battery_monitor),
+                        parameters=[
+                            {
+                                "warn_percent": battery_warn_percent,
+                                "critical_percent": battery_critical_percent,
+                                "empty_percent": battery_empty_percent,
+                            }
+                        ],
+                    ),
+                    Node(
+                        package="px4_vio_bridge",
                         executable="px4_local_position_to_ros",
                         name="px4_local_position_to_ros",
                         output="screen",
@@ -216,7 +258,7 @@ def generate_launch_description():
                             "topic_whitelist": foxglove_topic_whitelist,
                             "service_whitelist": "['^$']",
                             "param_whitelist": "['^$']",
-                            "client_topic_whitelist": "['^$']",
+                            "client_topic_whitelist": foxglove_client_topic_whitelist,
                             "capabilities": foxglove_capabilities,
                             "min_qos_depth": "1",
                             "max_qos_depth": "1",

@@ -53,12 +53,6 @@ class OffboardHoldYaw(OffboardHover):
             return math.inf
         return abs(wrap_pi(target - self.pos.heading))
 
-    def check_flight_position(self):
-        if self.auto_arm and not self.pos_valid():
-            self.trigger_landing("lost local position in flight")
-            return False
-        return True
-
     def wait_for_yaw(self, target, next_state, description):
         self.publish_setpoint(self.hover_height, target)
         if not self.check_flight_position():

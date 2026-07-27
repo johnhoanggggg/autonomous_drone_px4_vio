@@ -307,12 +307,29 @@ class OffboardHover(Node):
         if self.x0 is None or self.y0 is None:
             return
         now = self.monotonic_time()
-        self.horizontal_error = math.hypot(msg.x - self.x0, msg.y - self.y0)
-        if self.horizontal_error > self.max_horizontal_error:
+        hold_x, hold_y = self.hold_point
+        self.horizontal_error = math.hypot(msg.x - hold_x, msg.y - hold_y)
+        if self.horizontal_error > self.horizontal_error_limit:
             if self.horizontal_error_since is None:
                 self.horizontal_error_since = now
         else:
             self.horizontal_error_since = None
+
+    @property
+    def hold_point(self):
+        """(x, y) NED that the horizontal-error watchdog measures against.
+
+        The latched takeoff point for a station-keeping flight. Subclasses that
+        deliberately translate must override this with the position they are
+        currently commanding, or the watchdog will land them for successfully
+        doing what they were told.
+        """
+        return self.x0, self.y0
+
+    @property
+    def horizontal_error_limit(self):
+        """Distance from hold_point that trips the watchdog, in meters."""
+        return self.max_horizontal_error
 
     def on_control_mode(self, msg):
         self.vcm = msg
@@ -468,6 +485,13 @@ class OffboardHover(Node):
         self.request_land()
         self.set_state("LAND")
 
+    def check_flight_position(self):
+        """False (and LAND) once an armed flight has lost its position estimate."""
+        if self.auto_arm and not self.pos_valid():
+            self.trigger_landing("lost local position in flight")
+            return False
+        return True
+
     def tracking_loss_reason(self):
         """Fault reason gated by the conditions under which we actually LAND."""
         if not self.tracking_loss_land or not self.is_armed:
@@ -492,7 +516,7 @@ class OffboardHover(Node):
             and now - self.horizontal_error_since >= self.horizontal_error_time
         ):
             return (
-                f"horizontal hold error exceeded {self.max_horizontal_error:.2f}m "
+                f"horizontal hold error exceeded {self.horizontal_error_limit:.2f}m "
                 f"for {self.horizontal_error_time:.2f}s "
                 f"(latest={self.horizontal_error:.2f}m)"
             )

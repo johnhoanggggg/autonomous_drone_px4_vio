@@ -3,7 +3,10 @@
 Authoritative current-state doc. Full chronological history is in `HANDOFF_ARCHIVE.md`
 (kept for forensics; some of it is superseded — trust this file).
 
-Last updated: 2026-07-26.
+Parked side-work lives in its own doc: `HANDOFF_LOOP_CLOSURE.md` (SLAM loop-closure
+correction — built, measured, not wired to PX4; safe to ignore while flying).
+
+Last updated: 2026-07-27.
 
 ## What this project is
 
@@ -17,7 +20,16 @@ for horizontal position, height, and yaw (no GPS). Goal: indoor autonomous fligh
 - px4_msgs from `/home/john/ros2_ws/install`
 - VIO script: `scripts/rtabmap_vio_ros2.py` (also `oak_d_vins_cpp/.../basalt/` — Basalt is a dead end here, too timing-fragile)
 
-## Immediate handoff status (2026-07-26 — read before doing anything)
+## Immediate handoff status (2026-07-26 / 07-27 — read before doing anything)
+
+**2026-07-27 in one paragraph.** Two new autonomous modes were built and both flew
+successfully on their first armed attempt: `offboard_waypoint` (Foxglove
+click-to-fly, 4 waypoints) and `offboard_square` (scripted 0.40 m square with four
+90 deg turns). Details in the two FLOWN sections below. Also added `battery_to_ros`
+(battery on a Foxglove gauge) and taught `analyze_flight.py` to analyse waypoint
+flights. **Two things need attention before the next flight: the battery was run to
+2% SoC, and the landing bounce is getting worse (178 deg/s roll at contact) — both
+are in Open Risks.** The 07-26 milestone below still stands unchanged.
 
 **MILESTONE 2026-07-26: the yaw-torque bias is FIXED and confirmed gone.** The
 operator changed the motor/prop configuration so that diagonally opposite props
@@ -289,13 +301,184 @@ written eagerly and survives a hard death. After any future flight — especiall
 an empty one — read that file first: it says unambiguously which launch file and
 which profile actually ran.
 
+### FLOWN 2026-07-27: first armed waypoint flight — SUCCESS
+
+Bag `offboard_waypoint_20260727T121338Z`. Armed, 4 waypoints clicked in Foxglove,
+**zero rejections, zero safety triggers, no manual intervention.** Stable hover
+reached 2.28 s after CLIMB_HOLD; converged to as close as 0.022 m; typical settled
+error 0.08–0.17 m. Yaw was the best on record (error p2p 3.58 deg, peak gyro
+7.8 deg/s vs a 60 abort, `yawspeed=NaN` in all 2671 setpoints). Altitude 0.292–0.362 m.
+VIO clean: features median 330, min 190, **0 samples below 160** — the lowered 80
+floor was never exercised.
+
+**Both watchdog changes were load-bearing.** Measured against the two gates the node
+actually applies (`analyze_flight.py` now prints this split):
+
+| phase | n | mean | max | gate | over |
+|---|---|---|---|---|---|
+| settled | 1892 | 0.135 m | 0.252 m | 0.35 | 0 |
+| transit | 611 | 0.229 m | 0.405 m | 0.60 | 0 |
+
+Max distance from the **takeoff latch** was 0.757 m. Under the pre-waypoint logic
+(error vs takeoff, single 0.35 m gate) this flight aborts almost immediately; with
+`hold_point` re-pointed but no transit gate, the 117 transit samples above 0.35 m
+abort it too. Slew limiter exact: max step 5.000 mm across 2504 intervals, 0
+violations. **Do not measure slew as a divided speed from bag timestamps** — receive
+jitter (2 ms against a 20 ms median) makes an exact limiter look 2.7x over.
+
+**Defect found and fixed: the idle timeout could never fire.** Settled hold error
+averaged 0.135 m against `arrival_tol` 0.12 m, so the instantaneous `at_waypoint()`
+test flickered false and reset `idle_t` every few ticks — `/waypoint/status` shows
+`to_go=0.00m` with `idle=0/300s` right to the end, and the flight had to be stopped
+by hand (which is why the bag is truncated before disarm). Arrival is now **latched**
+on first touch of `arrival_tol` and cleared only by the next accepted click.
+
+Two other things from that flight:
+
+- **Battery finished at 11% SoC / 10.97 V under 23.9 A**, by far the lowest in the
+  record (07-26 flights were 47–58%). This is what prompted `battery_to_ros` below.
+- **The bag was truncated** by the hard stop — and `fastwrite` did its job:
+  **8.3 MB fully readable** where `zstd_fast` would have left 0 bytes.
+- Airborne roll read −2.07 deg (vs −0.46 on 07-26), but that window is full of
+  deliberate translation, so it is **not** a clean zero-velocity reference. Fly a
+  plain `offboard_hover` hold before concluding the level calibration has drifted.
+
+### FLOWN 2026-07-27: `offboard_square` — square completed on the first armed attempt
+
+Straight/turn/straight/turn/straight/turn/straight/turn. Subclasses
+`OffboardWaypoint`, so the slew limiter, `hold_point` re-pointing and the
+settled/transit gate split all carry over; only the target source changes. Foxglove
+clicks are refused while it runs. Defaults `side_m=0.40`, `turn_deg=+90`, `sides=4`.
+Full operating notes in README.
+
+Bag `offboard_square_20260727T125433Z`. **All 4 sides, all 4 turns, zero safety
+triggers**, first armed attempt. Headings 93 → −177 → −87 → 3 → **93** (exactly +90
+each, back to start heading); corners closed exactly on the start point; all four
+sides 0.400 m. 46.7 s for the square, ~11.7 s per side.
+
+**The 15 deg/s turn rate — the main unflown risk — behaved.** Each 90 deg turn took
+**6.08 s = 14.8 deg/s actual**, against a 10.0 s timeout (61% used); legs took 3.09 s
+against 7.6 s (41%). The geometry-derived timeouts were correctly sized and nothing
+came close to timing out. Peak yaw rate 23.2 deg/s against the 60 abort.
+
+| phase | n | mean | max | gate | margin used |
+|---|---|---|---|---|---|
+| settled | 1816 | 0.111 m | 0.227 m | 0.35 | 65% |
+| transit | 520 | 0.303 m | **0.444 m** | 0.60 | **74%** |
+
+Settled error is *better* than the waypoint flight (0.135/0.252); transit is worse
+(was 0.229/0.405) because each leg now starts from a position the preceding turn
+displaced. **74% of the transit gate is the tightest number in the flight — lengthen
+the sides or raise `waypoint_speed` and that is what breaks first.** Slew limiter
+exact: 5.000 mm max step, 0 violations in 2335 intervals.
+
+VIO held through four 90 deg turns but with visibly less margin than translation-only
+flight: features median 272 (was 330), min 154, 2 samples below 160, none below 80.
+The old 160 floor would not have aborted this either (2 samples is far short of the
+0.25 s persistence). Yaw error mean −2.92 deg, p2p 9.89 — expected for a
+mostly-turning flight; the mean is ramp lag, not droop.
+
+**Two problems from this flight:**
+
+1. **Battery finished at 2% SoC** (10.71 V under 23.3 A), after the previous flight
+   already ended at 11%. That is below any usable reserve — deep discharge damages the
+   pack and risks a brownout instead of a landing. `battery_to_ros` was **not running**
+   (the stack had been up since before that node existed), so nothing was on screen;
+   it would have read EMPTY for the entire flight. Restart the stack before flying.
+2. **Hard landing, worse than 07-26.** Roll rate hit **178 deg/s** at t=57.41. Every
+   gyro extreme is after the square finished (during the square: roll 15.1, pitch 12.5,
+   yaw 23.2 max) — this is purely ground contact. Altitude touched 0.000 m at t=56.99
+   then rose back to 0.177 m before the operator killed it at 58.60, i.e. it **bounced**.
+   Second flight pointing at `MPC_LAND_SPEED`; see Open Risks.
+
+Design notes that held up: corners are planned from the latched start pose, never
+chained off actual position (chaining folds tracking error into the shape), and a
+square that would not fit the geofence is **refused, not clamped** — clamping a corner
+deforms it. `yaw_rate_deg` defaults to 15 rather than 5 because a 90 deg turn at
+5 deg/s is 18 s and four of them do not fit in a flight; `leg_timeout` and
+`turn_timeout` are computed as travel-time + margin, which is the fix for the
+documented `yaw_timeout` footgun. If a leg times out, raise the *margin*.
+
+### NEW 2026-07-27: `battery_to_ros` — battery indicator for Foxglove
+
+Flattens `/fmu/out/battery_status_v1` into `std_msgs` on `/battery/{percent,voltage,
+cell_voltage,current,power,level,status}` so Foxglove Gauge and Indicator panels can
+bind directly. Starts with `rtabmap_slam_px4.launch.py`; `battery_monitor:=false` to
+disable. `level` (0 OK / 1 LOW / 2 CRITICAL / 3 EMPTY) is the **worse** of percent
+thresholds, per-cell voltage, and PX4's own `warning` enum, so an optimistic SoC
+cannot mask a real low-voltage warning. Verified live against the vehicle: reads
+`OK 100% 12.12V (4.04V/cell)` on a fresh pack. See README for panel setup.
+
+### NEW 2026-07-27: interactive Foxglove waypoints — BUILT, BENCH-VERIFIED, NOW FLOWN
+
+`offboard_waypoint` (+ `offboard_waypoint.launch.py`) flies to points clicked in the
+Foxglove 3D panel. Full operating instructions are in `README.md`; what matters here:
+
+- ~~It has never been armed.~~ **Flown successfully 2026-07-27** — see the section
+  above for the flight results.
+- Foxglove has no `InteractiveMarker` support. The interaction is the 3D panel's
+  Publish tool → `geometry_msgs/PointStamped` on `/waypoint/clicked`.
+- **`rtabmap_slam_px4.launch.py` changed**: the bridge now runs with
+  `capabilities:=[clientPublish,connectionGraph]` and
+  `client_topic_whitelist:=['^/waypoint/clicked(_pose)?$']`. Before this the browser
+  could not publish at all. Keep that whitelist narrow — widening it to `['.*']` puts
+  `/fmu/in/*` (setpoints, arm commands) in reach of any WebSocket client.
+- **`OffboardHover` gained two overridable properties**, `hold_point` and
+  `horizontal_error_limit`, and `check_flight_position` moved up from
+  `OffboardHoldYaw`. Behavior of the existing nodes is unchanged (`hold_point`
+  defaults to the takeoff latch); the waypoint node re-points the watchdog at the
+  commanded position, because otherwise the 0.35 m hold gate lands the vehicle for
+  successfully translating.
+- **Transit lag is the tuning risk.** PX4 trails a moving setpoint by about
+  `waypoint_speed / MPC_XY_P` ≈ 0.26 m at the 0.25 m/s default, so the tight 0.35 m
+  gate applies only after the commanded point has been still for 1.0 s; a looser
+  0.60 m `transit_horizontal_error` covers transit. If waypoint flights abort on hold
+  error, that pair is the first thing to look at — not the VIO.
+- Click bounds: wrong `frame_id` rejected; target clamped into a 1.5 m disc around the
+  takeoff latch; **click z ignored** (Foxglove clicks land on the z=0 ground plane, so
+  honoring it would fly into the floor); setpoint slews at 0.25 m/s.
+- **`min_vio_features` is 80 in `offboard_waypoint.launch.py`, not the 160 the hover
+  and yaw tests use.** Lowered 2026-07-27 at the operator's request after a run aborted
+  at 134 features. Note 134 is below anything in the flight record (prior minimums 184
+  and 220, medians 284–336), so the room, not the threshold, is the underlying change —
+  the lower floor buys tolerance, not tracking quality.
+
+Bench verification 2026-07-27 against a faked PX4/VIO (`fake_px4.py` harness, not
+committed): 999 setpoints, max commanded step exactly 0.250 m/s, wrong-frame click
+rejected without moving the target, a 40 m runaway click clamped onto the fence at the
+correct bearing, `/waypoint/target` and `/waypoint/status` publishing. `colcon build`
+and `colcon test` green: `colcon test-result` reports **45 tests, 0 failures**
+(41 pytest cases across the four suites, of which 18 are the new
+`test/test_offboard_waypoint.py`).
+
+Known pre-existing gap this surfaced, NOT fixed: `main()` in all three offboard nodes
+catches only `KeyboardInterrupt`, so a **SIGTERM** exits via
+`rclpy.executors.ExternalShutdownException` without running `on_shutdown()` — i.e.
+without the while-armed AUTO.LAND. Ctrl-C (SIGINT) and the launch shutdown path are
+unaffected. Worth fixing deliberately rather than as a side effect of this work.
+
+### Loop-closure correction — PARKED, see `HANDOFF_LOOP_CLOSURE.md`
+
+Node `map_correction` estimates and rate-limits the SLAM loop-closure transform so a closure
+arrives as a drift instead of a jump. **Observation only — nothing it publishes reaches PX4**,
+so it can be ignored entirely while working on flight. Enabled by default in
+`rtabmap_slam_px4.launch.py` (`map_correction:=false` to disable).
+
+Measured 2026-07-27: corrections in this room are 10–34 cm against a 0.8 cm noise floor. Full
+findings, the open A/B design decision, and how to re-run the measurement are in
+`HANDOFF_LOOP_CLOSURE.md`.
+
 ### Flight-log analysis tooling
 
 - `scripts/analyze_flight.py <bag_dir_or_mcap>` — needs the ROS 2 environment,
   not `.venv-mavlink`. Yaw tracking, drift resolved into **body** axes
   (left/right is the recurring failure mode), roll/pitch by flight phase, VIO
   health. Sorts by timestamp, so it also reads unindexed bags recovered from a
-  killed recorder.
+  killed recorder. If the bag contains `/waypoint/commanded` it adds a **WAYPOINT
+  TRACKING** section (accepted clicks, per-waypoint convergence, slew-limiter
+  check, hold error split into settled-vs-0.35 and transit-vs-0.60) and stops
+  comparing takeoff-relative excursion to the 0.35 m abort — that number is the
+  travel envelope for a waypoint flight, not an error.
 - `.venv-mavlink/bin/python scripts/analyze_ulog.py <ulg> [<ulg> ...]` — motor
   outputs and control-allocator torques, which the bag does not contain.
   Accepts several logs for side-by-side comparison. Rotor index → position and
@@ -680,8 +863,19 @@ rather than replace the RC kill switch.
    Hover roll +2.67 → −0.46 deg; steady offset 0.200 m left → 0.020 m right; max excursion
    0.231 → 0.099 m. Root cause of the first failed attempt was the USB cable tilting the FC
    during calibration — see Known Issues.
-5. **Landing touchdown is firm.** The 07-26 flight recorded roll-rate spikes of +131 and +112 deg/s at
-   ground contact (t=21.03 / 20.66 s). Benign so far, but worth reviewing `MPC_LAND_SPEED`.
+5. **Landing touchdown is firm and getting worse — now the top open item.** 07-26
+   recorded roll-rate spikes of +131 and +112 deg/s at ground contact; the 07-27
+   square flight hit **178 deg/s** (t=57.41) and the altitude trace shows it touching
+   0.000 m then rebounding to 0.177 m before the operator killed it — it **bounced**.
+   Confirmed to be ground contact only: during the square itself the peaks were roll
+   15.1 / pitch 12.5 / yaw 23.2 deg/s. Three flights now point at `MPC_LAND_SPEED`.
+
+6. **Battery discipline. Two consecutive flights landed at 11% and then 2% SoC.**
+   2% (10.71 V under 23.3 A) leaves no reserve for a go-around and deep-discharges the
+   pack. `battery_to_ros` now puts `/battery/{percent,level,status}` on Foxglove
+   (Gauge + Indicator, see README) — but it only exists in stacks started after
+   2026-07-27 12:26, so **restart `rtabmap_slam_px4.launch.py`** or it will not be
+   there. Start scripted flights on a full pack: the square draws ~249 W for ~60 s.
 
 ## Known Issues & Gotchas
 
@@ -760,6 +954,16 @@ rather than replace the RC kill switch.
   executable fails fast if 3.7.1 is installed. The host-side `X_LINK_ERROR` messages are consequences
   of the device firmware crash, not an XRCE failure or evidence that the OAK hardware needs an RMA.
 
+- **Never publish a `TransformStamped` topic that Foxglove can see unless it belongs in the TF
+  tree.** Foxglove grafts *any* `TransformStamped` topic into its transform tree, not just `/tf`.
+  `map_correction` originally published the correction as `TransformStamped` with
+  `frame_id=map` / `child_frame_id=odom`; this pipeline's tree is only `world`→`camera`, so those
+  became a **disconnected second root**. The 3D panel resolved against `odom`, reported
+  `Missing transform from frame <camera> to frame <odom>`, and **the point clouds and all frames
+  vanished** — with nothing actually wrong in the SLAM graph. Fixed by publishing the correction as
+  `PoseStamped` in `world`. If a panel is already stuck this way, set its follow/display frame back
+  to `world`; stale frames clear when the publisher restarts.
+
 - **Camera feed in Foxglove: use the compressed topic.** The feed now defaults to JPEG
   `CompressedImage` on `/rtabmap/image/compressed` (best-effort, keep-last-1) — raw `/rtabmap/image`
   (256 KB/frame) backed up over the WebSocket and the delay grew unbounded. In Foxglove point an
@@ -787,7 +991,11 @@ rather than replace the RC kill switch.
 `/basalt/pose` (VIO in), `/fmu/in/vehicle_visual_odometry` (bridge out),
 `/fmu/out/vehicle_local_position_v1`, `/fmu/out/vehicle_control_mode`,
 `/fmu/out/estimator_status_flags`, `/px4/local_position/{pose,odometry,path}`,
-`/vio/yaw_offset/{pose,odometry,path}` (yaw-offset tester), `/rtabmap/{path,odometry}`.
+`/vio/yaw_offset/{pose,odometry,path}` (yaw-offset tester), `/rtabmap/{path,odometry}`,
+`/vio/map_correction{,_target}` and `/vio/map_correction/{preview_pose,residual_m,residual_deg}`
+(loop-closure correction, observation only),
+`/waypoint/{clicked,clicked_pose}` (Foxglove click in, ENU `world`),
+`/waypoint/{target,commanded,status}` (waypoint node out).
 
 ## Safety
 
