@@ -34,6 +34,11 @@ def generate_launch_description():
     slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
     slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
     slam_num_features = LaunchConfiguration("slam_num_features")
+    map_correction = LaunchConfiguration("map_correction")
+    map_correction_translation_rate = LaunchConfiguration(
+        "map_correction_translation_rate"
+    )
+    map_correction_yaw_rate_deg = LaunchConfiguration("map_correction_yaw_rate_deg")
     foxglove = LaunchConfiguration("foxglove")
     foxglove_port = LaunchConfiguration("foxglove_port")
     foxglove_topic_whitelist = LaunchConfiguration("foxglove_topic_whitelist")
@@ -75,6 +80,14 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
             DeclareLaunchArgument("slam_num_features", default_value="500"),
+            # Observation only: map_correction estimates and rate-limits the
+            # loop-closure transform between /rtabmap/vio_pose and
+            # /rtabmap/pose, but nothing it publishes reaches PX4.
+            DeclareLaunchArgument("map_correction", default_value="true"),
+            DeclareLaunchArgument(
+                "map_correction_translation_rate", default_value="0.03"
+            ),
+            DeclareLaunchArgument("map_correction_yaw_rate_deg", default_value="1.0"),
             DeclareLaunchArgument("foxglove", default_value="true"),
             DeclareLaunchArgument("foxglove_port", default_value="8765"),
             DeclareLaunchArgument(
@@ -86,6 +99,8 @@ def generate_launch_description():
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
                     "'^/vio/yaw_offset/(pose|odometry|path)$', "
+                    "'^/vio/map_correction(_target)?$', "
+                    "'^/vio/map_correction/(preview_pose|residual_m|residual_deg)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
                     "'^/fmu/in/vehicle_visual_odometry$', "
                     "'^/fmu/out/(vehicle_local_position_v1|vehicle_odometry|estimator_status_flags)$']"
@@ -156,6 +171,20 @@ def generate_launch_description():
                                 "output_odometry_topic": output_odometry_topic,
                                 "frame_transform": frame_transform,
                                 "vio_yaw_offset_deg": vio_yaw_offset_deg,
+                            }
+                        ],
+                    ),
+                    Node(
+                        package="px4_vio_bridge",
+                        executable="map_correction",
+                        name="map_correction",
+                        output="screen",
+                        condition=IfCondition(map_correction),
+                        parameters=[
+                            {
+                                "vio_pose_topic": input_pose_topic,
+                                "translation_rate": map_correction_translation_rate,
+                                "yaw_rate_deg": map_correction_yaw_rate_deg,
                             }
                         ],
                     ),

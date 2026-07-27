@@ -9,6 +9,7 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/basalt_odometry_test
   scripts/basalt_rtabmap_slam_ros2
+  scripts/map_correction
   scripts/offboard_hold_yaw
   scripts/offboard_hover
   scripts/px4_local_position_to_ros
@@ -22,6 +23,7 @@ install(DIRECTORY launch
 
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_map_correction test/test_map_correction.py)
   ament_add_pytest_test(test_offboard_hover test/test_offboard_hover.py)
   ament_add_pytest_test(test_vio_to_px4_odometry test/test_vio_to_px4_odometry.py)
 endif()
