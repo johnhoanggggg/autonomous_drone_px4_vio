@@ -78,7 +78,7 @@ def generate_launch_description():
                     "port": foxglove_port,
                     "topic_whitelist": (
                         "['^/tf$', "
-                        "'^/rtabmap/(vio_pose|pose|odometry|path|vio_feature_count)$', "
+                        "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count)$', "
                         "'^/rtabmap/image/compressed$', "
                         "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
                         "'^/person/(image/compressed|points|count)$']"

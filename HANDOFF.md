@@ -511,20 +511,37 @@ also built. The final 137 s loop-correction bag produced zero backward
 cumulative-progress events, bounded relative-position motion, 0.87 ms median
 A*, and 12.1 Hz VIO without gaps. Nothing published PX4 trajectory setpoints.
 
-Next session: implement a separately reviewed adapter that applies the
-follower's relative ENU displacement from PX4's current NED local position,
-with `auto_arm=false`, HOLD-on-planner-fault, and the existing offboard safety
-gates. Never send the absolute SLAM-world carrot to PX4. The fresh local
-collision layer remains deferred only for controlled static environments and
-is required before dynamic-environment use. Full details and props-off/live
+The follower now publishes structured validity on `/planner/follower/valid`
+and fails closed on missing, reset-sentinel, or stale raw VIO; missing, stale,
+non-finite, or oversized native correction; stale pose/path; correction settle;
+path-start mismatch; and cross-track failure. Next session: add the separately
+reviewed PX4 adapter. Translation loop correction cancels in the relative
+carrot, but correction yaw must be removed with
+`d_vio = R(-yaw_correction) * d_map` before ENU-to-NED conversion. A separately
+reviewed adapter then applies that vector from PX4's current NED local
+position, with `auto_arm=false`, HOLD-on-planner/correction fault, a final NED
+position slew limiter, and the existing offboard safety gates. Never send the
+absolute SLAM-world carrot to PX4 or inject corrected SLAM into EKF2. The fresh
+local collision layer remains deferred only for controlled static environments
+and is required before dynamic-environment use. Full details and props-off/live
 gates are in `HANDOFF_GLOBAL_PLANNER.md`.
 
-### Loop-closure correction — PARKED, see `HANDOFF_LOOP_CLOSURE.md`
+### Native loop-closure correction
 
-Node `map_correction` estimates and rate-limits the SLAM loop-closure transform so a closure
-arrives as a drift instead of a jump. **Observation only — nothing it publishes reaches PX4**,
-so it can be ignored entirely while working on flight. Enabled by default in
-`rtabmap_slam_px4.launch.py` (`map_correction:=false` to disable).
+DepthAI 3.5's native `RTABMapSLAM.odomCorrection` is published directly as a
+PoseStamped on `/rtabmap/odom_correction`. The former reconstructed/rate-limited
+`map_correction` relay and `/vio/map_correction*` topics were removed: the native
+transform was exact in bag `_5`, while the extra relay duplicated state and
+could conceal source freshness. The observation follower consumes native
+correction directly, rejects values above 0.5 m / 15 degrees, gates on raw-VIO
+health and correction freshness, and still coalesces material changes until a
+quiet interval and fresh path are available. Nothing reaches PX4 yet.
+
+Bag `_5` confirmed raw-frame offset 0 / 0.0 ms and effectively zero p95 native
+transform error. Genuine correction reached 39.96 cm / 11.15 degrees, so the
+provisional 0.25 m / 5 degree first-flight adapter gate must HOLD then LAND
+rather than attempting to fly through the largest updates. Historical relay
+details and bag results are summarized in `HANDOFF_LOOP_CLOSURE.md`.
 
 Measured 2026-07-27: corrections in this room are 10–34 cm against a 0.8 cm noise floor. Full
 findings, the open A/B design decision, and how to re-run the measurement are in
@@ -1018,7 +1035,7 @@ rather than replace the RC kill switch.
 
 - **Never publish a `TransformStamped` topic that Foxglove can see unless it belongs in the TF
   tree.** Foxglove grafts *any* `TransformStamped` topic into its transform tree, not just `/tf`.
-  `map_correction` originally published the correction as `TransformStamped` with
+  the retired correction relay originally published the correction as `TransformStamped` with
   `frame_id=map` / `child_frame_id=odom`; this pipeline's tree is only `world`→`camera`, so those
   became a **disconnected second root**. The 3D panel resolved against `odom`, reported
   `Missing transform from frame <camera> to frame <odom>`, and **the point clouds and all frames
@@ -1053,13 +1070,12 @@ rather than replace the RC kill switch.
 `/basalt/pose` (VIO in), `/fmu/in/vehicle_visual_odometry` (bridge out),
 `/fmu/out/vehicle_local_position_v1`, `/fmu/out/vehicle_control_mode`,
 `/fmu/out/estimator_status_flags`, `/px4/local_position/{pose,odometry,path}`,
-`/vio/yaw_offset/{pose,odometry,path}` (yaw-offset tester), `/rtabmap/{path,odometry}`,
-`/vio/map_correction{,_target}` and `/vio/map_correction/{preview_pose,residual_m,residual_deg}`
-(loop-closure correction, observation only),
+`/vio/yaw_offset/{pose,odometry,path}` (yaw-offset tester),
+`/rtabmap/{path,odometry,odom_correction}` (native loop correction is observation only),
 `/waypoint/{clicked,clicked_pose}` (Foxglove click in, ENU `world`),
 `/waypoint/{target,commanded,status}` (waypoint node out).
 `/planner/{path,candidate_path,inflated_map,status}` (global planner monitor),
-`/planner/follower/{carrot,lookahead,displacement,status,progress,path_progress,remaining,cross_track,path_generation}`
+`/planner/follower/{carrot,lookahead,displacement,status,valid,progress,path_progress,remaining,cross_track,path_generation}`
 (position-only route follower monitor; observation only).
 
 ## Safety

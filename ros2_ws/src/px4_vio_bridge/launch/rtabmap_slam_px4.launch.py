@@ -39,11 +39,6 @@ def generate_launch_description():
     slam_grid_ray_tracing = LaunchConfiguration("slam_grid_ray_tracing")
     slam_grid_footprint_radius = LaunchConfiguration("slam_grid_footprint_radius")
     slam_num_features = LaunchConfiguration("slam_num_features")
-    map_correction = LaunchConfiguration("map_correction")
-    map_correction_translation_rate = LaunchConfiguration(
-        "map_correction_translation_rate"
-    )
-    map_correction_yaw_rate_deg = LaunchConfiguration("map_correction_yaw_rate_deg")
     battery_monitor = LaunchConfiguration("battery_monitor")
     battery_warn_percent = LaunchConfiguration("battery_warn_percent")
     battery_critical_percent = LaunchConfiguration("battery_critical_percent")
@@ -97,14 +92,6 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_grid_ray_tracing", default_value="false"),
             DeclareLaunchArgument("slam_grid_footprint_radius", default_value="0.0"),
             DeclareLaunchArgument("slam_num_features", default_value="500"),
-            # Observation only: map_correction estimates and rate-limits the
-            # loop-closure transform between /rtabmap/vio_pose and
-            # /rtabmap/pose, but nothing it publishes reaches PX4.
-            DeclareLaunchArgument("map_correction", default_value="true"),
-            DeclareLaunchArgument(
-                "map_correction_translation_rate", default_value="0.03"
-            ),
-            DeclareLaunchArgument("map_correction_yaw_rate_deg", default_value="1.0"),
             # Flattens PX4 battery telemetry into std_msgs so Foxglove Gauge and
             # Indicator panels can bind to it directly. Added 2026-07-27 after a
             # flight finished at 11% SoC unnoticed.
@@ -118,13 +105,11 @@ def generate_launch_description():
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf$', "
-                    "'^/rtabmap/(vio_pose|pose|odometry|path|vio_feature_count|grid)$', "
+                    "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count|grid)$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
                     "'^/vio/yaw_offset/(pose|odometry|path)$', "
-                    "'^/vio/map_correction(_target)?$', "
-                    "'^/vio/map_correction/(preview_pose|residual_m|residual_deg)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
                     "'^/waypoint/(clicked|clicked_pose|target|commanded|status)$', "
                     # VFH publishes a fixed set of small topics plus one marker
@@ -220,20 +205,6 @@ def generate_launch_description():
                                 "output_odometry_topic": output_odometry_topic,
                                 "frame_transform": frame_transform,
                                 "vio_yaw_offset_deg": vio_yaw_offset_deg,
-                            }
-                        ],
-                    ),
-                    Node(
-                        package="px4_vio_bridge",
-                        executable="map_correction",
-                        name="map_correction",
-                        output="screen",
-                        condition=IfCondition(map_correction),
-                        parameters=[
-                            {
-                                "vio_pose_topic": input_pose_topic,
-                                "translation_rate": map_correction_translation_rate,
-                                "yaw_rate_deg": map_correction_yaw_rate_deg,
                             }
                         ],
                     ),

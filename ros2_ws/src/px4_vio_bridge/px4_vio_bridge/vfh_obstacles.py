@@ -294,7 +294,7 @@ class ObstacleField:
         memory_duration=30.0,
         memory_voxel_size=0.10,
         memory_max_points=20000,
-        memory_correction_topic="/vio/map_correction_target",
+        memory_correction_topic="/rtabmap/odom_correction",
         memory_reset_correction_m=0.05,
         memory_reset_correction_deg=2.0,
         clock=None,

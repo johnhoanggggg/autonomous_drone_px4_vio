@@ -91,7 +91,7 @@ def generate_launch_description():
                 condition=IfCondition(foxglove),
                 launch_arguments={
                     "port": foxglove_port,
-                    "topic_whitelist": "['^/tf$', '^/rtabmap/(vio_pose|pose|odometry|path|depth|camera_info|vio_feature_count|grid)$', '^/rtabmap/image/compressed$', '^/rtabmap/image$', '^/rtabmap/(obstacle_cloud|ground_cloud)$']",
+                    "topic_whitelist": "['^/tf$', '^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|depth|camera_info|vio_feature_count|grid)$', '^/rtabmap/image/compressed$', '^/rtabmap/image$', '^/rtabmap/(obstacle_cloud|ground_cloud)$']",
                     "service_whitelist": "['^$']",
                     "param_whitelist": "['^$']",
                     "client_topic_whitelist": "['^$']",

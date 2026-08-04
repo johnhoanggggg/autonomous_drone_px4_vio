@@ -13,7 +13,6 @@ install(PROGRAMS
   scripts/global_planner_monitor
   scripts/global_planner_sim
   scripts/route_follower_monitor
-  scripts/map_correction
   scripts/offboard_hold_yaw
   scripts/offboard_hover
   scripts/offboard_square
@@ -34,7 +33,6 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_battery_to_ros test/test_battery_to_ros.py)
   ament_add_pytest_test(test_grid_planner test/test_grid_planner.py)
   ament_add_pytest_test(test_rtabmap_grid test/test_rtabmap_grid.py)
-  ament_add_pytest_test(test_map_correction test/test_map_correction.py)
   ament_add_pytest_test(test_path_follower test/test_path_follower.py)
   ament_add_pytest_test(test_offboard_hover test/test_offboard_hover.py)
   ament_add_pytest_test(test_offboard_square test/test_offboard_square.py)

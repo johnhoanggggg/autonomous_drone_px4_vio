@@ -123,6 +123,7 @@ class Ros2Node(dai.node.ThreadedHostNode):
         dai.node.ThreadedHostNode.__init__(self)
         self.inputTrans = dai.Node.Input(self)
         self.inputBasaltTrans = dai.Node.Input(self)
+        self.inputOdomCorrection = self.createInput()
         self.inputImg = dai.Node.Input(self)
         self.inputDepth = dai.Node.Input(self)
         self.inputDepth.setBlocking(False)
@@ -143,6 +144,8 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.path_pub = self.ros_node.create_publisher(Path, '/rtabmap/path', 10)
         self.pose_pub = self.ros_node.create_publisher(PoseStamped, '/rtabmap/pose', 10)
         self.odom_pub = self.ros_node.create_publisher(Odometry, '/rtabmap/odometry', 10)
+        self.odom_correction_pub = self.ros_node.create_publisher(
+            PoseStamped, '/rtabmap/odom_correction', 10)
         self.vio_pose_pub = self.ros_node.create_publisher(PoseStamped, args.vio_pose_topic, 10)
         self.obstacle_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/obstacle_cloud', 10)
         self.ground_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/ground_cloud', 10)
@@ -179,7 +182,7 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.person_depth_band_m = max(0.0, args.person_depth_band_m)
         self.raw_pose_history = deque(maxlen=120)
         self.person_depth_history = deque(maxlen=30)
-        self.map_correction = np.eye(4, dtype=np.float64)
+        self.odom_correction = np.eye(4, dtype=np.float64)
         self.rgb_to_left = np.eye(4, dtype=np.float64)
         self.left_to_rgb = np.eye(4, dtype=np.float64)
         self.left_optical_to_body = np.array(
@@ -341,12 +344,22 @@ class Ros2Node(dai.node.ThreadedHostNode):
         matrix[:3, 3] = (trans.x, trans.y, trans.z)
         return matrix
 
+    @staticmethod
+    def _has_unit_quaternion(transform_data):
+        quat = transform_data.getQuaternion()
+        values = np.array(
+            [quat.qw, quat.qx, quat.qy, quat.qz], dtype=np.float64)
+        return bool(
+            np.isfinite(values).all()
+            and abs(np.linalg.norm(values) - 1.0) <= 1.0e-3
+        )
+
     def _pose_for_timestamp(self, timestamp):
         if not self.raw_pose_history:
             return None, None
         sample_time, raw_pose = min(
             self.raw_pose_history, key=lambda item: abs(item[0] - timestamp))
-        return self.map_correction @ raw_pose, abs(sample_time - timestamp)
+        return self.odom_correction @ raw_pose, abs(sample_time - timestamp)
 
     def _publish_person_group(self, group, now):
         try:
@@ -500,7 +513,12 @@ class Ros2Node(dai.node.ThreadedHostNode):
     def run(self):
         while self.mainLoop():
             transData = self.inputTrans.get()
-            basaltTransData = self.inputBasaltTrans.tryGet()
+            # RTABMapSLAM::odomPoseCB sends transform, odomCorrection, then
+            # passthroughOdom for one input sample. Blocking for the latter two
+            # is intentional: tryGet() often returned the previous raw pose,
+            # creating a motion-dependent fake map correction in ROS.
+            odomCorrectionData = self.inputOdomCorrection.get()
+            basaltTransData = self.inputBasaltTrans.get()
             imgFrame = self.inputImg.tryGet() if self.publish_image else None
             depthFrame = self.inputDepth.tryGet() if (
                 self.publish_depth or self.detect_people) else None
@@ -511,6 +529,22 @@ class Ros2Node(dai.node.ThreadedHostNode):
             gridData = self.inputGrid.tryGet() if self.publish_grid else None
 
             now = self.ros_node.get_clock().now().to_msg()
+
+            if odomCorrectionData is not None:
+                # This is RTAB-Map's native stats.mapCorrection() result. The
+                # DepthAI output is documented as map-to-odom and is preferable
+                # to inferring the same transform from separately delivered
+                # corrected/raw pose messages. Publish it as PoseStamped rather
+                # than TransformStamped so visualization tools cannot graft it
+                # into the active TF tree by accident.
+                if self._has_unit_quaternion(odomCorrectionData):
+                    self.odom_correction = self._transform_matrix(odomCorrectionData)
+                    self.odom_correction_pub.publish(
+                        self._make_pose(odomCorrectionData, now))
+                else:
+                    self.ros_node.get_logger().warning(
+                        'native odom correction has a non-unit quaternion; rejected',
+                        throttle_duration_sec=1.0)
 
             if gridData is not None:
                 try:
@@ -547,9 +581,6 @@ class Ros2Node(dai.node.ThreadedHostNode):
                 self.vio_pose_pub.publish(self._make_pose(basaltTransData, now))
 
             if transData is not None:
-                corrected_pose = self._transform_matrix(transData)
-                if basaltTransData is not None:
-                    self.map_correction = corrected_pose @ np.linalg.inv(raw_pose)
                 pose = self._make_pose(transData, now)
                 self.pose_pub.publish(pose)
                 self._publish_camera_transform(pose)
@@ -855,6 +886,7 @@ with dai.Pipeline() as p:
     odom.transform.link(slam.odom)
     slam.passthroughOdom.link(ros2Viewer.inputBasaltTrans)
     slam.transform.link(ros2Viewer.inputTrans)
+    slam.odomCorrection.link(ros2Viewer.inputOdomCorrection)
     if args.publish_image:
         slam.passthroughRect.link(ros2Viewer.inputImg)
     if args.publish_depth or args.detect_people:

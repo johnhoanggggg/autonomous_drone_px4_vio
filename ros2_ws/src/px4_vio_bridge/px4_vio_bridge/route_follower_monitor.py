@@ -7,11 +7,16 @@ import rclpy
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Vector3Stamped
 from nav_msgs.msg import Path
 from rclpy.node import Node
-from std_msgs.msg import Float32, Int32, String
+from std_msgs.msg import Bool, Float32, Int32, String
 from visualization_msgs.msg import Marker, MarkerArray
 
-from px4_vio_bridge.map_correction import yaw_from_quaternion
-from px4_vio_bridge.path_follower import CorrectionReplanGate, PositionRouteFollower
+from px4_vio_bridge.path_follower import (
+    CorrectionReplanGate,
+    PositionRouteFollower,
+    correction_rejection_reason,
+    yaw_from_quaternion,
+)
+from px4_vio_bridge.vio_to_px4_odometry import pose_rejection_reason
 
 
 class RouteFollowerMonitor(Node):
@@ -19,12 +24,17 @@ class RouteFollowerMonitor(Node):
         super().__init__("route_follower_monitor")
         self.declare_parameter("path_topic", "/planner/path")
         self.declare_parameter("pose_topic", "/rtabmap/pose")
+        self.declare_parameter("raw_vio_topic", "/rtabmap/vio_pose")
         self.declare_parameter("goal_topic", "/waypoint/clicked")
-        self.declare_parameter("correction_topic", "/vio/map_correction_target")
+        self.declare_parameter("correction_topic", "/rtabmap/odom_correction")
         self.declare_parameter("frame_id", "world")
         self.declare_parameter("rate_hz", 10.0)
         self.declare_parameter("path_timeout", 3.0)
         self.declare_parameter("pose_timeout", 1.0)
+        self.declare_parameter("vio_timeout", 0.5)
+        self.declare_parameter("correction_timeout", 1.0)
+        self.declare_parameter("max_correction_m", 0.50)
+        self.declare_parameter("max_correction_yaw_deg", 15.0)
         self.declare_parameter("lookahead", 0.60)
         self.declare_parameter("max_carrot_speed", 0.25)
         self.declare_parameter("max_carrot_acceleration", 0.50)
@@ -42,6 +52,16 @@ class RouteFollowerMonitor(Node):
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.path_timeout = float(self.get_parameter("path_timeout").value)
         self.pose_timeout = float(self.get_parameter("pose_timeout").value)
+        self.vio_timeout = float(self.get_parameter("vio_timeout").value)
+        self.correction_timeout = float(
+            self.get_parameter("correction_timeout").value
+        )
+        self.max_correction_m = float(
+            self.get_parameter("max_correction_m").value
+        )
+        self.max_correction_yaw = math.radians(
+            float(self.get_parameter("max_correction_yaw_deg").value)
+        )
         self.path_start_tolerance = float(self.get_parameter("path_start_tolerance").value)
         self.correction_gate = CorrectionReplanGate(
             translation_trigger=float(
@@ -74,6 +94,14 @@ class RouteFollowerMonitor(Node):
 
         self.pose = None
         self.pose_received = 0.0
+        self.raw_vio_seen = False
+        self.raw_vio_valid = False
+        self.raw_vio_reason = ""
+        self.raw_vio_received = 0.0
+        self.correction_seen = False
+        self.correction_valid = False
+        self.correction_reason = ""
+        self.correction_received = 0.0
         self.path_received = 0.0
         self.path_start = None
         self.last_tick = self.monotonic_time()
@@ -83,6 +111,12 @@ class RouteFollowerMonitor(Node):
         )
         self.create_subscription(
             PoseStamped, str(self.get_parameter("pose_topic").value), self.on_pose, 10
+        )
+        self.create_subscription(
+            PoseStamped,
+            str(self.get_parameter("raw_vio_topic").value),
+            self.on_raw_vio,
+            10,
         )
         self.create_subscription(
             PointStamped, str(self.get_parameter("goal_topic").value), self.on_goal, 10
@@ -104,6 +138,9 @@ class RouteFollowerMonitor(Node):
         )
         self.status_pub = self.create_publisher(
             String, "/planner/follower/status", 10
+        )
+        self.valid_pub = self.create_publisher(
+            Bool, "/planner/follower/valid", 10
         )
         self.progress_pub = self.create_publisher(
             Float32, "/planner/follower/progress", 10
@@ -134,8 +171,9 @@ class RouteFollowerMonitor(Node):
     def monotonic_time():
         return time.monotonic()
 
-    def publish_status(self, status):
+    def publish_status(self, status, valid=False):
         self.status_pub.publish(String(data=status))
+        self.valid_pub.publish(Bool(data=valid))
 
     def on_pose(self, msg):
         if msg.header.frame_id != self.frame_id:
@@ -144,6 +182,28 @@ class RouteFollowerMonitor(Node):
         if all(math.isfinite(value) for value in point):
             self.pose = point
             self.pose_received = self.monotonic_time()
+
+    def on_raw_vio(self, msg):
+        now = self.monotonic_time()
+        position = msg.pose.position
+        orientation = msg.pose.orientation
+        reason = pose_rejection_reason(
+            (float(position.x), float(position.y), float(position.z)),
+            (
+                float(orientation.w),
+                float(orientation.x),
+                float(orientation.y),
+                float(orientation.z),
+            ),
+        )
+        self.raw_vio_seen = True
+        self.raw_vio_received = now
+        self.raw_vio_valid = reason is None
+        self.raw_vio_reason = reason or ""
+        if reason:
+            self.get_logger().error(
+                f"raw VIO rejected: {reason}", throttle_duration_sec=1.0
+            )
 
     def on_goal(self, msg):
         if msg.header.frame_id != self.frame_id:
@@ -187,15 +247,26 @@ class RouteFollowerMonitor(Node):
             )
 
     def on_correction(self, msg):
+        now = self.monotonic_time()
         position = msg.pose.position
         orientation = msg.pose.orientation
         correction = (
             float(position.x), float(position.y), float(position.z),
             yaw_from_quaternion((orientation.w, orientation.x, orientation.y, orientation.z)),
         )
-        if not all(math.isfinite(value) for value in correction):
+        reason = correction_rejection_reason(
+            correction, self.max_correction_m, self.max_correction_yaw
+        )
+        self.correction_seen = True
+        self.correction_received = now
+        self.correction_valid = reason is None
+        self.correction_reason = reason or ""
+        if reason:
+            self.get_logger().error(
+                f"native correction rejected: {reason}", throttle_duration_sec=1.0
+            )
             return
-        if self.correction_gate.observe(correction, self.monotonic_time()):
+        if self.correction_gate.observe(correction, now):
             translation, yaw = self.correction_gate.last_trigger_delta
             self.get_logger().warn(
                 f"persistent map correction {translation:.3f}m/"
@@ -253,6 +324,28 @@ class RouteFollowerMonitor(Node):
         now = self.monotonic_time()
         dt = max(1.0e-3, min(0.5, now - self.last_tick))
         self.last_tick = now
+        if not self.raw_vio_seen:
+            self.publish_status("WAITING_FOR_VIO")
+            return
+        if not self.raw_vio_valid:
+            self.publish_status(f"INVALID_VIO reason={self.raw_vio_reason}")
+            return
+        if now - self.raw_vio_received > self.vio_timeout:
+            self.publish_status(f"STALE_VIO age={now - self.raw_vio_received:.2f}s")
+            return
+        if not self.correction_seen:
+            self.publish_status("WAITING_FOR_CORRECTION")
+            return
+        if not self.correction_valid:
+            self.publish_status(
+                f"CORRECTION_REJECTED reason={self.correction_reason}"
+            )
+            return
+        if now - self.correction_received > self.correction_timeout:
+            self.publish_status(
+                f"STALE_CORRECTION age={now - self.correction_received:.2f}s"
+            )
+            return
         if self.pose is None:
             self.publish_status("WAITING_FOR_POSE")
             return
@@ -297,7 +390,8 @@ class RouteFollowerMonitor(Node):
         self.publish_status(
             f"{result.status} generation={result.generation} progress={result.progress:.2f}m "
             f"path_progress={result.path_progress:.2f}m "
-            f"remaining={result.remaining:.2f}m cross_track={result.cross_track:.2f}m"
+            f"remaining={result.remaining:.2f}m cross_track={result.cross_track:.2f}m",
+            valid=result.valid,
         )
         self.publish_markers(result, stamp)
 

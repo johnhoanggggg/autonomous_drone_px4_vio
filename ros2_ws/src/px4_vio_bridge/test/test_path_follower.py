@@ -7,7 +7,39 @@ from px4_vio_bridge.path_follower import (
     CorrectionReplanGate,
     Polyline,
     PositionRouteFollower,
+    correction_rejection_reason,
+    yaw_from_quaternion,
 )
+
+
+def test_yaw_from_quaternion():
+    yaw = math.radians(-115.0)
+    quaternion = (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0))
+    assert yaw_from_quaternion(quaternion) == pytest.approx(yaw)
+
+
+def test_invalid_correction_quaternion_is_rejected():
+    yaw = yaw_from_quaternion((0.0, 0.0, 0.0, 0.0))
+    assert correction_rejection_reason((0.0, 0.0, 0.0, yaw)) == (
+        "correction contains a non-finite value"
+    )
+    non_unit_yaw = yaw_from_quaternion((0.5, 0.0, 0.0, 0.0))
+    assert correction_rejection_reason((0.0, 0.0, 0.0, non_unit_yaw)) == (
+        "correction contains a non-finite value"
+    )
+
+
+def test_native_correction_safety_limits():
+    assert correction_rejection_reason((0.2, 0.0, 0.0, 0.0)) is None
+    assert "max_correction_m" in correction_rejection_reason(
+        (0.9, 0.0, 0.0, 0.0)
+    )
+    assert "max_correction_yaw_deg" in correction_rejection_reason(
+        (0.0, 0.0, 0.0, math.radians(40.0))
+    )
+    assert correction_rejection_reason((math.nan, 0.0, 0.0, 0.0)) == (
+        "correction contains a non-finite value"
+    )
 
 
 def test_polyline_projection_and_interpolated_lookahead():

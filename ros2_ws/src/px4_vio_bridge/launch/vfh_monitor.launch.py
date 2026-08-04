@@ -68,7 +68,7 @@ def generate_launch_description():
         DeclareLaunchArgument("memory_voxel_size", default_value="0.10"),
         DeclareLaunchArgument("memory_max_points", default_value="20000"),
         DeclareLaunchArgument(
-            "memory_correction_topic", default_value="/vio/map_correction_target"
+            "memory_correction_topic", default_value="/rtabmap/odom_correction"
         ),
         DeclareLaunchArgument("memory_reset_correction_m", default_value="0.05"),
         DeclareLaunchArgument("memory_reset_correction_deg", default_value="2.0"),

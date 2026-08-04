@@ -138,6 +138,10 @@ Important pose distinction:
   jumps into EKF2.
 - **Foxglove's SLAM visualization is loop-corrected.** `/rtabmap/pose`,
   `/rtabmap/odometry`, and `/rtabmap/path` use RTAB-Map's optimized SLAM frame.
+- `/rtabmap/odom_correction` is DepthAI RTAB-Map's native map-to-odometry
+  correction. The observation-only route follower consumes it directly and
+  fails closed on stale, non-finite, or oversized corrections and unhealthy raw
+  VIO. It is not added to TF or sent to PX4.
 - `/px4/local_position/*` shows PX4/EKF2's estimated vehicle position. It should be
   compared with `/rtabmap/vio_pose`, not expected to follow a later SLAM loop closure.
 
@@ -594,7 +598,8 @@ Click a `world` goal through the existing `/waypoint/clicked` Foxglove Publish
 tool. Add `/rtabmap/grid`, `/planner/inflated_map`, `/planner/path`,
 `/planner/candidate_path`, and `/planner/markers` to the 3D panel; watch
 `/planner/status` and `/planner/planning_ms` separately. For the follower, add
-`/planner/follower/markers` and watch `/planner/follower/status`. Its
+`/planner/follower/markers` and watch `/planner/follower/status` plus the
+structured `/planner/follower/valid` boolean. Its
 `/planner/follower/displacement` is the smoothed position displacement in the
 corrected `world` frame that a later, separately reviewed flight adapter could
 apply relative to PX4's current position. It is not a velocity command.
@@ -605,7 +610,10 @@ planner produces a route. A real loop-closure bag captured a 12.1 cm corrected
 pose step while the relative position proposal remained within its 0.25 m/s
 limit. The correction gate and progress telemetry were subsequently improved,
 then live-validated in a second 137 s recording with zero backward cumulative
-progress events. An asymmetric-scene Foxglove visual check remains useful.
+progress events. A later native-correction bag confirmed zero-frame
+raw/corrected synchronization and effectively exact map-to-odom transform
+direction after the host pairing fix. An asymmetric-scene Foxglove visual
+check remains useful.
 Do not use the displayed route for flight control.
 
 ## PARKED: Obstacle Avoidance (VFH2D) — EXPERIMENTAL, NEVER ARMED

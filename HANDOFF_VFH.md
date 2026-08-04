@@ -146,7 +146,7 @@ The pipeline, in order, with defaults:
    voxel replaces its complete point batch instead of accumulating frames, so
    current-cloud density is preserved. Set `memory_duration:=0` to recover
    current-frame-only behaviour. `memory_correction_topic` defaults to
-   `/vio/map_correction_target`; reset gates are 0.05 m and 2 deg.
+   `/rtabmap/odom_correction`; reset gates are 0.05 m and 2 deg.
 3. **Density** — `density += 1 - range/max_range` per point. `max_range` is
    therefore both the cutoff *and* the weight scale: raising it makes far points
    count and every point count less.

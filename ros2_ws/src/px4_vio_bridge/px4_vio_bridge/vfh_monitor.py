@@ -91,7 +91,7 @@ class VfhMonitor(Node):
         self.declare_parameter("memory_voxel_size", 0.10)
         self.declare_parameter("memory_max_points", 20000)
         self.declare_parameter(
-            "memory_correction_topic", "/vio/map_correction_target"
+            "memory_correction_topic", "/rtabmap/odom_correction"
         )
         self.declare_parameter("memory_reset_correction_m", 0.05)
         self.declare_parameter("memory_reset_correction_deg", 2.0)

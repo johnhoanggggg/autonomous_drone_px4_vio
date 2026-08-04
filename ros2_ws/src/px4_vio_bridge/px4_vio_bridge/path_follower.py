@@ -7,6 +7,7 @@ from typing import Optional, Sequence, Tuple
 
 Point2 = Tuple[float, float]
 Correction4 = Tuple[float, float, float, float]
+Quaternion = Tuple[float, float, float, float]  # w, x, y, z
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,42 @@ def _wrap_pi(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def yaw_from_quaternion(quaternion: Quaternion) -> float:
+    """Yaw about +Z from a quaternion supplied as (w, x, y, z)."""
+    w, x, y, z = quaternion
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if not math.isfinite(norm) or abs(norm - 1.0) > 1.0e-3:
+        return math.nan
+    w, x, y, z = (value / norm for value in (w, x, y, z))
+    return math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+
+def correction_rejection_reason(
+    correction: Correction4,
+    max_translation: float = 0.5,
+    max_yaw: float = math.radians(15.0),
+) -> Optional[str]:
+    """Return why a native map-to-odom correction is unsafe, if anything."""
+    if not all(math.isfinite(value) for value in correction):
+        return "correction contains a non-finite value"
+    translation = math.sqrt(sum(value * value for value in correction[:3]))
+    if translation > max_translation:
+        return (
+            f"translation {translation:.2f}m exceeds "
+            f"max_correction_m {max_translation:.2f}"
+        )
+    yaw = abs(_wrap_pi(correction[3]))
+    if yaw > max_yaw:
+        return (
+            f"yaw {math.degrees(yaw):.1f}deg exceeds "
+            f"max_correction_yaw_deg {math.degrees(max_yaw):.1f}"
+        )
+    return None
+
+
 def _correction_delta(first: Correction4, second: Correction4) -> Tuple[float, float]:
     return (
         math.dist(first[:3], second[:3]),
@@ -118,7 +155,7 @@ def _blend_correction(first: Correction4, second: Correction4, fraction: float) 
 class CorrectionReplanGate:
     """Coalesce noisy correction samples into infrequent replan barriers.
 
-    The raw correction target can move by centimetres from one SLAM update to
+    The native correction can move by centimetres from one SLAM update to
     the next. Gating on each sample starves the follower. This detector filters
     the target, starts one barrier for a material correction episode, and then
     requires both a quiet interval and a path received after the last material

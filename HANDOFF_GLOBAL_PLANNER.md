@@ -34,14 +34,28 @@ operator visual check of asymmetric obstacle sides in Foxglove remains useful.
 The observation-only planner/follower milestone is complete. Do not connect
 `/planner/path` or the absolute `/planner/follower/carrot` directly to PX4.
 The next implementation milestone is a separately reviewed, position-only
-flight adapter for a controlled static-room trial. It should:
+flight adapter for a controlled static-room trial. Bag `_4` validated the
+native `/rtabmap/odom_correction` direction and exposed/fixed a one-raw-frame
+host pairing error. Bag `_5` confirmed the synchronization and native source.
+The redundant host correction relay is removed. The follower now consumes
+native correction directly and `/planner/follower/valid` fails closed on raw
+VIO, correction, pose, path, correction-settle, path-start, and cross-track
+faults. Bag `_4` proved this is necessary because corrected pose can remain
+finite after raw VIO enters its reset sentinel. Before building the flight
+adapter, add a continuous-VIO-frame displacement derived from the follower's
+filtered correction yaw. The adapter should then:
 
-1. Consume `/planner/follower/displacement` and the follower status, plus the
-   current PX4 local position and the existing estimator/VIO/battery health
-   topics.
-2. Convert the relative displacement from ENU to NED and add it to PX4's
-   current local position. Never treat an absolute corrected-SLAM coordinate as
-   a PX4 local coordinate.
+1. Consume the continuous-VIO-frame displacement and structured follower
+   validity, plus the current PX4 local position and the existing
+   estimator/VIO/battery health topics. Do not make flight logic parse the
+   human-readable follower status string.
+2. Undo correction yaw before ENU-to-NED conversion. If
+   `T_map<-vio = (R(yaw_correction), translation)`, then for the map-frame
+   relative carrot `d_map`, calculate `d_vio = R(-yaw_correction) * d_map`,
+   followed by `d_ned = (d_vio.y, d_vio.x, 0)`. Add `d_ned` to PX4's current
+   local position. Correction translation cancels in the relative vector;
+   correction yaw does not. Never treat an absolute corrected-SLAM coordinate
+   as a PX4 local coordinate.
 3. Reuse the `offboard_waypoint` safety/state-machine patterns: `auto_arm=false`
    by default, offboard/arm confirmation, geofence and maximum-flight-time
    limits, RC kill/manual override, battery gates, and stale estimator/VIO
@@ -50,7 +64,10 @@ flight adapter for a controlled static-room trial. It should:
    is not `FOLLOWING`/`GOAL_REACHED`; land after a bounded persistent planning
    fault while armed. A missing/blocked route must never leave the last moving
    target active.
-5. First run entirely props-off with arming disabled. Before any live trial,
+5. Apply a second speed/acceleration limiter to the final PX4 NED position
+   setpoint. This guarantees a continuous command when leaving HOLD even if the
+   map-frame follower or correction transform changed while paused.
+6. First run entirely props-off with arming disabled. Before any live trial,
    verify TELEM2/DDS on battery power and address the recorded hard/bouncing
    landing. A first route should be only 0.5–1.0 m at about 0.5–0.6 m altitude,
    in an empty mapped room, on a full battery, with RC kill ready.
@@ -59,6 +76,32 @@ The fresh local obstacle-cloud layer remains explicitly deferred for the
 operator's static environments. That limits any future trial to a controlled
 scene with no people, moving doors, or movable obstacles. Add the local layer
 before any dynamic-environment use.
+
+### Loop-correction behavior of the future flight adapter
+
+PX4 must continue receiving raw, continuous VIO through
+`/fmu/in/vehicle_visual_odometry`; neither `/rtabmap/pose` nor a map correction
+is injected into EKF2. During a persistent loop correction:
+
+1. The follower correction gate makes structured validity false while RTAB-Map
+   and A* settle.
+2. The flight adapter immediately latches PX4's current NED position and
+   streams that position-only HOLD setpoint. Horizontal velocity and
+   acceleration fields remain unset/NaN; altitude and takeoff yaw remain
+   independently latched.
+3. Once the correction is quiet and a fresh complete path exists, the follower
+   supplies a displacement transformed back into continuous VIO axes with the
+   inverse correction yaw.
+4. The adapter rebases that displacement from PX4's then-current local
+   position and slews its position setpoint out of HOLD. No absolute map jump
+   reaches PX4.
+
+Detect PX4 local-position reset counters as a separate event: relatch HOLD at
+the new PX4 coordinates and require fresh healthy follower data before
+resuming. For the first trial, a correction larger than the measured room
+behavior (provisionally 0.25 m or 5 degrees), or a correction/planner hold that
+outlives a bounded timeout, should remain HOLD and then request LAND rather
+than trying to fly through it.
 
 ## Files
 
@@ -230,10 +273,22 @@ episode; the follower waits for 0.40 s of correction quiet plus a path newer
 than the last material movement. An 8 s cooldown prevents one graph
 optimization from repeatedly starving the follower.
 
+The standard `rtabmap_ros` loop-closure info topic is not present here because
+this stack runs DepthAI's on-device `dai.node.RTABMapSLAM`. DepthAI 3.5 does,
+however, expose `odomCorrection`, which its source defines as RTAB-Map's
+`stats.mapCorrection()` map-to-odom transform. The host wrapper now publishes
+that output as PoseStamped on `/rtabmap/odom_correction`; it deliberately is
+not inserted into TF. The actual loop-closure ID is only logged internally by
+the DepthAI implementation and is not an output. Bag `_4` verified
+`C_native * raw_pose -> corrected_pose`. The redundant host correction relay
+has now been removed. The follower consumes native correction directly and
+keeps the 0.5 m / 15 degree rejection plus magnitude/quiet/fresh-path gating.
+It also gates on reset-sentinel/invalid/stale raw VIO and stale correction.
+
 ### Completed validation milestone — real loop closure and replanning stability
 
 Run the global planner and observation-only follower while deliberately
-creating a loop closure. Record the grid, SLAM pose, correction target, accepted
+creating a loop closure. Record the grid, SLAM pose, native correction, accepted
 and candidate paths, and proposed carrot. Confirm that:
 
 - map, pose, goal, and path remain in one corrected `world` frame;
@@ -284,6 +339,73 @@ envelope, so the planner reported `START_BLOCKED`. From 116 s onward an
 occupied cell was 0.323 m from the goal, so it reported `GOAL_BLOCKED`,
 published an empty path, and the follower moved to `WAITING_FOR_PATH`.
 
+All three existing loop-closure bags predate `/rtabmap/odom_correction`, so
+they cannot directly validate the native output. Offline reconstruction of
+`corrected_pose * inverse(raw_pose)` in bags `_2` and `_3` agrees with the
+deadbanded `/vio/map_correction_target` convention: translation disagreement
+was 0.91/0.97 cm p95 and yaw disagreement 0.193/0.199 degrees p95. The original
+unnumbered bag does not pass this comparison and remains unsuitable because of
+its earlier pairing/reset/recording problems. `scripts/analyze_map_correction.py`
+now reports native-vs-target comparison when the native topic exists and the
+legacy reconstruction result otherwise.
+
+Bag `global_planner_loop_closure_4` is the first native-correction recording.
+During healthy VIO, applying the native map-to-odom correction to the properly
+matched raw pose reproduced the corrected pose with 1.08 cm XY p95 and 0.040
+degree yaw p95 error, confirming transform direction. The best match was the
+*next* raw ROS message (`+1` frame, 71.8 ms median), exposing the host bridge's
+non-blocking read of the previous passthrough pose. DepthAI emits corrected
+transform, correction, then raw passthrough for one callback; the bridge now
+blocks for the latter two, keeping one callback together.
+
+The old reconstructed `/vio/map_correction_target` disagreed with native by
+9.78 cm / 2.42 degrees p95 during healthy motion because of that frame skew.
+Native showed the real main optimization at 60.06 s: an 11.30 cm / 1.04 degree
+step, settling around 12.21 cm / 1.35 degrees by 67.03 s. At 83.28 s raw VIO
+entered its reset sentinel and never recovered for the remaining 46.03 s.
+DepthAI later produced a bogus 1.47 m / 51.32 degree correction; the existing
+VIO-reset freeze and 0.5 m / 15 degree gates correctly define this as a fault.
+The observation planner nevertheless resumed on a finite corrected pose, so
+raw-VIO validity therefore became an explicit structured follower gate before
+PX4 is connected. The analyzer now separates healthy/reset intervals and
+validates the native transform relation instead of treating the old target as
+ground truth.
+
+Bag `global_planner_loop_closure_5` confirmed the post-fix pipeline over 136.5
+s. Native correction, raw VIO, corrected pose, and feature count all ran at
+13.2 Hz. The correct raw-frame offset is now `0` with a 0.0 ms median header
+offset; the full native transform reproduced corrected pose with effectively
+zero p95 XY/yaw error (0.23 cm / 0.079 degree maxima around the transient).
+The now-retired `/vio/map_correction_target` relay matched native exactly for at
+least 95% of valid samples; isolated maximum differences occurred only at
+correction-update ordering instants. One reset-sentinel sample at 46.24 s recovered on the next sample
+with only 1.5 cm / 2.86 degrees across the gap, so later corrections are not
+reset artifacts. VIO features were 287 median / 31 minimum, with 97 samples
+below 160.
+
+This longer 25.26 m carried loop produced genuine corrections up to 39.96 cm
+and 11.15 degrees, with a 32.21 cm single optimization step at 69.04 s. Those
+remain inside the follower's 0.5 m / 15 degree acceptance gate but
+exceed the provisional first-flight 0.25 m / 5 degree HOLD-then-LAND gate; do
+not silently raise the flight gate. While a route existed, four coalesced
+correction waits totaled 2.62 s. Follower displacement updates stayed at 2.70
+cm maximum (0.265 m/s implied), cumulative progress had zero backward events,
+and A* was 1.84 ms median / 10.36 ms p95 / 13.07 ms maximum.
+
+Bag `global_planner_loop_closure_6` is the first recording after removing the
+correction relay. Its topic set is native-only and includes structured follower
+validity. Over 100.4 s, raw VIO/corrected pose/native correction ran at 13.7 Hz;
+the native full transform matched exactly at healthy paired samples. The main
+correction reached 15.51 cm / 3.37 degrees. Both one-sample VIO reset sentinels
+produced `INVALID_VIO`, proving the new structured gate works. The follower
+made zero backward progress updates and its displacement changed by at most
+2.66 cm (0.2505 m/s p95 implied speed). A* took 2.27 ms median / 6.50 ms p95 /
+18.52 ms maximum. At 93.97 s the updated map made the clicked goal fall inside
+the lethal envelope, so `GOAL_BLOCKED` and continued invalid follower output
+were the correct result. Sixteen malformed non-unit native quaternions occurred
+only during DepthAI initialization; source, follower, and analyzer rejection is
+now explicit.
+
 Record it by running the normal SLAM stack and:
 
 ```bash
@@ -292,11 +414,12 @@ ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge \
   bag_output:=flight_logs/global_planner_loop_closure_N
 ```
 
-The launch records the grid, corrected and raw poses, correction target/applied
-correction, waypoint, accepted/candidate routes, planning metrics, and every
-follower output. Set a goal that remains in mapped free space, walk/fly a loop
-that causes a genuine closure, continue for roughly 10 seconds after the
-closure, then stop the launch cleanly so the MCAP index is finalized.
+The launch records the grid, corrected and raw poses, VIO feature count,
+native map-to-odom correction, structured follower validity, waypoint,
+accepted/candidate routes, planning metrics, and every follower output. Set a
+goal that remains in mapped free space, walk/fly a loop that causes a genuine
+closure, continue for roughly 10 seconds after the closure, then stop the
+launch cleanly so the MCAP index is finalized.
 Use a new `bag_output` directory for every run. The launch now shuts itself down
 if the recorder exits unexpectedly (including an existing-output-directory
 error), instead of letting an unrecorded planner run continue unnoticed.
