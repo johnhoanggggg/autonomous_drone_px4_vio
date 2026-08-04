@@ -4,8 +4,9 @@ Authoritative current-state doc. Full chronological history is in `HANDOFF_ARCHI
 (kept for forensics; some of it is superseded — trust this file).
 
 Side-work lives in its own docs: `HANDOFF_LOOP_CLOSURE.md` (SLAM loop-closure
-correction — built, measured, not wired to PX4; safe to ignore while flying) and
-`HANDOFF_VFH.md` (VFH2D obstacle avoidance — built, never armed, and parked).
+correction — built, measured, not wired to PX4), `HANDOFF_VFH.md` (VFH2D —
+built, never armed, and parked), and `HANDOFF_GLOBAL_PLANNER.md` (global A*
+monitor — built and simulator-verified, not wired to PX4).
 
 Last updated: 2026-08-04.
 
@@ -490,6 +491,33 @@ If revisited, begin with the observation-only monitor and reassess the planner
 architecture before considering any offboard use. The likely replacement is a
 persistent occupancy/voxel representation with route search and a separate
 local collision checker/controller.
+
+### Global A* path monitor — BUILT, OBSERVATION ONLY, see `HANDOFF_GLOBAL_PLANNER.md`
+
+A cost-aware, repeatedly replanned 2D A* monitor now consumes
+`/rtabmap/grid`, `/rtabmap/pose`, and Foxglove goals. The DepthAI bridge can
+publish `RTABMapSLAM.occupancyGridMap` as a strict ROS `OccupancyGrid` with
+`slam_publish_grid:=true`. The planner blocks unknown space, inflates obstacles
+to the 0.40 m vehicle envelope, forbids diagonal corner cutting, and publishes
+candidate/accepted `Path` messages plus an inflated map and metrics. It cannot
+command PX4.
+
+The simulator verified replanning when a passage closes (6.00 m route at
+2.0 ms, then 7.46 m at 15.6 ms). Live observation then produced a 3.42 m route
+in 2.5 ms. Grid/cloud alignment was quantitative: 96/96 obstacle points landed
+on occupied cells versus 47.9% under the vertically mirrored alternative.
+An observation-only position follower and correction-aware replan gate are now
+also built. The final 137 s loop-correction bag produced zero backward
+cumulative-progress events, bounded relative-position motion, 0.87 ms median
+A*, and 12.1 Hz VIO without gaps. Nothing published PX4 trajectory setpoints.
+
+Next session: implement a separately reviewed adapter that applies the
+follower's relative ENU displacement from PX4's current NED local position,
+with `auto_arm=false`, HOLD-on-planner-fault, and the existing offboard safety
+gates. Never send the absolute SLAM-world carrot to PX4. The fresh local
+collision layer remains deferred only for controlled static environments and
+is required before dynamic-environment use. Full details and props-off/live
+gates are in `HANDOFF_GLOBAL_PLANNER.md`.
 
 ### Loop-closure correction — PARKED, see `HANDOFF_LOOP_CLOSURE.md`
 
@@ -1006,11 +1034,11 @@ rather than replace the RC kill switch.
   non-blocking `tryGet`, so it can't stall the `/basalt/pose` → PX4 path. Enabled in the Foxglove-only
   launches; opt-in in the main launch (`rtabmap_publish_image:=true`).
 
-- **RTAB-Map VIO feature metadata must fit XLink.** With `slam_num_features:=1000`,
-  `FeatureTracker.outputFeatures` produced about 59 KB of metadata at 30 Hz and XLink dropped every
-  message because its metadata limit is 51,200 bytes. On 2026-07-14, `700` also left VIO stuck at
-  the identity pose while `400` initialized immediately under the same motion. The feature target
-  now defaults to `400` on this OAK-D Lite.
+- **Keep the RTAB-Map VIO feature target at the tested value.** On 2026-07-14,
+  `slam_num_features:=700` left VIO stuck at the identity pose while `400`
+  initialized immediately under the same motion. The feature target therefore
+  defaults to `400` on this OAK-D Lite; the cause of the higher-count failure
+  has not been isolated.
 
 - **Keep `RTABMapVIO.transform` single-consumer in the combined SLAM graph.** Fan-out directly to
   both `RTABMapSLAM.odom` and the ROS bridge left VIO publishing identity poses. Publish raw VIO to
@@ -1030,6 +1058,9 @@ rather than replace the RC kill switch.
 (loop-closure correction, observation only),
 `/waypoint/{clicked,clicked_pose}` (Foxglove click in, ENU `world`),
 `/waypoint/{target,commanded,status}` (waypoint node out).
+`/planner/{path,candidate_path,inflated_map,status}` (global planner monitor),
+`/planner/follower/{carrot,lookahead,displacement,status,progress,path_progress,remaining,cross_track,path_generation}`
+(position-only route follower monitor; observation only).
 
 ## Safety
 

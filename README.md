@@ -43,9 +43,8 @@ Performance defaults in the main launch:
   disable it with `slam_publish_image:=false`.
 - Point clouds are available to Foxglove when enabled with
   `slam_publish_clouds:=true`.
-- RTAB-Map VIO defaults to `slam_num_features:=400`. A target of 1000 produced
-  about 59 KB of tracked-feature metadata at 30 Hz, exceeding DepthAI's
-  51,200-byte XLink metadata limit; 700 also left VIO stuck at identity in live testing.
+- RTAB-Map VIO defaults to the live-tested `slam_num_features:=400`; 700 left
+  VIO stuck at identity under the same motion, but the cause was not isolated.
 - `/rtabmap/path` publishes every 10 odometry poses.
 - `/rtabmap/path` is capped at 1000 poses.
 
@@ -565,6 +564,49 @@ hardest. Worth doing in this order:
 2. `sides:=1` armed, to fly one leg and one 90 deg turn before committing to four.
 3. Full square, on a **full battery** — hover draw is ~262 W and the 2026-07-27
    waypoint flight finished at 11% SoC. Watch `/battery/level` in Foxglove.
+
+## Global A* Path Monitor — EXPERIMENTAL, OBSERVATION ONLY
+
+The global planner monitor continuously replans over RTAB-Map's 2D occupancy
+grid and draws the result in Foxglove. Its position-only route follower is
+started by the same launch and draws a smoothed 0.60 m lookahead carrot. Both
+publish no PX4 topics and cannot move the drone. Full design, topics,
+validation limits, and next steps are in
+`HANDOFF_GLOBAL_PLANNER.md`.
+
+Simulator, requiring no camera or vehicle:
+
+```bash
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge \
+  global_planner_monitor.launch.py simulate:=true
+```
+
+Live observation requires the map output to be explicitly enabled:
+
+```bash
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py \
+  slam_publish_grid:=true slam_grid_3d:=false \
+  slam_grid_ray_tracing:=true slam_grid_footprint_radius:=0.40
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge global_planner_monitor.launch.py
+```
+
+Click a `world` goal through the existing `/waypoint/clicked` Foxglove Publish
+tool. Add `/rtabmap/grid`, `/planner/inflated_map`, `/planner/path`,
+`/planner/candidate_path`, and `/planner/markers` to the 3D panel; watch
+`/planner/status` and `/planner/planning_ms` separately. For the follower, add
+`/planner/follower/markers` and watch `/planner/follower/status`. Its
+`/planner/follower/displacement` is the smoothed position displacement in the
+corrected `world` frame that a later, separately reviewed flight adapter could
+apply relative to PX4's current position. It is not a velocity command.
+
+Unknown space is blocked and the lethal inflation radius is 0.40 m. Live
+observation confirmed the decoded grid aligns with the obstacle cloud and the
+planner produces a route. A real loop-closure bag captured a 12.1 cm corrected
+pose step while the relative position proposal remained within its 0.25 m/s
+limit. The correction gate and progress telemetry were subsequently improved,
+then live-validated in a second 137 s recording with zero backward cumulative
+progress events. An asymmetric-scene Foxglove visual check remains useful.
+Do not use the displayed route for flight control.
 
 ## PARKED: Obstacle Avoidance (VFH2D) — EXPERIMENTAL, NEVER ARMED
 

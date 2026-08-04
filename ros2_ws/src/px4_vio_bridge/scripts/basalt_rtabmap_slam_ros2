@@ -12,11 +12,13 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import CameraInfo, PointCloud2, PointField, Image, CompressedImage
 from std_msgs.msg import Int32
 from tf2_ros import TransformBroadcaster
+
+from px4_vio_bridge.rtabmap_grid import make_occupancy_grid
 
 
 def parse_bool(value):
@@ -41,7 +43,7 @@ parser.add_argument('--depth-publish-hz', type=float, default=3.0,
                     help='Maximum depth publish rate in Hz.')
 parser.add_argument('--num-features', type=int, default=400,
                     help='RTAB-Map VIO FeatureTracker target feature count. 400 is validated '
-                         'on this OAK-D Lite; 700 can still exceed XLink metadata limits.')
+                         'on this OAK-D Lite; higher values have not initialized reliably.')
 parser.add_argument('--path-publish-stride', type=int, default=10)
 parser.add_argument('--path-size', type=int, default=1000)
 parser.add_argument('--publish-clouds', type=parse_bool, default=False,
@@ -51,7 +53,13 @@ parser.add_argument('--grid-3d', type=parse_bool, default=True,
 parser.add_argument('--cloud-coordinate-limit', type=float, default=100.0,
                     help='Reject cloud coordinates outside +/- this many metres.')
 parser.add_argument('--publish-grid', type=parse_bool, default=False,
-                    help='Publish the RTAB-Map occupancy grid from DepthAI. Usually too heavy.')
+                    help='Publish the RTAB-Map occupancy grid on /rtabmap/grid.')
+parser.add_argument('--grid-cell-size', type=float, default=0.10,
+                    help='RTAB-Map occupancy-grid resolution in metres.')
+parser.add_argument('--grid-ray-tracing', type=parse_bool, default=False,
+                    help='Mark cells between the sensor and occupied cells free.')
+parser.add_argument('--grid-footprint-radius', type=float, default=0.0,
+                    help='Clear this radius around graph poses in the global grid.')
 parser.add_argument('--detect-people', type=parse_bool, default=False,
                     help='Run RGB person detection and publish RGB-aligned person points.')
 parser.add_argument('--person-model', default='luxonis/yolov6-nano:r2-coco-512x288',
@@ -122,6 +130,8 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.inputObstaclePCL = dai.Node.Input(self)
         self.inputGroundPCL = dai.Node.Input(self)
         self.inputGrid = dai.Node.Input(self)
+        self.inputGrid.setBlocking(False)
+        self.inputGrid.setMaxSize(1)
         self.inputFeatures = dai.Node.Input(self)
         self.inputFeatures.setBlocking(False)
         self.inputFeatures.setMaxSize(1)
@@ -146,6 +156,20 @@ class Ros2Node(dai.node.ThreadedHostNode):
             depth=1,
             durability=DurabilityPolicy.VOLATILE,
         )
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.publish_grid = args.publish_grid
+        self.grid_resolution = float(args.grid_cell_size)
+        if self.grid_resolution <= 0.0:
+            raise ValueError('--grid-cell-size must be positive')
+        self.grid_pub = None
+        if self.publish_grid:
+            self.grid_pub = self.ros_node.create_publisher(
+                OccupancyGrid, '/rtabmap/grid', map_qos)
 
         self.detect_people = args.detect_people
         self.person_point_stride = max(1, args.person_point_stride)
@@ -484,9 +508,23 @@ class Ros2Node(dai.node.ThreadedHostNode):
             pclGrndData = self.inputGroundPCL.tryGet() if self.publish_clouds else None
             featuresData = self.inputFeatures.tryGet()
             personGroup = self.inputPersonGroup.tryGet() if self.detect_people else None
-            # grid received but not published (too large for XLink)
+            gridData = self.inputGrid.tryGet() if self.publish_grid else None
 
             now = self.ros_node.get_clock().now().to_msg()
+
+            if gridData is not None:
+                try:
+                    grid = make_occupancy_grid(
+                        np.array(gridData.map.getFrame(), copy=True),
+                        min_x=gridData.minX,
+                        min_y=gridData.minY,
+                        resolution=self.grid_resolution,
+                        stamp=now,
+                    )
+                    self.grid_pub.publish(grid)
+                except (TypeError, ValueError) as exc:
+                    self.ros_node.get_logger().error(
+                        f'occupancy grid rejected: {exc}', throttle_duration_sec=5.0)
 
             if featuresData is not None:
                 feature_count = len(featuresData.trackedFeatures)
@@ -755,7 +793,8 @@ with dai.Pipeline() as p:
         "RGBD/CreateOccupancyGrid": "true",
         "Grid/3D": str(args.grid_3d).lower(),
         "Grid/DepthDecimation": "8",
-        "Grid/CellSize": "0.10",
+        "Grid/CellSize": str(args.grid_cell_size),
+        "Grid/RayTracing": str(args.grid_ray_tracing).lower(),
         "Grid/PreVoxelFiltering": "true",
         "Grid/RangeMin": "0.30",
         "Grid/RangeMax": "4.0",
@@ -763,6 +802,7 @@ with dai.Pipeline() as p:
         "Grid/NoiseFilteringMinNeighbors": "4",
         "Grid/ClusterRadius": "0.20",
         "Grid/MinClusterSize": "20",
+        "GridGlobal/FootprintRadius": str(args.grid_footprint_radius),
         "Rtabmap/SaveWMState": "true",
     }
     slam.setParams(params)

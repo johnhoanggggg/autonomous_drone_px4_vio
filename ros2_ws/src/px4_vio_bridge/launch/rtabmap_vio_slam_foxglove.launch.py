@@ -21,7 +21,11 @@ def generate_launch_description():
     slam_path_publish_stride = LaunchConfiguration("slam_path_publish_stride")
     slam_path_size = LaunchConfiguration("slam_path_size")
     slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
+    slam_publish_grid = LaunchConfiguration("slam_publish_grid")
     slam_grid_3d = LaunchConfiguration("slam_grid_3d")
+    slam_grid_cell_size = LaunchConfiguration("slam_grid_cell_size")
+    slam_grid_ray_tracing = LaunchConfiguration("slam_grid_ray_tracing")
+    slam_grid_footprint_radius = LaunchConfiguration("slam_grid_footprint_radius")
     slam_cloud_coordinate_limit = LaunchConfiguration("slam_cloud_coordinate_limit")
     foxglove = LaunchConfiguration("foxglove")
     foxglove_port = LaunchConfiguration("foxglove_port")
@@ -41,7 +45,11 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_path_publish_stride", default_value="10"),
             DeclareLaunchArgument("slam_path_size", default_value="1000"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
+            DeclareLaunchArgument("slam_publish_grid", default_value="false"),
             DeclareLaunchArgument("slam_grid_3d", default_value="true"),
+            DeclareLaunchArgument("slam_grid_cell_size", default_value="0.10"),
+            DeclareLaunchArgument("slam_grid_ray_tracing", default_value="false"),
+            DeclareLaunchArgument("slam_grid_footprint_radius", default_value="0.0"),
             DeclareLaunchArgument("slam_cloud_coordinate_limit", default_value="100.0"),
             DeclareLaunchArgument("foxglove", default_value="true"),
             DeclareLaunchArgument("foxglove_port", default_value="8765"),
@@ -64,7 +72,11 @@ def generate_launch_description():
                     "--path-publish-stride", slam_path_publish_stride,
                     "--path-size", slam_path_size,
                     "--publish-clouds", slam_publish_clouds,
+                    "--publish-grid", slam_publish_grid,
                     "--grid-3d", slam_grid_3d,
+                    "--grid-cell-size", slam_grid_cell_size,
+                    "--grid-ray-tracing", slam_grid_ray_tracing,
+                    "--grid-footprint-radius", slam_grid_footprint_radius,
                     "--cloud-coordinate-limit", slam_cloud_coordinate_limit,
                 ],
                 name="rtabmap_vio_slam_ros2",
@@ -79,7 +91,7 @@ def generate_launch_description():
                 condition=IfCondition(foxglove),
                 launch_arguments={
                     "port": foxglove_port,
-                    "topic_whitelist": "['^/tf$', '^/rtabmap/(vio_pose|pose|odometry|path|depth|camera_info|vio_feature_count)$', '^/rtabmap/image/compressed$', '^/rtabmap/image$', '^/rtabmap/(obstacle_cloud|ground_cloud)$']",
+                    "topic_whitelist": "['^/tf$', '^/rtabmap/(vio_pose|pose|odometry|path|depth|camera_info|vio_feature_count|grid)$', '^/rtabmap/image/compressed$', '^/rtabmap/image$', '^/rtabmap/(obstacle_cloud|ground_cloud)$']",
                     "service_whitelist": "['^$']",
                     "param_whitelist": "['^$']",
                     "client_topic_whitelist": "['^$']",

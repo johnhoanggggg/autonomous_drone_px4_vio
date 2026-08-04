@@ -33,7 +33,7 @@ parser.add_argument('--image-jpeg-quality', type=int, default=60,
                     help='JPEG quality 1-95 for --image-format jpeg.')
 parser.add_argument('--num-features', type=int, default=400,
                     help='FeatureTracker target features. 400 is validated on this OAK-D Lite; '
-                         '700 can still exceed XLink metadata limits.')
+                         'higher values have not initialized reliably on this camera.')
 parser.add_argument('--path-publish-stride', type=int, default=1, help='Publish /rtabmap/path every N poses.')
 parser.add_argument('--path-size', type=int, default=5000, help='Maximum poses retained in /rtabmap/path.')
 parser.add_argument('--trajectory-log', default='vslam_trajectory.txt', help='Trajectory log path, or "none" to disable.')

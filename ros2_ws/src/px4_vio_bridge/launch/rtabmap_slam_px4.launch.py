@@ -33,6 +33,11 @@ def generate_launch_description():
     slam_publish_depth = LaunchConfiguration("slam_publish_depth")
     slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
     slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
+    slam_publish_grid = LaunchConfiguration("slam_publish_grid")
+    slam_grid_3d = LaunchConfiguration("slam_grid_3d")
+    slam_grid_cell_size = LaunchConfiguration("slam_grid_cell_size")
+    slam_grid_ray_tracing = LaunchConfiguration("slam_grid_ray_tracing")
+    slam_grid_footprint_radius = LaunchConfiguration("slam_grid_footprint_radius")
     slam_num_features = LaunchConfiguration("slam_num_features")
     map_correction = LaunchConfiguration("map_correction")
     map_correction_translation_rate = LaunchConfiguration(
@@ -86,6 +91,11 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_publish_depth", default_value="false"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
+            DeclareLaunchArgument("slam_publish_grid", default_value="false"),
+            DeclareLaunchArgument("slam_grid_3d", default_value="true"),
+            DeclareLaunchArgument("slam_grid_cell_size", default_value="0.10"),
+            DeclareLaunchArgument("slam_grid_ray_tracing", default_value="false"),
+            DeclareLaunchArgument("slam_grid_footprint_radius", default_value="0.0"),
             DeclareLaunchArgument("slam_num_features", default_value="500"),
             # Observation only: map_correction estimates and rate-limits the
             # loop-closure transform between /rtabmap/vio_pose and
@@ -108,7 +118,7 @@ def generate_launch_description():
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf$', "
-                    "'^/rtabmap/(vio_pose|pose|odometry|path|vio_feature_count)$', "
+                    "'^/rtabmap/(vio_pose|pose|odometry|path|vio_feature_count|grid)$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
@@ -122,6 +132,7 @@ def generate_launch_description():
                     # namespace is safe to expose. It is read-only telemetry:
                     # nothing under /vfh is subscribed by any node.
                     "'^/vfh/.*$', "
+                    "'^/planner/.*$', "
                     "'^/battery/(percent|voltage|current|power|cell_voltage|level|status)$', "
                     "'^/fmu/in/vehicle_visual_odometry$', "
                     "'^/fmu/out/(vehicle_local_position_v1|vehicle_odometry|estimator_status_flags)$']"
@@ -182,6 +193,11 @@ def generate_launch_description():
                                     "slam_publish_depth": slam_publish_depth,
                                     "slam_depth_publish_hz": slam_depth_publish_hz,
                                     "slam_publish_clouds": slam_publish_clouds,
+                                    "slam_publish_grid": slam_publish_grid,
+                                    "slam_grid_3d": slam_grid_3d,
+                                    "slam_grid_cell_size": slam_grid_cell_size,
+                                    "slam_grid_ray_tracing": slam_grid_ray_tracing,
+                                    "slam_grid_footprint_radius": slam_grid_footprint_radius,
                                     "slam_num_features": slam_num_features,
                                 }.items(),
                             )

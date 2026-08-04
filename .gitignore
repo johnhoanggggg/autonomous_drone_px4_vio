@@ -17,6 +17,7 @@ ros2_ws/log/
 # are matched below, but metadata.yaml and .launchinfo are not, so ignore the
 # whole tree.
 ros2_ws/flight_logs/
+/flight_logs/
 
 # Local runtime output
 *.tlog
