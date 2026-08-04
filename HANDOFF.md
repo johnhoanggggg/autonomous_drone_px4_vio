@@ -3,10 +3,11 @@
 Authoritative current-state doc. Full chronological history is in `HANDOFF_ARCHIVE.md`
 (kept for forensics; some of it is superseded — trust this file).
 
-Parked side-work lives in its own doc: `HANDOFF_LOOP_CLOSURE.md` (SLAM loop-closure
-correction — built, measured, not wired to PX4; safe to ignore while flying).
+Side-work lives in its own docs: `HANDOFF_LOOP_CLOSURE.md` (SLAM loop-closure
+correction — built, measured, not wired to PX4; safe to ignore while flying) and
+`HANDOFF_VFH.md` (VFH2D obstacle avoidance — built, never armed, and parked).
 
-Last updated: 2026-07-27.
+Last updated: 2026-08-04.
 
 ## What this project is
 
@@ -456,6 +457,39 @@ catches only `KeyboardInterrupt`, so a **SIGTERM** exits via
 `rclpy.executors.ExternalShutdownException` without running `on_shutdown()` — i.e.
 without the while-armed AUTO.LAND. Ctrl-C (SIGINT) and the launch shutdown path are
 unaffected. Worth fixing deliberately rather than as a side effect of this work.
+
+### VFH2D obstacle avoidance — PARKED 2026-08-04, see `HANDOFF_VFH.md`
+
+A VFH+ obstacle-avoidance planner: `vfh2d.py` (the algorithm — no ROS, no numpy,
+no vehicle), `vfh_obstacles.py` (`/rtabmap/obstacle_cloud` → body-frame
+`(range, bearing)`), `vfh_telemetry.py` (everything Foxglove draws),
+`vfh_monitor` (runs the planner live, **publishes nothing to PX4**) and
+`offboard_vfh` (subclasses `OffboardWaypoint`; a click becomes a *goal* and the
+setpoint becomes a 0.60 m carrot along the direction VFH picks every 0.2 s).
+The implementation, tests, and operating notes are preserved in
+**`HANDOFF_VFH.md`**, but this is no longer the current path-planning direction.
+It remained unarmed. VFH is reactive local steering rather than route planning;
+it has no global path or robust dead-end behavior, and its decisions depend
+strongly on point-cloud density, the height slab, and short-lived obstacle
+memory. No normal stack launch starts it.
+
+Three things that matter if you touch nothing else:
+
+- **It is dead without `slam_publish_clouds:=true`.** The obstacle cloud is off
+  by default and the flight node's response to no data is to hold, then land.
+- **`rtabmap_slam_px4.launch.py` changed**: `'^/vfh/.*$'` added to
+  `foxglove_topic_whitelist`, or none of the telemetry reaches the browser. It
+  stays read-only — nothing subscribes to `/vfh/*` and the client publish
+  whitelist is untouched.
+- The tuned clearance envelope is `robot_radius + safety_margin = 0.4 m`
+  (`0.30 + 0.10 m`). At 1 m it enlarges an obstacle by 23.6 deg on each side.
+  The ±35 deg steerable cone is the camera's ~70 deg FOV; outside it the world
+  is *unknown*, not free.
+
+If revisited, begin with the observation-only monitor and reassess the planner
+architecture before considering any offboard use. The likely replacement is a
+persistent occupancy/voxel representation with route search and a separate
+local collision checker/controller.
 
 ### Loop-closure correction — PARKED, see `HANDOFF_LOOP_CLOSURE.md`
 

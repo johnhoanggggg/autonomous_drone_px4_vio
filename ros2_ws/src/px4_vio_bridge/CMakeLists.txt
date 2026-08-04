@@ -14,8 +14,10 @@ install(PROGRAMS
   scripts/offboard_hold_yaw
   scripts/offboard_hover
   scripts/offboard_square
+  scripts/offboard_vfh
   scripts/offboard_waypoint
   scripts/px4_local_position_to_ros
+  scripts/vfh_monitor
   scripts/vio_to_px4_odometry
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -30,7 +32,10 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_map_correction test/test_map_correction.py)
   ament_add_pytest_test(test_offboard_hover test/test_offboard_hover.py)
   ament_add_pytest_test(test_offboard_square test/test_offboard_square.py)
+  ament_add_pytest_test(test_offboard_vfh test/test_offboard_vfh.py)
   ament_add_pytest_test(test_offboard_waypoint test/test_offboard_waypoint.py)
+  ament_add_pytest_test(test_vfh2d test/test_vfh2d.py)
+  ament_add_pytest_test(test_vfh_telemetry test/test_vfh_telemetry.py)
   ament_add_pytest_test(test_vio_to_px4_odometry test/test_vio_to_px4_odometry.py)
 endif()
 

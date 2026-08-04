@@ -566,6 +566,177 @@ hardest. Worth doing in this order:
 3. Full square, on a **full battery** — hover draw is ~262 W and the 2026-07-27
    waypoint flight finished at 11% SoC. Watch `/battery/level` in Foxglove.
 
+## PARKED: Obstacle Avoidance (VFH2D) — EXPERIMENTAL, NEVER ARMED
+
+This implementation is preserved for reference and testing, but it is not the
+current path-planning direction and should not be treated as a supported flight
+mode. VFH supplies reactive local steering, not a global route; it has weak
+dead-end behavior and is sensitive to cloud density, height filtering, and its
+short-lived off-camera memory. No normal stack launch starts it. See
+`HANDOFF_VFH.md` for the frozen design, failure analysis, parameters, and tests.
+
+A 2D Vector Field Histogram (VFH+) planner, split into three pieces so the
+algorithm can be judged long before it is given authority over the vehicle:
+
+| file | what it is |
+|---|---|
+| `px4_vio_bridge/vfh2d.py` | the algorithm — no ROS, no numpy, no vehicle |
+| `px4_vio_bridge/vfh_obstacles.py` | `/rtabmap/obstacle_cloud` → world-frame voxel memory → body-frame `(range, bearing)` samples |
+| `vfh_monitor` | runs the planner live and publishes what it decided. **Cannot move the drone** |
+| `offboard_vfh` | parked experimental flight node; never armed |
+| `scripts/vfh_sim_obstacles.py` | fake cloud + pose, so all of the above runs with no camera and no drone |
+
+**The obstacle cloud is not published by default.** Everything here needs the
+stack started with `slam_publish_clouds:=true`, or it sees nothing at all:
+
+```bash
+ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py slam_publish_clouds:=true
+```
+
+### Historical validation sequence (only use if deliberately reviving it)
+
+```bash
+# 0. no hardware at all: fake a wall 2.2 m ahead with a 1.4 m gap to the right
+python3 scripts/vfh_sim_obstacles.py --wall-distance 2.2 --gap-width 1.4 --gap-offset -0.8
+ros2 run px4_vio_bridge vfh_monitor        # expect a positive (right) steer angle
+
+# 1. real camera, real room, nothing armed — carry the drone around by hand
+ros2 launch px4_vio_bridge vfh_monitor.launch.py
+
+# 2. props off, whole flight state machine, never arms
+ros2 launch px4_vio_bridge offboard_vfh.launch.py auto_arm:=false climb_timeout:=5.0
+
+# The offboard mode was never armed and is now parked. Reassess the planning
+# architecture before attempting an armed VFH flight.
+```
+
+It also logs a nose-centred ASCII bar once a second, where `#` is blocked, `.` is
+empty, `-` is free-with-returns and `^` is the chosen direction:
+
+```text
+...........................############....^............................  steer=+35deg nearest=2.20m
+```
+
+A goal is optional — publish a `PointStamped` on `/waypoint/clicked` from the
+Foxglove 3D panel and it will steer toward it, exactly as the flight node does.
+
+### What VFH publishes to Foxglove
+
+Both nodes publish the **same** telemetry (`vfh_telemetry.py`), so a monitor
+session is a genuine rehearsal of the flight display. Everything is drawn in the
+ENU `world` frame at the pose the obstacle cloud was measured against, so it
+lines up with `/rtabmap/obstacle_cloud` and the SLAM path.
+
+| topic | type | panel |
+|---|---|---|
+| `/vfh/markers` | `MarkerArray` | **3D** — the whole picture, see below |
+| `/vfh/samples` | `PointCloud2` | **3D** — the points that actually reached the histogram |
+| `/vfh/status` | `String` | Raw Message — one line, everything |
+| `/vfh/blocked` | `Int32` | **Indicator** — 0 clear, 1 no way forward |
+| `/vfh/nearest` | `Float32` | **Gauge** — closest return in metres (−1 = nothing in range) |
+| `/vfh/nearest_bearing_deg` | `Float32` | Plot — where that closest thing is, relative to the nose |
+| `/vfh/heading_deg` | `Float32` | Plot — vehicle heading, PX4 NED (0 = north) |
+| `/vfh/direction_deg` | `Float32` | Plot — chosen steer angle, relative to the nose |
+| `/vfh/direction_heading_deg` | `Float32` | Plot — the same direction as an absolute NED heading |
+| `/vfh/goal_bearing_deg`, `/vfh/goal_distance` | `Float32` | Plot — where the goal is (only while one is set) |
+| `/vfh/opening_width_deg` | `Float32` | **Gauge** — how wide the gap it chose actually is |
+| `/vfh/blocked_sectors`, `/vfh/obstacle_blocked_sectors`, `/vfh/samples_count` | `Int32` | Plot — non-flyable sectors, physically obstacle-blocked sectors, and how much data fed VFH |
+| `/vfh/memory_points` | `Int32` | Plot — number of remembered world-frame obstacle voxels |
+| `/vfh/cost` | `Float32` | Plot — cost of the winning candidate |
+| `/vfh/histogram`, `/vfh/binary`, `/vfh/obstacle_binary` | `Float32MultiArray` | Plot — density, final non-flyable mask, and obstacle-only mask per sector |
+| `/vfh/direction`, `/vfh/goal` | `PoseStamped` | 3D — plain arrow/point if you prefer them separate |
+
+`/vfh/markers` is the one to add first. It contains, in the 3D panel:
+
+- **the histogram fan** — one ray per sector inside `display_fov_deg` (±90 deg
+  by default), drawn out to the range that sector measured (or `max_range` if it
+  saw nothing). Red means physically blocked after vehicle-radius enlargement;
+  green means clear and inside the legal steering FOV; grey means no remembered
+  obstacle but outside the legal steering FOV. The `max_steer_deg` wedge shows
+  the smaller region in which a heading may actually be generated;
+- **the chosen direction** as a thick blue arrow;
+- **the rejected candidates** as thin yellow lines — this is what explains a
+  surprising choice;
+- **the goal** as a white sphere, and a text label repeating steer/nearest.
+
+Plot `/vfh/heading_deg` and `/vfh/direction_heading_deg` on one Plot panel to see
+where the vehicle is pointing against where the planner wants to go; the gap
+between the two is what `yaw_follows_direction` is closing.
+
+**The Foxglove bridge whitelist had to be widened for any of this to arrive** —
+`rtabmap_slam_px4.launch.py` now includes `'^/vfh/.*$'` in
+`foxglove_topic_whitelist`. It stays read-only: nothing subscribes to `/vfh/*`,
+and the client publish whitelist is untouched.
+
+### How the flight node differs from `offboard_waypoint`
+
+It subclasses it, so the setpoint rate limiter, the `hold_point` re-pointing, the
+settled/transit gate split, the VIO watchdogs, K/L and `max_flight_time` are
+unchanged. After reaching a verified stable hover, it first holds XY and runs
+`0 -> -90 -> +90 -> 0 deg` at 15 deg/s, where 0 is the original heading. This
+clears pre-takeoff obstacle memory and repopulates the useful forward hemisphere;
+translation stays disabled until it returns within 5 deg of 0 and settles for
+1 s. A click during the sweep is retained as the next goal but cannot move the
+vehicle early. Set both `startup_sweep_min_deg` and `startup_sweep_max_deg` to
+0 to disable this phase.
+
+After that, **a click is a goal, not a setpoint.** The setpoint is a
+carrot placed `lookahead` (0.60 m) along the direction VFH picks every
+`plan_period` (0.2 s), so the vehicle curves around obstacles rather than driving
+through them, and `yaw_follows_direction` turns it to face where it is going.
+Obstacle enlargement is evaluated against the finite segment to the goal, not
+an infinite ray: a return beyond a short waypoint only blocks headings whose
+endpoint would enter `robot_radius + safety_margin` around that return.
+
+| condition | response |
+|---|---|
+| `nearest < stop_distance` (0.90 m) | freeze the carrot, hold position |
+| planner reports blocked | freeze the carrot, hold position |
+| blocked for `blocked_timeout` (10 s) | AUTO.LAND |
+| obstacle data stale > `obstacle_timeout` (1 s) | freeze the carrot |
+| stale > `obstacle_stale_land_time` (2 s) | AUTO.LAND |
+| `nearest < abort_distance` (0.50 m) for 0.5 s | AUTO.LAND |
+
+### Three things that decide whether this works
+
+- **The camera sees ~70 deg, and unknown is not free.** `max_steer_deg` (35)
+  marks histogram sectors outside that cone non-flyable and bounds every chosen
+  direction to the region actually observed. `display_fov_deg` is visualization
+  only and defaults to 90 deg, so remembered side obstacles remain visible. A
+  consequence worth internalising: the tuned 0.40 m clearance envelope expands
+  an obstacle at 1 m by 23.6 deg on each side.
+- **A gap must be wider than `2 * (robot_radius + safety_margin)` = 0.8 m.**
+  The measured radius is approximately 0.30 m and the tuned margin is 0.10 m.
+  Shrink `safety_margin` only if you also believe the position hold.
+- **It has bounded world-frame obstacle memory.** The newest point batch in
+  each 0.10 m voxel is retained for 30 s, capped at 20,000 points. This prevents
+  yawing away from an obstacle and immediately steering back when it leaves the
+  camera. Repeated observations replace a voxel batch rather than accumulating
+  frames, preserving the tuned current-cloud density; expiry removes moved
+  objects and noise. Small SLAM-correction jitter is ignored; an accumulated
+  correction of 0.05 m or 2 deg clears memory and holds until a fresh cloud.
+  Set `memory_duration:=0` to disable it.
+- **The height slab must clear the floor.** `z_below` is measured *from the
+  vehicle*, so a value at or above `hover_height` turns every ground return
+  inside `max_range` into an obstacle — a broad, symmetric red fan across the
+  whole forward arc with genuinely empty space ahead. It is a silent failure:
+  the histogram looks entirely plausible. The default is 0.15 m for a 0.30 m
+  hover, and `offboard_vfh` clamps it to `hover_height - 0.15` with an error log.
+
+Obstacle geometry is measured against `/rtabmap/pose` (the SLAM pose), not the
+raw VIO pose PX4 flies on, because that is the frame the cloud lives in; only the
+resulting *relative* bearing crosses over to PX4's heading. That is safe while
+the two headings agree, which the inherited 20 deg `max_vio_yaw_error_deg`
+watchdog enforces.
+
+Tuning is all launch arguments (`tau_high`/`tau_low`, `min_points`, `smoothing`,
+`sectors`, `robot_radius`, `safety_margin`, `max_range`, `memory_duration`,
+`memory_voxel_size`, `memory_max_points`, the memory-correction reset gates,
+`display_fov_deg`, the `startup_sweep_*` controls, and the three `mu_*` cost
+weights).
+Tune them against `vfh_monitor` in the actual room before arming —
+density thresholds depend on how many points that room's surfaces return.
+
 ## Known Issues & Operational Notes
 
 ### TELEM2 / DDS link is marginal (works USB-free, but near the edge)

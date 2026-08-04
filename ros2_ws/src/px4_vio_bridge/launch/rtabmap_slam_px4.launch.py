@@ -117,6 +117,11 @@ def generate_launch_description():
                     "'^/vio/map_correction/(preview_pose|residual_m|residual_deg)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
                     "'^/waypoint/(clicked|clicked_pose|target|commanded|status)$', "
+                    # VFH publishes a fixed set of small topics plus one marker
+                    # array and one already-decimated cloud, so the whole
+                    # namespace is safe to expose. It is read-only telemetry:
+                    # nothing under /vfh is subscribed by any node.
+                    "'^/vfh/.*$', "
                     "'^/battery/(percent|voltage|current|power|cell_voltage|level|status)$', "
                     "'^/fmu/in/vehicle_visual_odometry$', "
                     "'^/fmu/out/(vehicle_local_position_v1|vehicle_odometry|estimator_status_flags)$']"
