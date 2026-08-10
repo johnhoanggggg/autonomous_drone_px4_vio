@@ -136,6 +136,29 @@ def correction_rejection_reason(
     return None
 
 
+def map_displacement_to_vio(displacement: Point2, correction_yaw: float) -> Point2:
+    """Rotate a map-frame vector into the continuous VIO/odometry frame."""
+    if not all(math.isfinite(value) for value in (*displacement, correction_yaw)):
+        raise ValueError("displacement and correction yaw must be finite")
+    cosine = math.cos(correction_yaw)
+    sine = math.sin(correction_yaw)
+    # R(-yaw) * d_map. Translation cancels because this is a vector.
+    return (
+        cosine * displacement[0] + sine * displacement[1],
+        -sine * displacement[0] + cosine * displacement[1],
+    )
+
+
+def requested_goal_reached(follower_status: str, goal_terminal: bool) -> bool:
+    """Report whether the reached path endpoint completes the requested goal.
+
+    An exploration route can temporarily end at the current known-space
+    frontier. Reaching that endpoint is a hold-and-wait condition, not arrival
+    at the user's requested waypoint and therefore must not trigger landing.
+    """
+    return follower_status == "GOAL_REACHED" and bool(goal_terminal)
+
+
 def _correction_delta(first: Correction4, second: Correction4) -> Tuple[float, float]:
     return (
         math.dist(first[:3], second[:3]),
@@ -262,15 +285,37 @@ class PositionRouteFollower:
         max_carrot_speed: float = 0.25,
         max_carrot_acceleration: float = 0.50,
         max_cross_track: float = 0.60,
+        cross_track_resume: float = 0.05,
+        cross_track_recovery_time: float = 1.0,
         arrival_tolerance: float = 0.12,
+        arrival_release_tolerance: float = 0.20,
     ):
-        if min(lookahead, max_carrot_speed, max_carrot_acceleration, max_cross_track, arrival_tolerance) <= 0.0:
+        limits = (
+            lookahead,
+            max_carrot_speed,
+            max_carrot_acceleration,
+            max_cross_track,
+            cross_track_resume,
+            cross_track_recovery_time,
+            arrival_tolerance,
+            arrival_release_tolerance,
+        )
+        if any(not math.isfinite(value) or value <= 0.0 for value in limits):
             raise ValueError("follower limits must be positive")
+        if cross_track_resume >= max_cross_track:
+            raise ValueError("cross_track_resume must be below max_cross_track")
+        if arrival_release_tolerance < arrival_tolerance:
+            raise ValueError(
+                "arrival_release_tolerance must be at least arrival_tolerance"
+            )
         self.lookahead = lookahead
         self.max_carrot_speed = max_carrot_speed
         self.max_carrot_acceleration = max_carrot_acceleration
         self.max_cross_track = max_cross_track
+        self.cross_track_resume = cross_track_resume
+        self.cross_track_recovery_time = cross_track_recovery_time
         self.arrival_tolerance = arrival_tolerance
+        self.arrival_release_tolerance = arrival_release_tolerance
         self.path: Optional[Polyline] = None
         self.fingerprint = ()
         self.generation = 0
@@ -280,17 +325,32 @@ class PositionRouteFollower:
         self.path_progress = 0.0
         self.commanded_displacement: Point2 = (0.0, 0.0)
         self.command_velocity: Point2 = (0.0, 0.0)
+        self.cross_track_latched = False
+        self.cross_track_fault_generation = 0
+        self.cross_track_recovery_elapsed = 0.0
+        self.at_goal = False
 
     def clear_path(self) -> None:
         self.path = None
         self.fingerprint = ()
         self.path_progress = 0.0
         self.command_velocity = (0.0, 0.0)
+        self.at_goal = False
 
     def reset_route_progress(self) -> None:
         self.progress = 0.0
+        self.cross_track_latched = False
+        self.cross_track_fault_generation = 0
+        self.cross_track_recovery_elapsed = 0.0
+        self.at_goal = False
         if self.path is not None:
             self.path_progress = 0.0
+
+    def interrupt_cross_track_recovery(self) -> None:
+        """Break the continuous-healthy recovery interval after stale input."""
+        if self.cross_track_latched:
+            self.cross_track_recovery_elapsed = 0.0
+            self.command_velocity = (0.0, 0.0)
 
     def set_path(self, points: Sequence[Point2], pose: Point2) -> bool:
         fingerprint = path_fingerprint(points)
@@ -309,21 +369,60 @@ class PositionRouteFollower:
             raise ValueError("pose and dt must be finite, and dt positive")
 
         projection = self.path.project(pose)
-        new_path_progress = max(self.path_progress, projection.along)
-        self.progress += new_path_progress - self.path_progress
-        self.path_progress = new_path_progress
-        remaining = max(0.0, self.path.length - self.path_progress)
-        desired = self.path.point_at(self.path_progress + self.lookahead)
+        candidate_progress = max(self.path_progress, projection.along)
+        remaining = max(0.0, self.path.length - candidate_progress)
+        desired = self.path.point_at(candidate_progress + self.lookahead)
         desired_offset = desired[0] - pose[0], desired[1] - pose[1]
 
         if projection.cross_track > self.max_cross_track:
+            if not self.cross_track_latched:
+                self.cross_track_latched = True
+                self.cross_track_fault_generation = self.generation
+            self.cross_track_recovery_elapsed = 0.0
             self.command_velocity = (0.0, 0.0)
-            carrot = (pose[0] + self.commanded_displacement[0], pose[1] + self.commanded_displacement[1])
+            carrot = (
+                pose[0] + self.commanded_displacement[0],
+                pose[1] + self.commanded_displacement[1],
+            )
             return FollowResult(
                 "CROSS_TRACK_EXCEEDED", False, desired, carrot,
                 self.commanded_displacement, self.path_progress, self.progress, remaining,
                 projection.cross_track, self.generation,
             )
+
+        if self.cross_track_latched:
+            self.command_velocity = (0.0, 0.0)
+            fresh_path = self.generation > self.cross_track_fault_generation
+            if not fresh_path or projection.cross_track > self.cross_track_resume:
+                self.cross_track_recovery_elapsed = 0.0
+                status = (
+                    "CROSS_TRACK_HOLD_WAITING_FOR_PATH"
+                    if not fresh_path
+                    else "CROSS_TRACK_HOLD"
+                )
+            else:
+                self.cross_track_recovery_elapsed += dt
+                status = "CROSS_TRACK_RECOVERING"
+            carrot = (
+                pose[0] + self.commanded_displacement[0],
+                pose[1] + self.commanded_displacement[1],
+            )
+            if (
+                self.cross_track_recovery_elapsed + 1.0e-12
+                < self.cross_track_recovery_time
+            ):
+                return FollowResult(
+                    status, False, desired, carrot,
+                    self.commanded_displacement, self.path_progress, self.progress,
+                    remaining, projection.cross_track, self.generation,
+                )
+            self.cross_track_latched = False
+            self.cross_track_fault_generation = 0
+            self.cross_track_recovery_elapsed = 0.0
+
+        self.progress += candidate_progress - self.path_progress
+        self.path_progress = candidate_progress
+        remaining = max(0.0, self.path.length - self.path_progress)
 
         error = (
             desired_offset[0] - self.commanded_displacement[0],
@@ -350,9 +449,22 @@ class PositionRouteFollower:
             self.command_velocity = velocity
 
         carrot = (pose[0] + self.commanded_displacement[0], pose[1] + self.commanded_displacement[1])
-        at_goal = remaining <= self.arrival_tolerance and math.dist(pose, self.path.points[-1]) <= self.arrival_tolerance
+        # Arrival latches: entering needs arrival_tolerance, leaving needs the
+        # wider release tolerance.  Both terms are re-evaluated against a path
+        # the global planner replans several times a second, and near the goal
+        # the endpoint moves a few centimetres per generation -- without
+        # hysteresis the endpoint distance crosses the threshold by a millimetre
+        # or two and drops GOAL_REACHED, which restarts the adapter's hold timer.
+        # 20260810T105345Z needed 9.5s to satisfy a 3.0s hold for exactly that.
+        tolerance = (
+            self.arrival_release_tolerance if self.at_goal else self.arrival_tolerance
+        )
+        self.at_goal = (
+            remaining <= tolerance
+            and math.dist(pose, self.path.points[-1]) <= tolerance
+        )
         return FollowResult(
-            "GOAL_REACHED" if at_goal else "FOLLOWING", True, desired, carrot,
+            "GOAL_REACHED" if self.at_goal else "FOLLOWING", True, desired, carrot,
             self.commanded_displacement, self.path_progress, self.progress, remaining,
             projection.cross_track, self.generation,
         )

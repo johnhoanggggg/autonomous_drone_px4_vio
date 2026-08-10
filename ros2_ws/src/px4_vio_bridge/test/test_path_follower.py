@@ -8,6 +8,8 @@ from px4_vio_bridge.path_follower import (
     Polyline,
     PositionRouteFollower,
     correction_rejection_reason,
+    map_displacement_to_vio,
+    requested_goal_reached,
     yaw_from_quaternion,
 )
 
@@ -40,6 +42,13 @@ def test_native_correction_safety_limits():
     assert correction_rejection_reason((math.nan, 0.0, 0.0, 0.0)) == (
         "correction contains a non-finite value"
     )
+
+
+def test_map_displacement_is_rotated_back_into_continuous_vio_axes():
+    assert map_displacement_to_vio((1.0, 0.0), math.pi / 2.0) == pytest.approx(
+        (0.0, -1.0)
+    )
+    assert map_displacement_to_vio((0.4, -0.2), 0.0) == pytest.approx((0.4, -0.2))
 
 
 def test_polyline_projection_and_interpolated_lookahead():
@@ -140,6 +149,71 @@ def test_cross_track_fault_holds_relative_carrot():
     assert result.commanded_displacement == before
 
 
+def test_cross_track_fault_requires_fresh_path_and_stable_lower_error():
+    follower = PositionRouteFollower(
+        max_cross_track=0.10,
+        cross_track_resume=0.05,
+        cross_track_recovery_time=0.30,
+    )
+    follower.set_path(((0.0, 0.0), (3.0, 0.0)), (0.0, 0.0))
+    before = follower.commanded_displacement
+
+    fault = follower.update((1.0, 0.11), 0.10)
+    assert fault.status == "CROSS_TRACK_EXCEEDED"
+    assert not fault.valid
+
+    # Merely dipping below both thresholds on the same path cannot restart.
+    waiting = follower.update((1.0, 0.04), 0.10)
+    assert waiting.status == "CROSS_TRACK_HOLD_WAITING_FOR_PATH"
+    assert not waiting.valid
+
+    # A replan anchored at the held pose is necessary but not sufficient: the
+    # lower error must then remain healthy for the entire recovery interval.
+    assert follower.set_path(((1.0, 0.04), (3.0, 0.0)), (1.0, 0.04))
+    first = follower.update((1.0, 0.04), 0.10)
+    second = follower.update((1.0, 0.04), 0.10)
+    assert first.status == second.status == "CROSS_TRACK_RECOVERING"
+    assert not first.valid and not second.valid
+    assert first.commanded_displacement == second.commanded_displacement == before
+
+    recovered = follower.update((1.0, 0.04), 0.10)
+    assert recovered.status == "FOLLOWING"
+    assert recovered.valid
+
+
+def test_cross_track_recovery_is_continuous_and_has_hysteresis():
+    follower = PositionRouteFollower(
+        max_cross_track=0.10,
+        cross_track_resume=0.05,
+        cross_track_recovery_time=0.20,
+    )
+    follower.set_path(((0.0, 0.0), (3.0, 0.0)), (0.0, 0.0))
+    follower.update((1.0, 0.11), 0.10)
+    follower.set_path(((1.0, 0.0), (3.0, 0.0)), (1.0, 0.04))
+
+    assert follower.update((1.0, 0.04), 0.10).status == "CROSS_TRACK_RECOVERING"
+    # Below the 0.10 m trip threshold but above the 0.05 m resume threshold:
+    # remain latched and discard the accumulated healthy interval.
+    held = follower.update((1.0, 0.06), 0.10)
+    assert held.status == "CROSS_TRACK_HOLD"
+    assert not held.valid
+    assert follower.update((1.0, 0.04), 0.10).status == "CROSS_TRACK_RECOVERING"
+
+    follower.interrupt_cross_track_recovery()
+    assert follower.update((1.0, 0.04), 0.10).status == "CROSS_TRACK_RECOVERING"
+    assert follower.update((1.0, 0.04), 0.10).valid
+
+
+def test_new_requested_goal_resets_cross_track_latch():
+    follower = PositionRouteFollower(max_cross_track=0.10)
+    follower.set_path(((0.0, 0.0), (3.0, 0.0)), (0.0, 0.0))
+    assert not follower.update((1.0, 0.11), 0.10).valid
+    follower.reset_route_progress()
+    follower.clear_path()
+    follower.set_path(((1.0, 0.11), (2.0, 1.0)), (1.0, 0.11))
+    assert follower.update((1.0, 0.11), 0.10).valid
+
+
 def test_goal_reached_requires_along_track_and_euclidean_arrival():
     follower = PositionRouteFollower(arrival_tolerance=0.15)
     follower.set_path(((0.0, 0.0), (1.0, 0.0)), (0.0, 0.0))
@@ -152,6 +226,68 @@ def test_single_point_path_reports_goal_reached():
     follower.set_path(((1.0, 2.0),), (1.05, 2.0))
     result = follower.update((1.05, 2.0), 0.1)
     assert result.status == "GOAL_REACHED"
+
+
+def test_arrival_latches_through_replan_jitter_at_the_threshold():
+    # 20260810T105345Z: near the goal the planner replanned ~2 Hz and the path
+    # endpoint moved a few cm per generation, so the euclidean term crossed a
+    # 0.12m tolerance by 1-2mm and dropped GOAL_REACHED.  Each drop restarted
+    # the adapter's 3.0s hold, which took 9.5s to satisfy.
+    follower = PositionRouteFollower(
+        arrival_tolerance=0.12, arrival_release_tolerance=0.20
+    )
+    follower.set_path(((0.0, 0.0), (1.0, 0.0)), (0.0, 0.0))
+    assert follower.update((0.90, 0.0), 0.1).status == "GOAL_REACHED"
+
+    # The endpoint jitters out to 0.119m, then 0.120m -- inside the release band.
+    follower.set_path(((0.0, 0.0), (1.019, 0.0)), (0.90, 0.0))
+    assert follower.update((0.90, 0.0), 0.1).status == "GOAL_REACHED"
+    follower.set_path(((0.0, 0.0), (1.020, 0.0)), (0.90, 0.0))
+    assert follower.update((0.90, 0.0), 0.1).status == "GOAL_REACHED"
+
+
+def test_arrival_releases_once_past_the_release_tolerance():
+    follower = PositionRouteFollower(
+        arrival_tolerance=0.12, arrival_release_tolerance=0.20
+    )
+    follower.set_path(((0.0, 0.0), (1.0, 0.0)), (0.0, 0.0))
+    assert follower.update((0.90, 0.0), 0.1).status == "GOAL_REACHED"
+    follower.set_path(((0.0, 0.0), (1.25, 0.0)), (0.90, 0.0))
+    assert follower.update((0.90, 0.0), 0.1).status == "FOLLOWING"
+
+
+def test_arrival_still_requires_the_tight_tolerance_to_latch():
+    follower = PositionRouteFollower(
+        arrival_tolerance=0.12, arrival_release_tolerance=0.20
+    )
+    follower.set_path(((0.0, 0.0), (1.0, 0.0)), (0.0, 0.0))
+    # 0.15m out: inside the release band but never latched, so it must not count.
+    assert follower.update((0.85, 0.0), 0.1).status == "FOLLOWING"
+
+
+def test_arrival_latch_clears_with_the_path_and_the_route():
+    for reset in ("clear_path", "reset_route_progress"):
+        follower = PositionRouteFollower(
+            arrival_tolerance=0.12, arrival_release_tolerance=0.20
+        )
+        follower.set_path(((0.0, 0.0), (1.0, 0.0)), (0.0, 0.0))
+        assert follower.update((0.90, 0.0), 0.1).status == "GOAL_REACHED"
+        getattr(follower, reset)()
+        follower.set_path(((0.0, 0.0), (1.0, 0.0)), (0.85, 0.0))
+        assert follower.update((0.85, 0.0), 0.1).status == "FOLLOWING"
+
+
+def test_release_tolerance_below_arrival_tolerance_is_rejected():
+    with pytest.raises(ValueError):
+        PositionRouteFollower(
+            arrival_tolerance=0.20, arrival_release_tolerance=0.12
+        )
+
+
+def test_exploration_frontier_is_not_reported_as_requested_goal_reached():
+    assert not requested_goal_reached("GOAL_REACHED", goal_terminal=False)
+    assert requested_goal_reached("GOAL_REACHED", goal_terminal=True)
+    assert not requested_goal_reached("FOLLOWING", goal_terminal=True)
 
 
 def test_correction_gate_ignores_fast_zero_mean_jitter():

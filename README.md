@@ -370,6 +370,10 @@ which Foxglove can only render as raw fields, and whose `remaining` is 0..1) int
 plain `std_msgs` that Foxglove panels bind to directly. It starts automatically with
 `rtabmap_slam_px4.launch.py`; disable with `battery_monitor:=false`.
 
+These companion topics are display/logging telemetry only. They do not inhibit
+planner arming or trigger planner HOLD/LAND; PX4 remains the sole authority for
+battery arming checks and low-battery failsafe actions.
+
 | Topic | Type | Panel |
 |---|---|---|
 | `/battery/percent` | `Float32` (0–100) | **Gauge**, min 0 max 100 |
@@ -410,11 +414,30 @@ publishes a `geometry_msgs/PointStamped` on `/waypoint/clicked`.
 all publishing from the browser. It now defaults to:
 
 - `foxglove_capabilities:=[clientPublish,connectionGraph]`
-- `foxglove_client_topic_whitelist:=['^/waypoint/clicked(_pose)?$']`
+- `foxglove_client_topic_whitelist:=['^/waypoint/clicked(_pose)?$','^/planner/flight/teleop$']`
 
-The narrow client whitelist is deliberate: a browser tab may reach the waypoint intake
-topics and nothing else. Do **not** widen it to `['.*']` — that would put `/fmu/in/*`
-(raw setpoints, arm commands) within reach of anything that can open the WebSocket.
+The narrow client whitelist is deliberate: a browser tab may reach the waypoint
+intake topics and the validated flight-control intake, but nothing else. Do
+**not** widen it to `['.*']` — that would put `/fmu/in/*` (raw setpoints and arm
+commands) within reach of anything that can open the WebSocket.
+
+### Foxglove LAND / emergency KILL controls
+
+The global-planner flight launch subscribes to `/planner/flight/teleop` using
+Foxglove's built-in Teleop panel `geometry_msgs/msg/Twist` schema. Configure a
+dedicated panel as follows:
+
+- Topic: `/planner/flight/teleop`
+- Publish rate: `1 Hz`
+- Stop on release: **disabled**
+- Center Stop button: field `linear.z`, value `-1` (**controlled AUTO.LAND**)
+- Down button: field `linear.z`, value `-2` (**EMERGENCY KILL / motors stop**)
+- Up, Left and Right: value `0` (no action)
+
+Rename the panel `Flight Safety — STOP=LAND, DOWN=KILL`. A zero Twist and button
+release are deliberately inert. LAND is ignored while disarmed by the existing
+flight state machine; browser KILL is also ignored while disarmed. The browser
+control supplements rather than replaces the independent RC kill switch.
 
 ### Foxglove panel setup
 
@@ -426,6 +449,13 @@ topics and nothing else. Do **not** widen it to `['.*']` — that would put `/fm
    accepted goal and the rate-limited point actually being sent to PX4.
 4. Add a Raw Message panel on `/waypoint/status` for accepted/rejected counts,
    distance to go, live hold error against its current limit, and the idle countdown.
+
+The planner publishes its effective parameters, including launch overrides, as
+latched JSON on `/planner/config`; the route follower does the same on
+`/planner/follower/config`. Both topics are included in planner and flight bags,
+so values such as `robot_radius`, `safety_margin`, `lookahead`, and
+`max_cross_track` can be recovered during analysis even when those nodes started
+before the recorder.
 
 To also command heading, publish a `PoseStamped` on `/waypoint/clicked_pose` and launch
 with `accept_waypoint_yaw:=true`. Off by default — yawing while translating is the
@@ -569,7 +599,7 @@ hardest. Worth doing in this order:
 3. Full square, on a **full battery** — hover draw is ~262 W and the 2026-07-27
    waypoint flight finished at 11% SoC. Watch `/battery/level` in Foxglove.
 
-## Global A* Path Monitor — EXPERIMENTAL, OBSERVATION ONLY
+## Global A* Planner — EXPERIMENTAL
 
 The global planner monitor continuously replans over RTAB-Map's 2D occupancy
 grid and draws the result in Foxglove. Its position-only route follower is
@@ -601,10 +631,35 @@ tool. Add `/rtabmap/grid`, `/planner/inflated_map`, `/planner/path`,
 `/planner/follower/markers` and watch `/planner/follower/status` plus the
 structured `/planner/follower/valid` boolean. Its
 `/planner/follower/displacement` is the smoothed position displacement in the
-corrected `world` frame that a later, separately reviewed flight adapter could
-apply relative to PX4's current position. It is not a velocity command.
+corrected `world` frame. `/planner/follower/vio_displacement` rotates that
+vector back into continuous VIO axes. The separately launched
+`offboard_global_planner` adapter can apply the latter relative to PX4's current
+local position; it defaults `auto_arm=false` and must pass a real-PX4 props-off
+run before first use. Neither displacement topic is a velocity command.
 
-Unknown space is blocked and the lethal inflation radius is 0.40 m. Live
+A cross-track violation is latched: the follower freezes its relative carrot
+and remains invalid until it receives a newer path and cross-track stays below
+`cross_track_resume` (default 0.05 m) continuously for
+`cross_track_recovery_time` (default 1.0 s). Samples merely dipping below
+`max_cross_track` cannot restart flight or reset the adapter's LAND timer.
+
+Props-off attempt 1 remained disarmed and validated OFFBOARD entry, fixed yaw,
+position-only fields, the 0.15 m/s speed cap, geofence and data health. It also
+found a target-arrival snap that bypassed the 0.30 m/s^2 limiter near noisy
+rebased targets. The snap has been removed and regression-tested. A second
+props-off bag with an exact known-free goal and a deliberate planner-loss HOLD
+is still required before `auto_arm=true`; see `HANDOFF_GLOBAL_PLANNER.md`.
+
+The click expresses the requested destination and is accepted even if it lies
+in unknown space, outside the current map, or on an obstacle. Unknown and
+lethal cells remain blocked. For unknown/outside/disconnected requests the
+planner reports `EXPLORING` and flies only to the closest reachable known-safe
+frontier, updating that endpoint as the map expands. For obstacle clicks it
+reports `SAFE_APPROACH` and stops outside the 0.40 m lethal envelope. The
+orange `/planner/effective_goal` marker shows where the current route actually
+ends; the white marker remains the requested goal. A temporary exploration
+frontier is not reported as final arrival, so the PX4 adapter holds and waits
+rather than landing there. Live
 observation confirmed the decoded grid aligns with the obstacle cloud and the
 planner produces a route. A real loop-closure bag captured a 12.1 cm corrected
 pose step while the relative position proposal remained within its 0.25 m/s
@@ -613,8 +668,8 @@ then live-validated in a second 137 s recording with zero backward cumulative
 progress events. A later native-correction bag confirmed zero-frame
 raw/corrected synchronization and effectively exact map-to-odom transform
 direction after the host pairing fix. An asymmetric-scene Foxglove visual
-check remains useful.
-Do not use the displayed route for flight control.
+check remains useful. See `HANDOFF_GLOBAL_PLANNER.md` for the mandatory
+props-off gate and first-flight procedure.
 
 ## PARKED: Obstacle Avoidance (VFH2D) — EXPERIMENTAL, NEVER ARMED
 

@@ -15,6 +15,33 @@ def test_wrap_pi_handles_boundary() -> None:
     assert math.isclose(wrap_pi(math.radians(190.0)), math.radians(-170.0))
 
 
+def teleop_msg(linear_z):
+    return SimpleNamespace(linear=SimpleNamespace(z=linear_z))
+
+
+def test_foxglove_teleop_discrete_command_contract() -> None:
+    assert OffboardHover.decode_foxglove_teleop(teleop_msg(0.0)) is None
+    assert OffboardHover.decode_foxglove_teleop(teleop_msg(float("nan"))) is None
+    assert OffboardHover.decode_foxglove_teleop(teleop_msg(-1.0)) == "LAND"
+    assert OffboardHover.decode_foxglove_teleop(teleop_msg(-2.0)) == "KILL"
+
+
+def test_foxglove_land_and_kill_dispatch() -> None:
+    calls = []
+    stub = SimpleNamespace(
+        is_armed=True,
+        decode_foxglove_teleop=OffboardHover.decode_foxglove_teleop,
+        trigger_landing=lambda reason: calls.append(("LAND", reason)),
+        trigger_kill=lambda reason: calls.append(("KILL", reason)),
+    )
+    OffboardHover.on_foxglove_teleop(stub, teleop_msg(-1.0))
+    OffboardHover.on_foxglove_teleop(stub, teleop_msg(-2.0))
+    assert calls == [
+        ("LAND", "FOXGLOVE LAND PRESSED"),
+        ("KILL", "FOXGLOVE EMERGENCY KILL PRESSED"),
+    ]
+
+
 def make_hover_stub(yaw_feedforward=False, rate_deg=5.0):
     """Minimal stand-in exercising the real OffboardHover methods unbound.
 

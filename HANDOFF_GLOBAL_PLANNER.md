@@ -1,7 +1,7 @@
 # Global A* Planner — Experimental Handoff
 
-Observation-only global planning work. Nothing here commands PX4 and nothing
-has been armed. Last updated: 2026-08-04.
+Global planning and position-only PX4 adapter work. Nothing here has been
+armed. Last updated: 2026-08-06.
 
 ## Status
 
@@ -9,10 +9,13 @@ A continuously replanning, cost-aware 2D A* monitor and observation-only
 position route follower are built, simulator verified, and live-observation
 verified on the OAK-D, including a real loop-correction run. They consume a
 loop-corrected RTAB-Map occupancy grid, `/rtabmap/pose`, and the existing
-Foxglove `/waypoint/clicked` goal. The planner publishes the raw latest
+Foxglove `/waypoint/clicked` goal. Clicks may be in known free space, unknown
+space, outside the current map, or on an obstacle. The planner publishes the raw latest
 candidate, a stable accepted path, an inflated costmap, markers, status, and
 planning metrics. The follower publishes a smoothed lookahead position and
-relative displacement, never a PX4 setpoint. Unknown cells are non-traversable.
+relative displacement. Unknown cells remain non-traversable: the planner heads
+to the closest reachable known-safe frontier and advances the endpoint as the
+map expands instead of treating unknown as free.
 
 The DepthAI bridge now converts `RTABMapSLAM.occupancyGridMap` (`dai.MapData`:
 an `ImgFrame` plus `minX`/`minY`) to `/rtabmap/grid` as
@@ -31,19 +34,20 @@ operator visual check of asymmetric obstacle sides in Foxglove remains useful.
 
 ## Start here next session
 
-The observation-only planner/follower milestone is complete. Do not connect
-`/planner/path` or the absolute `/planner/follower/carrot` directly to PX4.
-The next implementation milestone is a separately reviewed, position-only
-flight adapter for a controlled static-room trial. Bag `_4` validated the
+The position-only `offboard_global_planner` adapter is implemented. Real-PX4
+props-off attempt 1 (`flight_logs/offboard_global_props_off_1`, 2026-08-06)
+correctly remained disarmed and entered OFFBOARD/ROUTE, but failed the final
+acceleration-continuity gate. The defect is fixed and regression-tested; one
+more props-off recording is mandatory before arming. Never connect
+`/planner/path` or the absolute
+`/planner/follower/carrot` directly to PX4. Bag `_4` validated the
 native `/rtabmap/odom_correction` direction and exposed/fixed a one-raw-frame
 host pairing error. Bag `_5` confirmed the synchronization and native source.
 The redundant host correction relay is removed. The follower now consumes
 native correction directly and `/planner/follower/valid` fails closed on raw
 VIO, correction, pose, path, correction-settle, path-start, and cross-track
 faults. Bag `_4` proved this is necessary because corrected pose can remain
-finite after raw VIO enters its reset sentinel. Before building the flight
-adapter, add a continuous-VIO-frame displacement derived from the follower's
-filtered correction yaw. The adapter should then:
+finite after raw VIO enters its reset sentinel. The completed adapter:
 
 1. Consume the continuous-VIO-frame displacement and structured follower
    validity, plus the current PX4 local position and the existing
@@ -67,7 +71,7 @@ filtered correction yaw. The adapter should then:
 5. Apply a second speed/acceleration limiter to the final PX4 NED position
    setpoint. This guarantees a continuous command when leaving HOLD even if the
    map-frame follower or correction transform changed while paused.
-6. First run entirely props-off with arming disabled. Before any live trial,
+6. Must first run entirely props-off with arming disabled. Before any live trial,
    verify TELEM2/DDS on battery power and address the recorded hard/bouncing
    landing. A first route should be only 0.5–1.0 m at about 0.5–0.6 m altitude,
    in an empty mapped room, on a full battery, with RC kill ready.
@@ -77,7 +81,7 @@ operator's static environments. That limits any future trial to a controlled
 scene with no people, moving doors, or movable obstacles. Add the local layer
 before any dynamic-environment use.
 
-### Loop-correction behavior of the future flight adapter
+### Loop-correction behavior of the flight adapter
 
 PX4 must continue receiving raw, continuous VIO through
 `/fmu/in/vehicle_visual_odometry`; neither `/rtabmap/pose` nor a map correction
@@ -87,8 +91,9 @@ is injected into EKF2. During a persistent loop correction:
    and A* settle.
 2. The flight adapter immediately latches PX4's current NED position and
    streams that position-only HOLD setpoint. Horizontal velocity and
-   acceleration fields remain unset/NaN; altitude and takeoff yaw remain
-   independently latched.
+   acceleration fields remain unset/NaN; altitude stays independently latched
+   and the yaw target freezes where its slew had reached, so a fault never
+   turns the airframe.
 3. Once the correction is quiet and a fresh complete path exists, the follower
    supplies a displacement transformed back into continuous VIO axes with the
    inverse correction yaw.
@@ -113,10 +118,14 @@ than trying to fly through it.
 | `px4_vio_bridge/global_planner_sim.py` | fake room whose lower passage opens and closes |
 | `px4_vio_bridge/path_follower.py` | ROS-free path projection, progress and position-carrot smoothing |
 | `px4_vio_bridge/route_follower_monitor.py` | observation-only follower ROS node and telemetry |
+| `px4_vio_bridge/planner_flight.py` | ROS-free final NED position limiter and frame conversion |
+| `px4_vio_bridge/offboard_global_planner.py` | fail-closed position-only PX4 adapter |
 | `launch/global_planner_monitor.launch.py` | monitor, optional simulator and optional bag |
+| `launch/offboard_global_planner.launch.py` | adapter and crash-resistant flight recorder |
 | `test/test_grid_planner.py` | search, unknown, dead-end, clearance and simplification tests |
 | `test/test_rtabmap_grid.py` | map encoding and ROS geometry tests |
 | `test/test_path_follower.py` | route, replan and synthetic loop-closure stability tests |
+| `test/test_planner_flight.py` | flight gates, frame conversion, geofence and final limiter tests |
 
 `basalt_rtabmap_slam_ros2`, both main RTAB-Map launch files, `CMakeLists.txt`,
 and the combined Foxglove whitelist were extended for the new topics.
@@ -128,16 +137,28 @@ and the combined Foxglove whitelist were extended for the new topics.
 - Unknown and lethal cells are forbidden.
 - Occupied threshold: 65/100.
 - Lethal radius: `robot_radius + safety_margin = 0.30 + 0.10 = 0.40 m`.
+- The 0.40 m value is the centre-to-obstacle envelope, not 0.40 m of empty
+  padding: it represents an assumed 0.30 m centre-to-prop-tip radius plus only
+  0.10 m clearance. Do not reduce the total envelope to 0.10 m unless the
+  physical vehicle radius is first measured and proven much smaller.
 - Additional graded inflation: 0.20 m, used as search cost rather than a hard block.
 - Cost-aware route search prefers clearance over grazing inflated obstacles.
 - 100 ms planning deadline and 2 Hz observation loop.
 - Result is simplified only where the same inflated map proves direct line of sight.
+- A requested goal is intent, not permission to enter unsafe space. The selected
+  endpoint is the safe cell in the start-connected component closest to the click.
+- A known-safe reachable click is `PATH_VALID` and exact. An unknown, outside-map,
+  or currently disconnected click is `EXPLORING`; the route ends at the current
+  reachable frontier and is recomputed as mapping expands. An obstacle or point
+  inside lethal inflation is `SAFE_APPROACH`; the route ends outside the 0.40 m
+  hard clearance envelope.
 - A candidate path is published every replan. The accepted path switches when
-  invalid, the start cell moves, the goal changes, or the candidate is at least
-  10% cheaper.
-
-There is deliberately no partial-path success and no goal snapping. Invalid,
-outside-map, occupied and unknown goals are reported instead of silently changed.
+  invalid, the start cell moves, the requested/effective goal changes, or the
+  candidate is at least 10% cheaper.
+- Reaching a temporary `EXPLORING` frontier does not publish requested-goal
+  completion and therefore does not trigger the flight adapter's arrival landing.
+  It holds there until newly mapped free space advances the route. Reaching an
+  exact goal or terminal `SAFE_APPROACH` endpoint does complete the request.
 
 ## Simulator
 
@@ -184,8 +205,11 @@ Foxglove topics:
 | `/planner/inflated_map` | clearance-aware costmap |
 | `/planner/path` | accepted blue/display path |
 | `/planner/candidate_path` | latest replan, whether or not accepted |
-| `/planner/markers` | start, goal and status label |
-| `/planner/status` | `WAITING_*`, `PATH_VALID`, `NO_KNOWN_PATH`, stale/error state |
+| `/planner/markers` | start, requested goal, effective safe endpoint, and status label |
+| `/planner/effective_goal` | current reachable safe endpoint selected for the request |
+| `/planner/goal_exact` | whether the effective endpoint is the clicked map cell |
+| `/planner/goal_terminal` | whether reaching the effective endpoint completes the request |
+| `/planner/status` | `WAITING_*`, `PATH_VALID`, `EXPLORING`, `SAFE_APPROACH`, stale/error state |
 | `/planner/planning_ms` | search time |
 | `/planner/path_length` | accepted route length |
 | `/planner/expanded_cells` | A* work per plan |
@@ -204,21 +228,136 @@ First live acceptance checks:
    `/planner/inflated_map` in Foxglove as a visual confirmation of the measured alignment.
 2. Put a known obstacle on each side of the drone and verify the corresponding
    map side without relying on a symmetric scene.
-3. Confirm unexplored space is `-1` and the planner refuses it.
-4. Repeat an A/B VIO-rate measurement while moving; the stationary live run with
+3. Confirm unexplored space is `-1`; click into it and verify an `EXPLORING`
+   path stops in known free space, then advances as mapping reveals safe cells.
+4. Click an obstacle and verify `SAFE_APPROACH`, `goal_terminal=true`, and an
+   effective endpoint outside the lethal envelope. No path cell may be unknown
+   or lethal.
+5. Repeat an A/B VIO-rate measurement while moving; the stationary live run with
    grid and clouds enabled measured about 14.3 Hz, but is not a flight-load benchmark.
-5. Exercise a loop closure and confirm old cells, current pose, and path remain aligned.
-6. Replay or record a moving blockage and confirm path invalidation/replanning.
+6. Exercise a loop closure and confirm old cells, current pose, and path remain aligned.
+7. Replay or record a moving blockage and confirm path invalidation/replanning.
 
-## Boundary before flight work
+## Flight boundary and mandatory props-off run
 
-This remains a global route monitor, not collision avoidance. It has no fresh
-local cloud layer, emergency stop, PX4 setpoint generator, or stale-data
-landing behavior. The route follower below is telemetry only. Do not connect
-`/planner/path` or `/planner/follower/*` to `offboard_waypoint`. A separately
-reviewed flight adapter is required for the controlled static-room milestone;
-the deferred short-lived local obstacle/collision layer is required before
-dynamic-environment use.
+This remains global planning, not dynamic collision avoidance. The
+`offboard_global_planner` adapter now supplies the PX4 position setpoint,
+stale-data HOLD/LAND behavior, strict 0.25 m / 5 degree correction gate,
+one-metre takeoff-centred geofence, PX4-reset rebasing,
+and independent 0.15 m/s / 0.30 m/s² launch-default limiter. It does not add a
+fresh local obstacle layer, so any eventual flight is limited to a controlled
+static room.
+
+Battery authority is intentionally not duplicated in the adapter: the ROS
+`/battery/*` topics are telemetry only, while PX4 owns battery arming checks and
+low-battery failsafe actions.
+
+### Yaw follows the path heading
+
+The adapter no longer holds the latched takeoff yaw through ROUTE. It takes the
+NED bearing of the same commanded displacement it flies (`atan2(east, north)`)
+and commands that heading, so the airframe and the forward-facing OAK-D point
+along the route instead of crabbing sideways down it.
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `yaw_follows_heading` | `true` | `false` restores the fixed takeoff yaw |
+| `yaw_rate_deg` | `20.0` (launch) | slew of the published yaw setpoint |
+| `yaw_track_min_displacement` | `0.15` m | shorter carrots are noise; hold the last heading |
+| `yaw_track_deadband_deg` | `8.0` | re-latch the target only outside this band |
+| `yaw_align_error_deg` | `40.0` | above this error, stop translating and turn first |
+| `yaw_resume_error_deg` | `15.0` | resume translating below this error (hysteresis) |
+
+Properties that must hold in a bag:
+
+- yaw only ever moves at `yaw_rate_deg` (the base class `ramp_yaw` slew); the
+  target changes in steps but the published setpoint never does;
+- the measured yaw rate stays far below the node's own `max_yaw_rate_deg` = 60
+  LAND watchdog, and VIO-vs-EKF yaw disagreement stays under
+  `max_vio_yaw_error_deg` = 20 through each turn;
+- while turning onto a leg the command decelerates through the same limiter and
+  the setpoint stops moving horizontally, so `/planner/flight/status` reads
+  `YAW_ALIGN`; and
+- a planner fault, a HOLD, or a PX4 heading reset stops the turn: the target
+  freezes at the current slew position (or is dropped entirely on a reset
+  counter change) rather than continuing to rotate.
+
+Turning is the weak point for VIO: rotation moves the whole image and can drop
+the tracked feature count. `yaw_rate_deg` is the knob to lower if a props-off
+bag shows features dipping toward `min_vio_features` during turns.
+
+Before fitting props, run the real stack and planner, click a short route, and
+confirm `/planner/follower/valid` is true. Then run:
+
+```bash
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge \
+  offboard_global_planner.launch.py auto_arm:=false
+```
+
+Inspect the resulting `offboard_global_*.mcap` before any armed attempt. It
+must contain position-only trajectory setpoints, no arm command, continuous
+bounded NED setpoint motion, healthy VIO/estimator inputs, and correct
+HOLD behavior if follower validity is deliberately removed. Only after that
+gate passes should the same launch be considered with `auto_arm:=true`.
+
+### Props-off attempt 1 and required repeat
+
+`flight_logs/offboard_global_props_off_1` is a complete 85.15 s / 66,565-message
+real-PX4 recording. It passed these gates:
+
+- all 168 control-mode samples were disarmed;
+- the only vehicle command was accepted `DO_SET_MODE` (176), with no arm
+  command (400);
+- OFFBOARD enabled and the position-only stream ran at 49.8 Hz; after engage,
+  maximum setpoint/heartbeat gaps were 40.5/35.4 ms;
+- all 4,052 trajectory messages had finite position and NaN velocity and
+  acceleration fields; yaw was fixed at the latched 89.89 degrees;
+- maximum setpoint speed was 0.150 m/s and maximum takeoff-relative command
+  distance was 0.491 m inside the 1.0 m geofence;
+- PX4 local position was always valid with unchanged reset counters; VIO
+  features were median 352/minimum 334 with no reset sentinel; and
+- A* took 4.38 ms median / 9.77 ms p95 / 11.62 ms maximum.
+
+It did not pass the acceleration gate. The final limiter snapped to a nearby
+target and zeroed its stored velocity. Because the target is continuously
+rebased from slightly noisy PX4 position, this made the published position
+derivative reverse discontinuously: 244/4050 nominal intervals exceeded
+0.303 m/s^2, 41 exceeded 1.0 m/s^2, and the maximum was 5.02 m/s^2. Speed itself
+never exceeded 0.15 m/s. `HorizontalCommandLimiter` no longer snaps or zeros
+velocity at a nearby target; it permits a tiny overshoot and reverses through
+the same acceleration bound. The bag-specific noisy/reversing-target regression
+passes, as does the no-snap settling regression and all 12 package test targets
+(185 current pytest cases).
+
+Attempt 1 used an `EXPLORING` frontier (`goal_exact=false`, 0.45 m route,
+requested point still 1.19 m away), and the planner remained healthy throughout
+ROUTE. It therefore did not test either an exact known-free request or the
+moving-route-to-HOLD transition. Next session, keep the props removed and use:
+
+```bash
+ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge \
+  offboard_global_planner.launch.py auto_arm:=false \
+  bag_output:=/home/john/autonomous_drone_px4_vio/flight_logs/offboard_global_props_off_2
+```
+
+For attempt 2:
+
+1. Use a short known-free click and confirm `PATH_VALID`,
+   `/planner/goal_exact=true`, and `/planner/follower/valid=true`.
+2. Let `ROUTE` run for at least 10 seconds.
+3. Stop `global_planner_monitor.launch.py` for at least four seconds while the
+   adapter remains running. Confirm `/planner/flight/status` changes to `HOLD`
+   promptly and no moving route target remains active.
+4. Stop the adapter cleanly and inspect the finalized bag. Require no arm
+   command, 0.15 m/s speed, 0.30 m/s^2 nominal-route acceleration, position-only
+   fields, yaw obeying the tracking rules below (bounded slew, no step, and no
+   turning while HOLD is latched), geofence compliance, a fresh healthy data
+   stream, and the
+   deliberate fault HOLD. The emergency current-position relatch itself is an
+   intentional discontinuity and should be evaluated separately from nominal
+   route limiting.
+5. Do not set `auto_arm=true` until attempt 2 passes. Use a full battery for the
+   eventual armed trial; attempt 1 was only approximately 55--59 percent.
 
 ### TODO — fresh local obstacle layer (deferred for static environments)
 
@@ -255,7 +394,9 @@ Foxglove and bag analysis. It:
 5. Publishes the proposed carrot, along-track progress, cross-track error,
    remaining distance, route generation, and a clear follower status.
 6. Holds the carrot when the path/pose is stale, the vehicle is too far from
-   the path, or there is no complete route.
+   the path, or there is no complete route. A cross-track violation latches:
+   recovery requires a newer path plus cross-track below the lower resume
+   threshold continuously for the configured recovery interval.
 
 The follower stores and limits the command as a displacement relative to the
 current corrected SLAM pose. A translational loop closure therefore moves the
@@ -267,7 +408,9 @@ send `/planner/follower/carrot` as an absolute PX4 coordinate.
 
 Defaults are a 0.60 m lookahead, 0.25 m/s maximum carrot motion, 0.50 m/s²
 maximum carrot acceleration, 0.60 m maximum cross-track error, and 0.12 m
-arrival tolerance. Correction targets pass through a 0.35 s low-pass filter.
+arrival tolerance. The cross-track latch resumes below 0.05 m only after 1.0 s
+of continuously healthy input; a new requested goal explicitly clears the old
+latch. Correction targets pass through a 0.35 s low-pass filter.
 An accumulated change over 0.05 m or 1.5 degrees starts one coalesced correction
 episode; the follower waits for 0.40 s of correction quiet plus a path newer
 than the last material movement. An 8 s cooldown prevents one graph
@@ -442,7 +585,8 @@ error), instead of letting an unrecorded planner run continue unnoticed.
 ## Verification and commit boundary
 
 - `colcon build --packages-select px4_vio_bridge --symlink-install`: passed.
-- Full package test result: 186 tests, 0 errors, 0 failures, 0 skipped.
+- Full package test result after the props-off limiter fix: all 12 active test
+  targets passed (185 current pytest cases).
 - Simulator integration: planner and follower reached `FOLLOWING`; no
   `/fmu/in/trajectory_setpoint` publisher existed.
 - Existing bag-output directories now stop the whole monitor launch instead of
@@ -453,5 +597,5 @@ error), instead of letting an unrecorded planner run continue unnoticed.
 Suggested commit message:
 
 ```text
-Add observation-only global planner and position route follower
+Add global planner flight adapter and safe frontier goals
 ```

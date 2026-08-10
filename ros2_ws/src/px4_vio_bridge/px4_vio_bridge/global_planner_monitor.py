@@ -5,28 +5,55 @@ This node publishes no PX4 topics. It plans in the loop-corrected RTAB-Map
 path for Foxglove inspection.
 """
 
+import json
 import math
 import time
 
 import rclpy
-from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Float32, Int32, String
+from std_msgs.msg import Bool, Float32, Int32, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from px4_vio_bridge.grid_planner import (
     GridMap,
     astar,
+    classify_goal,
+    closest_reachable_goal,
     inflate_occupancy,
+    inflation_display_data,
     line_is_clear,
     path_length,
+    recover_start,
     simplify_path,
+    traversable,
 )
+from px4_vio_bridge.process_singleton import ProcessSingleton
 
 
 class GlobalPlannerMonitor(Node):
+    CONFIG_PARAMETERS = (
+        "map_topic",
+        "pose_topic",
+        "goal_topic",
+        "frame_id",
+        "rate_hz",
+        "map_timeout",
+        "pose_timeout",
+        "occupied_threshold",
+        "robot_radius",
+        "safety_margin",
+        "inflation_extra",
+        "inflation_cost_scaling",
+        "start_recovery_radius",
+        "heuristic_weight",
+        "cost_weight",
+        "planning_timeout_ms",
+        "switch_improvement",
+    )
+
     def __init__(self):
         super().__init__("global_planner_monitor")
         self.declare_parameter("map_topic", "/rtabmap/grid")
@@ -41,6 +68,7 @@ class GlobalPlannerMonitor(Node):
         self.declare_parameter("safety_margin", 0.10)
         self.declare_parameter("inflation_extra", 0.20)
         self.declare_parameter("inflation_cost_scaling", 3.0)
+        self.declare_parameter("start_recovery_radius", 0.30)
         self.declare_parameter("heuristic_weight", 1.0)
         self.declare_parameter("cost_weight", 2.0)
         self.declare_parameter("planning_timeout_ms", 100.0)
@@ -59,6 +87,9 @@ class GlobalPlannerMonitor(Node):
         )
         self.inflation_cost_scaling = float(
             self.get_parameter("inflation_cost_scaling").value
+        )
+        self.start_recovery_radius = max(
+            0.0, float(self.get_parameter("start_recovery_radius").value)
         )
         self.heuristic_weight = float(self.get_parameter("heuristic_weight").value)
         self.cost_weight = float(self.get_parameter("cost_weight").value)
@@ -114,6 +145,32 @@ class GlobalPlannerMonitor(Node):
         self.expanded_pub = self.create_publisher(
             Int32, "/planner/expanded_cells", 10
         )
+        self.goal_exact_pub = self.create_publisher(
+            Bool, "/planner/goal_exact", 10
+        )
+        self.goal_terminal_pub = self.create_publisher(
+            Bool, "/planner/goal_terminal", 10
+        )
+        self.effective_goal_pub = self.create_publisher(
+            PointStamped, "/planner/effective_goal", 10
+        )
+        # A flight recorder normally starts after this long-running planner.
+        # TRANSIENT_LOCAL makes the effective launch overrides available to that
+        # late subscriber, so every flight bag is self-describing.
+        self.config_pub = self.create_publisher(
+            String, "/planner/config", map_qos
+        )
+        config = {
+            name: self.get_parameter(name).value
+            for name in self.CONFIG_PARAMETERS
+        }
+        config.update({
+            "lethal_radius": self.lethal_radius,
+            "inflation_radius": self.inflation_radius,
+        })
+        self.config_pub.publish(
+            String(data=json.dumps(config, sort_keys=True, separators=(",", ":")))
+        )
 
         self.grid = None
         self.grid_msg = None
@@ -129,6 +186,7 @@ class GlobalPlannerMonitor(Node):
         self.accepted_points = ()
         self.accepted_cost = math.inf
         self.accepted_goal_generation = -1
+        self.accepted_effective_goal = None
         self.last_planned_key = None
         rate = max(0.2, float(self.get_parameter("rate_hz").value))
         self.create_timer(1.0 / rate, self.tick)
@@ -190,7 +248,11 @@ class GlobalPlannerMonitor(Node):
                 f"goal rejected: frame '{msg.header.frame_id}' != '{self.frame_id}'"
             )
             return
-        self.goal = (float(msg.point.x), float(msg.point.y))
+        goal = (float(msg.point.x), float(msg.point.y))
+        if not all(math.isfinite(value) for value in goal):
+            self.get_logger().warn("goal rejected: coordinates must be finite")
+            return
+        self.goal = goal
         self.goal_generation += 1
         self.get_logger().warn(f"planner goal=({self.goal[0]:.2f}, {self.goal[1]:.2f})")
 
@@ -210,10 +272,11 @@ class GlobalPlannerMonitor(Node):
         msg.header.frame_id = self.frame_id
         msg.info = self.grid_msg.info
         msg.info.map_load_time = msg.header.stamp
-        msg.data = [
-            -1 if value < 0 else min(100, int(round(value * 100.0 / 255.0)))
-            for value in self.inflated.data
-        ]
+        msg.data = inflation_display_data(
+            self.grid,
+            self.inflated,
+            occupied_threshold=self.occupied_threshold,
+        )
         self.inflated_pub.publish(msg)
 
     def path_valid(self, points):
@@ -240,7 +303,20 @@ class GlobalPlannerMonitor(Node):
             msg.poses.append(pose)
         return msg
 
-    def publish_markers(self, status, candidate_points):
+    def clear_path(self, status, effective_goal=None):
+        self.accepted_cells = ()
+        self.accepted_points = ()
+        self.accepted_cost = math.inf
+        self.accepted_effective_goal = None
+        empty = self.make_path((), self.pose[2] if self.pose else 0.0)
+        self.candidate_pub.publish(empty)
+        self.path_pub.publish(empty)
+        self.goal_exact_pub.publish(Bool(data=False))
+        self.goal_terminal_pub.publish(Bool(data=False))
+        self.publish_status(status)
+        self.publish_markers(status, (), effective_goal)
+
+    def publish_markers(self, status, candidate_points, effective_goal=None):
         now = self.get_clock().now().to_msg()
         markers = MarkerArray()
         clear = Marker()
@@ -266,6 +342,16 @@ class GlobalPlannerMonitor(Node):
         if self.goal is not None:
             z = self.pose[2] if self.pose else 0.0
             markers.markers.append(sphere(1, "planner_goal", (*self.goal, z), (1.0, 1.0, 1.0, 1.0)))
+        if effective_goal is not None:
+            z = self.pose[2] if self.pose else 0.0
+            markers.markers.append(
+                sphere(
+                    3,
+                    "planner_effective_goal",
+                    (*effective_goal, z),
+                    (1.0, 0.5, 0.0, 1.0),
+                )
+            )
         text = Marker()
         text.header.frame_id = self.frame_id
         text.header.stamp = now
@@ -291,34 +377,82 @@ class GlobalPlannerMonitor(Node):
         if now - self.map_received > self.map_timeout:
             self.publish_status(f"STALE_MAP age={now - self.map_received:.2f}s")
             return
+        # Inflation is a property of the map, not of a requested route.  Keep
+        # its visualization current before a goal exists so clicking in
+        # Foxglove does not appear to turn nearby free space into obstacles.
+        self.ensure_inflated()
         if self.pose is None or now - self.pose_received > self.pose_timeout:
             self.publish_status("WAITING_FOR_POSE")
             return
         if self.goal is None:
             self.publish_status("WAITING_FOR_GOAL")
             return
-        self.ensure_inflated()
         start = self.inflated.world_to_cell(self.pose[:2])
-        goal = self.inflated.world_to_cell(self.goal)
         if start is None:
-            self.publish_status("START_OUTSIDE_MAP")
+            self.clear_path("START_OUTSIDE_MAP")
             return
-        if goal is None:
-            self.publish_status("GOAL_OUTSIDE_MAP")
+        planning_started = time.monotonic()
+        # Brushing past an obstacle puts the vehicle inside its own lethal
+        # inflation.  Dropping the route for that would arm the flight adapter's
+        # land timer while the aircraft is merely close to something, so shift
+        # the search start to the nearest cell outside the envelope instead and
+        # keep the offset visible in the status line.
+        start_offset = 0.0
+        if not traversable(self.inflated, start):
+            recovery = recover_start(
+                self.grid,
+                self.inflated,
+                start,
+                occupied_threshold=self.occupied_threshold,
+                max_radius=self.start_recovery_radius,
+            )
+            if recovery is None:
+                self.clear_path("START_BLOCKED")
+                return
+            start = recovery.cell
+            start_offset = recovery.distance
+        selection = closest_reachable_goal(self.inflated, start, self.goal)
+        if selection is None:
+            self.clear_path("START_BLOCKED")
             return
+        goal = selection.cell
+        exact, terminal = classify_goal(
+            self.grid, self.inflated, self.goal, goal
+        )
+        self.goal_exact_pub.publish(Bool(data=exact))
+        self.goal_terminal_pub.publish(Bool(data=terminal))
+        effective_goal = self.inflated.cell_center(goal)
+        effective_msg = PointStamped()
+        effective_msg.header.stamp = self.get_clock().now().to_msg()
+        effective_msg.header.frame_id = self.frame_id
+        effective_msg.point.x, effective_msg.point.y = effective_goal
+        effective_msg.point.z = self.pose[2]
+        self.effective_goal_pub.publish(effective_msg)
         key = (self.grid_generation, self.goal_generation, start, goal)
         if key == self.last_planned_key:
             return
         self.last_planned_key = key
+        selection_ms = (time.monotonic() - planning_started) * 1000.0
+        remaining_ms = self.planning_timeout_ms - selection_ms
+        if self.planning_timeout_ms > 0.0 and remaining_ms <= 0.0:
+            self.planning_ms_pub.publish(Float32(data=float(selection_ms)))
+            self.expanded_pub.publish(Int32(data=selection.reachable_cells))
+            self.clear_path(
+                f"TIMEOUT reachable={selection.reachable_cells} "
+                f"plan={selection_ms:.1f}ms",
+                effective_goal,
+            )
+            return
         result = astar(
             self.inflated,
             start,
             goal,
             heuristic_weight=self.heuristic_weight,
             cost_weight=self.cost_weight,
-            timeout_ms=self.planning_timeout_ms,
+            timeout_ms=max(0.0, remaining_ms),
         )
-        self.planning_ms_pub.publish(Float32(data=float(result.elapsed_ms)))
+        total_ms = (time.monotonic() - planning_started) * 1000.0
+        self.planning_ms_pub.publish(Float32(data=float(total_ms)))
         self.expanded_pub.publish(Int32(data=result.expanded))
         if not result.found:
             self.accepted_cells = ()
@@ -327,10 +461,10 @@ class GlobalPlannerMonitor(Node):
             self.path_pub.publish(self.make_path((), self.pose[2]))
             status = (
                 f"{result.reason} expanded={result.expanded} "
-                f"plan={result.elapsed_ms:.1f}ms"
+                f"plan={total_ms:.1f}ms"
             )
             self.publish_status(status)
-            self.publish_markers(status, ())
+            self.publish_markers(status, (), effective_goal)
             return
 
         candidate_cells = simplify_path(self.inflated, result.cells)
@@ -341,34 +475,50 @@ class GlobalPlannerMonitor(Node):
         moved = bool(self.accepted_cells) and start != self.accepted_cells[0]
         improved = result.cost < self.accepted_cost * (1.0 - self.switch_improvement)
         goal_changed = self.accepted_goal_generation != self.goal_generation
-        if not accepted_valid or moved or improved or goal_changed:
+        effective_goal_changed = self.accepted_effective_goal != goal
+        if not accepted_valid or moved or improved or goal_changed or effective_goal_changed:
             self.accepted_cells = candidate_cells
             self.accepted_points = candidate_points
             self.accepted_cost = result.cost
             self.accepted_goal_generation = self.goal_generation
+            self.accepted_effective_goal = goal
         self.path_pub.publish(self.make_path(self.accepted_points, self.pose[2]))
         accepted_length = path_length(self.accepted_points)
         self.path_length_pub.publish(Float32(data=float(accepted_length)))
+        mode = (
+            "PATH_VALID"
+            if exact
+            else ("SAFE_APPROACH" if terminal else "EXPLORING")
+        )
         status = (
-            f"PATH_VALID length={accepted_length:.2f}m candidate={candidate_length:.2f}m "
-            f"expanded={result.expanded} plan={result.elapsed_ms:.1f}ms "
+            f"{mode} length={accepted_length:.2f}m candidate={candidate_length:.2f}m "
+            f"goal_distance={selection.distance:.2f}m "
+            f"reachable={selection.reachable_cells} expanded={result.expanded} "
+            f"plan={total_ms:.1f}ms "
             f"map_age={now - self.map_received:.2f}s"
         )
+        if start_offset > 0.0:
+            status += f" start_recovered={start_offset:.2f}m"
         self.publish_status(status)
-        self.publish_markers(status, candidate_points)
+        self.publish_markers(status, candidate_points, effective_goal)
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = GlobalPlannerMonitor()
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        singleton = ProcessSingleton("global_planner_monitor")
+    except RuntimeError as exc:
+        raise SystemExit(f"FATAL: {exc}") from None
+    with singleton:
+        rclpy.init(args=args)
+        node = GlobalPlannerMonitor()
+        try:
+            rclpy.spin(node)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":

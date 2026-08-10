@@ -7,6 +7,7 @@ from launch.actions import (
     ExecuteProcess,
     LogInfo,
     RegisterEventHandler,
+    TimerAction,
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
@@ -32,6 +33,18 @@ def recorder_exited(event, _context):
     ]
 
 
+def required_node_exited(event, context):
+    if context.is_shutdown:
+        return []
+    return [
+        LogInfo(msg=(
+            f"ERROR: required planner process '{event.process_name}' exited "
+            f"with code {event.returncode}; stopping this launch"
+        )),
+        EmitEvent(event=Shutdown(reason="required planner process exited")),
+    ]
+
+
 def generate_launch_description():
     args = [
         DeclareLaunchArgument("simulate", default_value="false"),
@@ -43,6 +56,7 @@ def generate_launch_description():
         DeclareLaunchArgument("robot_radius", default_value="0.30"),
         DeclareLaunchArgument("safety_margin", default_value="0.10"),
         DeclareLaunchArgument("inflation_extra", default_value="0.20"),
+        DeclareLaunchArgument("start_recovery_radius", default_value="0.30"),
         DeclareLaunchArgument("heuristic_weight", default_value="1.0"),
         DeclareLaunchArgument("planning_timeout_ms", default_value="100.0"),
         DeclareLaunchArgument("route_follower", default_value="true"),
@@ -51,6 +65,8 @@ def generate_launch_description():
         DeclareLaunchArgument("max_carrot_speed", default_value="0.25"),
         DeclareLaunchArgument("max_carrot_acceleration", default_value="0.50"),
         DeclareLaunchArgument("max_cross_track", default_value="0.60"),
+        DeclareLaunchArgument("cross_track_resume", default_value="0.05"),
+        DeclareLaunchArgument("cross_track_recovery_time", default_value="1.0"),
         DeclareLaunchArgument("vio_timeout", default_value="0.5"),
         DeclareLaunchArgument("correction_timeout", default_value="1.0"),
         DeclareLaunchArgument("max_correction_m", default_value="0.50"),
@@ -80,6 +96,7 @@ def generate_launch_description():
             "robot_radius": typed("robot_radius", float),
             "safety_margin": typed("safety_margin", float),
             "inflation_extra": typed("inflation_extra", float),
+            "start_recovery_radius": typed("start_recovery_radius", float),
             "heuristic_weight": typed("heuristic_weight", float),
             "planning_timeout_ms": typed("planning_timeout_ms", float),
         }],
@@ -97,6 +114,10 @@ def generate_launch_description():
             "max_carrot_speed": typed("max_carrot_speed", float),
             "max_carrot_acceleration": typed("max_carrot_acceleration", float),
             "max_cross_track": typed("max_cross_track", float),
+            "cross_track_resume": typed("cross_track_resume", float),
+            "cross_track_recovery_time": typed(
+                "cross_track_recovery_time", float
+            ),
             "vio_timeout": typed("vio_timeout", float),
             "correction_timeout": typed("correction_timeout", float),
             "max_correction_m": typed("max_correction_m", float),
@@ -113,11 +134,17 @@ def generate_launch_description():
             "/rtabmap/odom_correction", "/rtabmap/vio_feature_count",
             "/waypoint/clicked",
             "/planner/path", "/planner/candidate_path", "/planner/inflated_map",
-            "/planner/markers", "/planner/status", "/planner/planning_ms",
+            "/planner/markers", "/planner/status", "/planner/config",
+            "/planner/planning_ms",
             "/planner/path_length", "/planner/expanded_cells",
+            "/planner/goal_exact", "/planner/goal_terminal",
+            "/planner/effective_goal",
             "/planner/follower/carrot", "/planner/follower/lookahead",
             "/planner/follower/displacement", "/planner/follower/status",
+            "/planner/follower/config",
             "/planner/follower/valid",
+            "/planner/follower/vio_displacement",
+            "/planner/follower/goal_reached",
             "/planner/follower/progress", "/planner/follower/remaining",
             "/planner/follower/path_progress",
             "/planner/follower/cross_track", "/planner/follower/path_generation",
@@ -130,7 +157,18 @@ def generate_launch_description():
     recorder_watchdog = RegisterEventHandler(
         OnProcessExit(target_action=recorder, on_exit=recorder_exited)
     )
+    monitor_watchdog = RegisterEventHandler(
+        OnProcessExit(target_action=monitor, on_exit=required_node_exited)
+    )
+    follower_watchdog = RegisterEventHandler(
+        OnProcessExit(target_action=follower, on_exit=required_node_exited)
+    )
+    # Let the planner singleton gate run first. If a stale planner exists, the
+    # launch shuts down before starting a follower that would immediately race
+    # the stale follower on the flight-validity topics.
+    follower_start = TimerAction(period=2.0, actions=[follower])
     return LaunchDescription(args + [
         LogInfo(msg="global planner monitor is observation only; it cannot command PX4"),
-        recorder_watchdog, recorder, simulator, monitor, follower,
+        recorder_watchdog, monitor_watchdog, follower_watchdog,
+        recorder, simulator, monitor, follower_start,
     ])

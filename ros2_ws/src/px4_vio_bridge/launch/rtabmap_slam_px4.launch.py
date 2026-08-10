@@ -126,9 +126,9 @@ def generate_launch_description():
             # `clientPublish` is what lets the Foxglove 3D panel's Publish tool
             # send a clicked waypoint back into ROS; without it the browser
             # cannot publish anything at all. It is deliberately paired with a
-            # narrow client_topic_whitelist below: a browser tab must be able to
-            # reach offboard_waypoint's intake topics and nothing else -- never
-            # /fmu/in/*, which would put an unvalidated setpoint or an arm
+            # narrow client_topic_whitelist below: a browser tab can reach only
+            # the waypoint inputs and the validated flight-control intake --
+            # never /fmu/in/*, which would put an unvalidated setpoint or an arm
             # command straight onto the PX4 uplink.
             DeclareLaunchArgument(
                 "foxglove_capabilities",
@@ -136,7 +136,10 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "foxglove_client_topic_whitelist",
-                default_value="['^/waypoint/clicked(_pose)?$']",
+                default_value=(
+                    "['^/waypoint/clicked(_pose)?$', "
+                    "'^/planner/flight/teleop$']"
+                ),
             ),
             # Keep the optional launch-owned agent independent of all delayed
             # camera, bridge, and Foxglove startup work.

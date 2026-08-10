@@ -492,7 +492,7 @@ architecture before considering any offboard use. The likely replacement is a
 persistent occupancy/voxel representation with route search and a separate
 local collision checker/controller.
 
-### Global A* path monitor — BUILT, OBSERVATION ONLY, see `HANDOFF_GLOBAL_PLANNER.md`
+### Global A* planner — FLIGHT ADAPTER BUILT, REAL PROPS-OFF GATE PENDING
 
 A cost-aware, repeatedly replanned 2D A* monitor now consumes
 `/rtabmap/grid`, `/rtabmap/pose`, and Foxglove goals. The DepthAI bridge can
@@ -520,11 +520,34 @@ carrot, but correction yaw must be removed with
 `d_vio = R(-yaw_correction) * d_map` before ENU-to-NED conversion. A separately
 reviewed adapter then applies that vector from PX4's current NED local
 position, with `auto_arm=false`, HOLD-on-planner/correction fault, a final NED
-position slew limiter, and the existing offboard safety gates. Never send the
-absolute SLAM-world carrot to PX4 or inject corrected SLAM into EKF2. The fresh
+position slew limiter, and the existing offboard safety gates. This adapter is
+now implemented as `offboard_global_planner`, still defaults `auto_arm=false`,
+and passed the synthetic PX4 dry integration without issuing an arm command.
+Real-PX4 props-off attempt 1 is recorded at
+`flight_logs/offboard_global_props_off_1`. It remained disarmed, sent only an
+accepted OFFBOARD-mode request, held fixed yaw, respected the 0.15 m/s speed
+and 1.0 m geofence, and had healthy PX4/VIO/planner data. It exposed a final
+limiter defect: snapping to a noisy, rebased target produced 244 acceleration
+violations over 0.303 m/s^2 and a 5.02 m/s^2 maximum despite bounded speed.
+The snap is removed and a reproducing regression now passes. Attempt 2 is still
+mandatory: props off and `auto_arm=false`, use an exact known-free goal, run
+ROUTE for 10 seconds, then stop the planner for at least four seconds to capture
+fault HOLD. Do not arm until that bag passes. Never send the absolute SLAM-world
+carrot to PX4 or inject corrected SLAM into EKF2. The fresh
 local collision layer remains deferred only for controlled static environments
 and is required before dynamic-environment use. Full details and props-off/live
 gates are in `HANDOFF_GLOBAL_PLANNER.md`.
+
+Waypoint intake now accepts clicks in unknown/outside-map space and on
+obstacles. Unknown and lethal cells are still never traversed: unknown or
+currently disconnected requests produce an `EXPLORING` route to the closest
+reachable known-safe frontier, which advances as the occupancy map expands;
+obstacle requests produce a terminal `SAFE_APPROACH` endpoint outside the
+0.40 m lethal envelope. `/planner/effective_goal` displays that endpoint.
+Reaching an exploration frontier does not assert final goal completion or
+trigger arrival landing; reaching an exact goal or safe obstacle-approach does.
+The 0.40 m centre-to-obstacle envelope is the assumed 0.30 m physical drone
+radius plus a 0.10 m safety margin; it is not 0.40 m of extra padding.
 
 ### Native loop-closure correction
 

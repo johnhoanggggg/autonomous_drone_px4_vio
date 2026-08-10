@@ -28,7 +28,7 @@ import time
 import tty
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from px4_msgs.msg import (
     OffboardControlMode,
     SensorCombined,
@@ -76,6 +76,11 @@ class OffboardHover(Node):
         self.declare_parameter("auto_arm", False)         # MUST be true to actually fly
         self.declare_parameter("keyboard_kill", True)     # K force-disarms (interactive TTY only)
         self.declare_parameter("keyboard_land", True)     # L requests AUTO.LAND (interactive TTY only)
+        # Foxglove's built-in Teleop panel publishes Twist. This is deliberately
+        # opt-in and decoded as discrete safety commands, never as vehicle
+        # velocity: linear.z=-1 requests LAND and linear.z=-2 requests KILL.
+        self.declare_parameter("foxglove_teleop", False)
+        self.declare_parameter("foxglove_teleop_topic", "/planner/flight/teleop")
         self.declare_parameter("tracking_loss_land", True)
         self.declare_parameter("vio_pose_topic", "/rtabmap/vio_pose")
         self.declare_parameter("vio_feature_topic", "/rtabmap/vio_feature_count")
@@ -116,6 +121,12 @@ class OffboardHover(Node):
         self.auto_arm = bool(self.get_parameter("auto_arm").value)
         self.keyboard_kill = bool(self.get_parameter("keyboard_kill").value)
         self.keyboard_land = bool(self.get_parameter("keyboard_land").value)
+        self.foxglove_teleop = bool(
+            self.get_parameter("foxglove_teleop").value
+        )
+        self.foxglove_teleop_topic = str(
+            self.get_parameter("foxglove_teleop_topic").value
+        )
         self.tracking_loss_land = bool(self.get_parameter("tracking_loss_land").value)
         self.vio_pose_timeout = float(self.get_parameter("vio_pose_timeout").value)
         self.vio_feature_timeout = float(self.get_parameter("vio_feature_timeout").value)
@@ -192,6 +203,17 @@ class OffboardHover(Node):
             self.on_sensor_combined,
             pub_qos,
         )
+        if self.foxglove_teleop:
+            self.create_subscription(
+                Twist,
+                self.foxglove_teleop_topic,
+                self.on_foxglove_teleop,
+                10,
+            )
+            self.get_logger().warn(
+                f"FOXGLOVE FLIGHT CONTROLS: {self.foxglove_teleop_topic} "
+                "linear.z=-1 LAND, linear.z=-2 EMERGENCY KILL"
+            )
 
         self.pos = None            # latest VehicleLocalPosition
         self.vcm = None            # latest VehicleControlMode
@@ -291,10 +313,36 @@ class OffboardHover(Node):
             self.get_logger().error(f"keyboard control read failed: {exc}")
             self.restore_terminal()
 
-    def trigger_kill(self):
+    @staticmethod
+    def decode_foxglove_teleop(msg):
+        """Decode the discrete Twist contract used by Foxglove's Teleop panel."""
+        value = float(msg.linear.z)
+        if not math.isfinite(value):
+            return None
+        if value <= -1.5:
+            return "KILL"
+        if value <= -0.5:
+            return "LAND"
+        return None
+
+    def on_foxglove_teleop(self, msg):
+        command = self.decode_foxglove_teleop(msg)
+        if command == "KILL":
+            # Do not let a retained/stale browser command terminate a newly
+            # started dry run before it can reach the normal arming gates.
+            if not self.is_armed:
+                self.get_logger().warn(
+                    "FOXGLOVE EMERGENCY KILL ignored because vehicle is disarmed"
+                )
+                return
+            self.trigger_kill("FOXGLOVE EMERGENCY KILL PRESSED")
+        elif command == "LAND":
+            self.trigger_landing("FOXGLOVE LAND PRESSED")
+
+    def trigger_kill(self, reason="KILL KEY PRESSED"):
         if self.state == "KILL":
             return
-        self.get_logger().fatal("KILL KEY PRESSED -> PX4 FORCED DISARM; MOTORS STOPPING")
+        self.get_logger().fatal(f"{reason} -> PX4 FORCED DISARM; MOTORS STOPPING")
         self.set_state("KILL")
         # Send an immediate burst as well as repeating in tick(), since this is a
         # BEST_EFFORT link and a single command must not be relied upon.
