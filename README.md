@@ -485,9 +485,15 @@ LIVE (props on, RC bound as kill, area clear, pre-flight gate green):
 ros2 launch px4_vio_bridge offboard_waypoint.launch.py auto_arm:=true
 ```
 
-Both record a flight bag to `flight_logs/offboard_waypoint_<UTC>` with the same
+Both record a flight bag to `ros2_ws/flight_logs/offboard_waypoint_<UTC>` with the same
 `fastwrite` MCAP profile and `.launchinfo` sidecar as the yaw test. `/waypoint/*` is in
 the bag, so a session can be replayed click by click.
+
+Every recording launch names its own bag `<mode>_<UTC stamp>` and resolves the
+directory through `px4_vio_bridge.log_paths`, so **do not pass `bag_output`** —
+runs never collide and nothing has to be hand-numbered. The path is absolute and
+does not depend on the directory the launch was typed from; set
+`PX4_VIO_FLIGHT_LOGS` to record somewhere other than `ros2_ws/flight_logs`.
 
 ### What bounds a click
 

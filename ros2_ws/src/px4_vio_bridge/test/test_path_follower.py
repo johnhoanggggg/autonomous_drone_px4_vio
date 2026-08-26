@@ -80,6 +80,33 @@ def test_position_carrot_obeys_speed_and_acceleration_limits():
     assert second.commanded_displacement == pytest.approx((1.5, 0.0))
 
 
+def test_update_can_reduce_lookahead_for_a_single_safe_command():
+    follower = PositionRouteFollower(
+        lookahead=0.60, max_carrot_speed=10.0, max_carrot_acceleration=100.0
+    )
+    follower.set_path(((0.0, 0.0), (2.0, 0.0)), (0.0, 0.0))
+    result = follower.update((0.0, 0.0), 0.1, lookahead=0.20)
+    assert result.desired_carrot == pytest.approx((0.20, 0.0))
+    assert follower.lookahead == pytest.approx(0.60)
+
+
+def test_unsafe_command_is_invalid_and_resets_relative_proposal():
+    follower = PositionRouteFollower(
+        lookahead=0.60, max_carrot_speed=10.0, max_carrot_acceleration=100.0
+    )
+    follower.set_path(((0.0, 0.0), (2.0, 0.0)), (0.0, 0.0))
+    result = follower.update(
+        (0.0, 0.0),
+        0.1,
+        command_validator=lambda carrot: carrot[0] <= 0.10,
+    )
+    assert result.status == "CLEARANCE_BLOCKED"
+    assert not result.valid
+    assert result.commanded_displacement == (0.0, 0.0)
+    assert result.commanded_carrot == (0.0, 0.0)
+    assert result.progress == 0.0
+
+
 def test_replan_does_not_jump_commanded_position_displacement():
     follower = PositionRouteFollower(max_carrot_speed=0.25, max_carrot_acceleration=10.0)
     follower.set_path(((0.0, 0.0), (4.0, 0.0)), (0.0, 0.0))

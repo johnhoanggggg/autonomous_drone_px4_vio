@@ -22,13 +22,18 @@ from px4_vio_bridge.grid_planner import (
     astar,
     classify_goal,
     closest_reachable_goal,
+    grid_lethal_radius,
     inflate_occupancy,
     inflation_display_data,
     line_is_clear,
     path_length,
+    path_projection,
     recover_start,
+    should_replace_path,
     simplify_path,
+    segment_has_clearance,
     traversable,
+    trim_path_to,
 )
 from px4_vio_bridge.process_singleton import ProcessSingleton
 
@@ -52,6 +57,8 @@ class GlobalPlannerMonitor(Node):
         "cost_weight",
         "planning_timeout_ms",
         "switch_improvement",
+        "path_retain_tolerance",
+        "path_head_margin",
     )
 
     def __init__(self):
@@ -73,6 +80,14 @@ class GlobalPlannerMonitor(Node):
         self.declare_parameter("cost_weight", 2.0)
         self.declare_parameter("planning_timeout_ms", 100.0)
         self.declare_parameter("switch_improvement", 0.10)
+        # Distance the vehicle may sit off the accepted path before the path is
+        # rebuilt. Keep it below the follower's max_cross_track so the planner
+        # gives up on a corridor before the follower faults on it.
+        self.declare_parameter("path_retain_tolerance", 0.35)
+        # How far the retained path's head may fall behind the vehicle before it
+        # is advanced onto it. Must stay under the follower's
+        # path_start_tolerance, which rejects a path that starts too far away.
+        self.declare_parameter("path_head_margin", 0.50)
 
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.map_timeout = float(self.get_parameter("map_timeout").value)
@@ -98,6 +113,12 @@ class GlobalPlannerMonitor(Node):
         )
         self.switch_improvement = float(
             self.get_parameter("switch_improvement").value
+        )
+        self.path_retain_tolerance = max(
+            0.0, float(self.get_parameter("path_retain_tolerance").value)
+        )
+        self.path_head_margin = max(
+            0.0, float(self.get_parameter("path_head_margin").value)
         )
 
         map_qos = QoSProfile(
@@ -176,23 +197,24 @@ class GlobalPlannerMonitor(Node):
         self.grid_msg = None
         self.grid_generation = 0
         self.inflated = None
+        self.grid_lethal_radius = None
+        self.grid_inflation_radius = None
         self.inflated_generation = -1
         self.pose = None
         self.goal = None
         self.goal_generation = 0
         self.map_received = 0.0
         self.pose_received = 0.0
-        self.accepted_cells = ()
         self.accepted_points = ()
-        self.accepted_cost = math.inf
         self.accepted_goal_generation = -1
         self.accepted_effective_goal = None
+        self.accepted_generation = 0
         self.last_planned_key = None
         rate = max(0.2, float(self.get_parameter("rate_hz").value))
         self.create_timer(1.0 / rate, self.tick)
         self.get_logger().warn(
             "global_planner_monitor: OBSERVATION ONLY; publishes no PX4 commands. "
-            f"clearance={self.lethal_radius:.2f}m unknown=blocked"
+            f"continuous_clearance={self.lethal_radius:.2f}m unknown=blocked"
         )
 
     @staticmethod
@@ -259,11 +281,17 @@ class GlobalPlannerMonitor(Node):
     def ensure_inflated(self):
         if self.inflated_generation == self.grid_generation:
             return
+        self.grid_lethal_radius = grid_lethal_radius(
+            self.lethal_radius, self.grid.resolution
+        )
+        self.grid_inflation_radius = grid_lethal_radius(
+            self.inflation_radius, self.grid.resolution
+        )
         self.inflated = inflate_occupancy(
             self.grid,
             occupied_threshold=self.occupied_threshold,
-            lethal_radius=self.lethal_radius,
-            inflation_radius=self.inflation_radius,
+            lethal_radius=self.grid_lethal_radius,
+            inflation_radius=self.grid_inflation_radius,
             cost_scaling=self.inflation_cost_scaling,
         )
         self.inflated_generation = self.grid_generation
@@ -285,8 +313,26 @@ class GlobalPlannerMonitor(Node):
         cells = [self.inflated.world_to_cell(point) for point in points]
         if any(cell is None for cell in cells):
             return False
+        if len(points) == 1:
+            return segment_has_clearance(
+                self.grid,
+                points[0],
+                points[0],
+                self.lethal_radius,
+                occupied_threshold=self.occupied_threshold,
+            )
         return all(
-            line_is_clear(self.inflated, a, b) for a, b in zip(cells, cells[1:])
+            line_is_clear(self.inflated, a, b)
+            and segment_has_clearance(
+                self.grid,
+                first,
+                second,
+                self.lethal_radius,
+                occupied_threshold=self.occupied_threshold,
+            )
+            for a, b, first, second in zip(
+                cells, cells[1:], points, points[1:]
+            )
         )
 
     def make_path(self, points, z):
@@ -304,9 +350,7 @@ class GlobalPlannerMonitor(Node):
         return msg
 
     def clear_path(self, status, effective_goal=None):
-        self.accepted_cells = ()
         self.accepted_points = ()
-        self.accepted_cost = math.inf
         self.accepted_effective_goal = None
         empty = self.make_path((), self.pose[2] if self.pose else 0.0)
         self.candidate_pub.publish(empty)
@@ -455,9 +499,7 @@ class GlobalPlannerMonitor(Node):
         self.planning_ms_pub.publish(Float32(data=float(total_ms)))
         self.expanded_pub.publish(Int32(data=result.expanded))
         if not result.found:
-            self.accepted_cells = ()
             self.accepted_points = ()
-            self.accepted_cost = math.inf
             self.path_pub.publish(self.make_path((), self.pose[2]))
             status = (
                 f"{result.reason} expanded={result.expanded} "
@@ -467,21 +509,50 @@ class GlobalPlannerMonitor(Node):
             self.publish_markers(status, (), effective_goal)
             return
 
-        candidate_cells = simplify_path(self.inflated, result.cells)
+        candidate_cells = simplify_path(
+            self.inflated,
+            result.cells,
+            preserve_cost=True,
+            source_grid=self.grid,
+            required_clearance=self.lethal_radius,
+            occupied_threshold=self.occupied_threshold,
+        )
+        if not candidate_cells:
+            self.clear_path(
+                "UNSAFE_SEGMENT continuous clearance validation failed",
+                effective_goal,
+            )
+            return
         candidate_points = tuple(self.inflated.cell_center(cell) for cell in candidate_cells)
         candidate_length = path_length(candidate_points)
         self.candidate_pub.publish(self.make_path(candidate_points, self.pose[2]))
         accepted_valid = self.path_valid(self.accepted_points)
-        moved = bool(self.accepted_cells) and start != self.accepted_cells[0]
-        improved = result.cost < self.accepted_cost * (1.0 - self.switch_improvement)
+        projection = (
+            path_projection(self.accepted_points, self.pose[:2])
+            if accepted_valid
+            else None
+        )
         goal_changed = self.accepted_goal_generation != self.goal_generation
         effective_goal_changed = self.accepted_effective_goal != goal
-        if not accepted_valid or moved or improved or goal_changed or effective_goal_changed:
-            self.accepted_cells = candidate_cells
+        replace = (
+            goal_changed
+            or effective_goal_changed
+            or should_replace_path(
+                projection,
+                candidate_length,
+                retain_tolerance=self.path_retain_tolerance,
+                switch_improvement=self.switch_improvement,
+            )
+        )
+        if replace:
             self.accepted_points = candidate_points
-            self.accepted_cost = result.cost
             self.accepted_goal_generation = self.goal_generation
             self.accepted_effective_goal = goal
+            self.accepted_generation += 1
+        else:
+            self.accepted_points = trim_path_to(
+                self.accepted_points, self.pose[:2], self.path_head_margin
+            )
         self.path_pub.publish(self.make_path(self.accepted_points, self.pose[2]))
         accepted_length = path_length(self.accepted_points)
         self.path_length_pub.publish(Float32(data=float(accepted_length)))
@@ -495,8 +566,11 @@ class GlobalPlannerMonitor(Node):
             f"goal_distance={selection.distance:.2f}m "
             f"reachable={selection.reachable_cells} expanded={result.expanded} "
             f"plan={total_ms:.1f}ms "
-            f"map_age={now - self.map_received:.2f}s"
+            f"map_age={now - self.map_received:.2f}s "
+            f"path_gen={self.accepted_generation}"
         )
+        if projection is not None:
+            status += f" off_path={projection.distance:.2f}m"
         if start_offset > 0.0:
             status += f" start_recovered={start_offset:.2f}m"
         self.publish_status(status)

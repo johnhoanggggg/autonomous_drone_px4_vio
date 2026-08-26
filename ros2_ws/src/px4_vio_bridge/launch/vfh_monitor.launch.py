@@ -13,8 +13,6 @@ The stack must be up WITH clouds, which is not the default:
 `fastwrite` profile the flight launches use, excluding the camera and the raw
 cloud (a 15 Hz XYZRGB cloud is far larger than everything else combined).
 """
-from datetime import datetime, timezone
-from pathlib import Path
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo
@@ -22,6 +20,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from px4_vio_bridge.log_paths import timestamped_bag
 
 STORAGE_PRESET = "fastwrite"
 
@@ -31,10 +30,7 @@ def typed(name, value_type):
 
 
 def generate_launch_description():
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    bag_root = Path.cwd() / "flight_logs"
-    bag_root.mkdir(parents=True, exist_ok=True)
-    default_bag_output = str(bag_root / f"vfh_monitor_{stamp}")
+    default_bag_output = timestamped_bag("vfh_monitor")
 
     arguments = [
         DeclareLaunchArgument("rate_hz", default_value="10.0"),

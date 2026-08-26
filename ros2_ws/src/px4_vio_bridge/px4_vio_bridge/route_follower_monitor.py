@@ -6,7 +6,7 @@ import time
 
 import rclpy
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Vector3Stamped
-from nav_msgs.msg import Path
+from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float32, Int32, String
@@ -20,6 +20,7 @@ from px4_vio_bridge.path_follower import (
     requested_goal_reached,
     yaw_from_quaternion,
 )
+from px4_vio_bridge.grid_planner import GridMap, segment_has_clearance
 from px4_vio_bridge.process_singleton import ProcessSingleton
 from px4_vio_bridge.vio_to_px4_odometry import pose_rejection_reason
 
@@ -27,6 +28,7 @@ from px4_vio_bridge.vio_to_px4_odometry import pose_rejection_reason
 class RouteFollowerMonitor(Node):
     CONFIG_PARAMETERS = (
         "path_topic",
+        "map_topic",
         "pose_topic",
         "raw_vio_topic",
         "goal_topic",
@@ -35,12 +37,18 @@ class RouteFollowerMonitor(Node):
         "frame_id",
         "rate_hz",
         "path_timeout",
+        "map_timeout",
         "pose_timeout",
         "vio_timeout",
         "correction_timeout",
         "max_correction_m",
         "max_correction_yaw_deg",
         "lookahead",
+        "lookahead_step",
+        "min_lookahead",
+        "occupied_threshold",
+        "robot_radius",
+        "safety_margin",
         "max_carrot_speed",
         "max_carrot_acceleration",
         "max_cross_track",
@@ -61,6 +69,7 @@ class RouteFollowerMonitor(Node):
     def __init__(self):
         super().__init__("route_follower_monitor")
         self.declare_parameter("path_topic", "/planner/path")
+        self.declare_parameter("map_topic", "/rtabmap/grid")
         self.declare_parameter("pose_topic", "/rtabmap/pose")
         self.declare_parameter("raw_vio_topic", "/rtabmap/vio_pose")
         self.declare_parameter("goal_topic", "/waypoint/clicked")
@@ -69,12 +78,18 @@ class RouteFollowerMonitor(Node):
         self.declare_parameter("frame_id", "world")
         self.declare_parameter("rate_hz", 10.0)
         self.declare_parameter("path_timeout", 3.0)
+        self.declare_parameter("map_timeout", 3.0)
         self.declare_parameter("pose_timeout", 1.0)
         self.declare_parameter("vio_timeout", 0.5)
         self.declare_parameter("correction_timeout", 1.0)
         self.declare_parameter("max_correction_m", 0.50)
         self.declare_parameter("max_correction_yaw_deg", 15.0)
         self.declare_parameter("lookahead", 0.60)
+        self.declare_parameter("lookahead_step", 0.05)
+        self.declare_parameter("min_lookahead", 0.05)
+        self.declare_parameter("occupied_threshold", 65)
+        self.declare_parameter("robot_radius", 0.30)
+        self.declare_parameter("safety_margin", 0.10)
         self.declare_parameter("max_carrot_speed", 0.25)
         self.declare_parameter("max_carrot_acceleration", 0.50)
         self.declare_parameter("max_cross_track", 0.60)
@@ -93,6 +108,7 @@ class RouteFollowerMonitor(Node):
 
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.path_timeout = float(self.get_parameter("path_timeout").value)
+        self.map_timeout = float(self.get_parameter("map_timeout").value)
         self.pose_timeout = float(self.get_parameter("pose_timeout").value)
         self.vio_timeout = float(self.get_parameter("vio_timeout").value)
         self.correction_timeout = float(
@@ -105,6 +121,19 @@ class RouteFollowerMonitor(Node):
             float(self.get_parameter("max_correction_yaw_deg").value)
         )
         self.path_start_tolerance = float(self.get_parameter("path_start_tolerance").value)
+        self.lookahead_step = max(
+            0.01, float(self.get_parameter("lookahead_step").value)
+        )
+        self.min_lookahead = max(
+            0.0, float(self.get_parameter("min_lookahead").value)
+        )
+        self.occupied_threshold = int(
+            self.get_parameter("occupied_threshold").value
+        )
+        self.required_clearance = (
+            float(self.get_parameter("robot_radius").value)
+            + float(self.get_parameter("safety_margin").value)
+        )
         self.correction_gate = CorrectionReplanGate(
             translation_trigger=float(
                 self.get_parameter("correction_translation_trigger").value
@@ -142,6 +171,10 @@ class RouteFollowerMonitor(Node):
                 self.get_parameter("arrival_release_tolerance").value
             ),
         )
+        if self.required_clearance <= 0.0:
+            raise ValueError("robot_radius + safety_margin must be positive")
+        if self.min_lookahead > self.follower.lookahead:
+            raise ValueError("min_lookahead must not exceed lookahead")
 
         self.pose = None
         self.pose_received = 0.0
@@ -157,8 +190,22 @@ class RouteFollowerMonitor(Node):
         self.goal_terminal = False
         self.path_received = 0.0
         self.path_start = None
+        self.grid = None
+        self.map_received = 0.0
         self.last_tick = self.monotonic_time()
 
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            OccupancyGrid,
+            str(self.get_parameter("map_topic").value),
+            self.on_map,
+            map_qos,
+        )
         self.create_subscription(
             Path, str(self.get_parameter("path_topic").value), self.on_path, 10
         )
@@ -264,6 +311,63 @@ class RouteFollowerMonitor(Node):
         if all(math.isfinite(value) for value in point):
             self.pose = point
             self.pose_received = self.monotonic_time()
+
+    def on_map(self, msg):
+        if msg.header.frame_id != self.frame_id:
+            self.get_logger().error(
+                f"map rejected: frame '{msg.header.frame_id}' != '{self.frame_id}'",
+                throttle_duration_sec=5.0,
+            )
+            return
+        q = msg.info.origin.orientation
+        if (
+            abs(q.x) > 1.0e-6
+            or abs(q.y) > 1.0e-6
+            or abs(q.z) > 1.0e-6
+            or abs(q.w - 1.0) > 1.0e-6
+        ):
+            self.get_logger().error(
+                "map rejected: rotated occupancy-grid origins are unsupported",
+                throttle_duration_sec=5.0,
+            )
+            return
+        try:
+            values = tuple(int(value) for value in msg.data)
+            if any(value < -1 or value > 100 for value in values):
+                raise ValueError("values must be -1 or 0..100")
+            self.grid = GridMap(
+                int(msg.info.width),
+                int(msg.info.height),
+                float(msg.info.resolution),
+                float(msg.info.origin.position.x),
+                float(msg.info.origin.position.y),
+                values,
+            )
+        except ValueError as exc:
+            self.get_logger().error(
+                f"map rejected: {exc}", throttle_duration_sec=5.0
+            )
+            return
+        self.map_received = self.monotonic_time()
+
+    def command_has_clearance(self, start, end):
+        return segment_has_clearance(
+            self.grid,
+            start,
+            end,
+            self.required_clearance,
+            occupied_threshold=self.occupied_threshold,
+        )
+
+    def safe_lookahead(self, pose):
+        projection = self.follower.path.project(pose)
+        candidate = self.follower.lookahead
+        while candidate + 1.0e-12 >= self.min_lookahead:
+            target = self.follower.path.point_at(projection.along + candidate)
+            if self.command_has_clearance(pose, target):
+                return candidate
+            candidate -= self.lookahead_step
+        return None
 
     def on_raw_vio(self, msg):
         now = self.monotonic_time()
@@ -447,6 +551,14 @@ class RouteFollowerMonitor(Node):
             self.follower.interrupt_cross_track_recovery()
             self.publish_status(f"STALE_POSE age={now - self.pose_received:.2f}s")
             return
+        if self.grid is None:
+            self.follower.interrupt_cross_track_recovery()
+            self.publish_status("WAITING_FOR_MAP")
+            return
+        if now - self.map_received > self.map_timeout:
+            self.follower.interrupt_cross_track_recovery()
+            self.publish_status(f"STALE_MAP age={now - self.map_received:.2f}s")
+            return
         if self.follower.path is None:
             self.follower.interrupt_cross_track_recovery()
             self.publish_status("WAITING_FOR_PATH")
@@ -468,7 +580,25 @@ class RouteFollowerMonitor(Node):
             self.publish_status(f"PATH_START_MISMATCH distance={start_error:.2f}m")
             return
 
-        result = self.follower.update(self.pose[:2], dt)
+        selected_lookahead = self.safe_lookahead(self.pose[:2])
+        if selected_lookahead is None:
+            self.follower.hold_command()
+            pose_safe = self.command_has_clearance(self.pose[:2], self.pose[:2])
+            reason = "NO_SAFE_LOOKAHEAD" if pose_safe else "POSE_INSIDE_CLEARANCE"
+            self.publish_status(
+                f"CLEARANCE_BLOCKED reason={reason} "
+                f"required={self.required_clearance:.2f}m"
+            )
+            return
+
+        result = self.follower.update(
+            self.pose[:2],
+            dt,
+            lookahead=selected_lookahead,
+            command_validator=lambda carrot: self.command_has_clearance(
+                self.pose[:2], carrot
+            ),
+        )
         stamp = self.get_clock().now().to_msg()
         self.lookahead_pub.publish(
             self.pose_message(result.desired_carrot, self.pose[2], stamp)
@@ -499,7 +629,8 @@ class RouteFollowerMonitor(Node):
         self.publish_status(
             f"{result.status} generation={result.generation} progress={result.progress:.2f}m "
             f"path_progress={result.path_progress:.2f}m "
-            f"remaining={result.remaining:.2f}m cross_track={result.cross_track:.2f}m",
+            f"remaining={result.remaining:.2f}m cross_track={result.cross_track:.2f}m "
+            f"lookahead={selected_lookahead:.2f}/{self.follower.lookahead:.2f}m",
             valid=result.valid,
             goal_reached=requested_goal_reached(
                 result.status, self.goal_terminal

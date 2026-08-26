@@ -352,6 +352,12 @@ class PositionRouteFollower:
             self.cross_track_recovery_elapsed = 0.0
             self.command_velocity = (0.0, 0.0)
 
+    def hold_command(self) -> None:
+        """Reset the relative proposal when an external safety gate blocks it."""
+        self.commanded_displacement = (0.0, 0.0)
+        self.command_velocity = (0.0, 0.0)
+        self.at_goal = False
+
     def set_path(self, points: Sequence[Point2], pose: Point2) -> bool:
         fingerprint = path_fingerprint(points)
         if fingerprint == self.fingerprint and self.path is not None:
@@ -362,16 +368,26 @@ class PositionRouteFollower:
         self.path_progress = self.path.project(pose).along
         return True
 
-    def update(self, pose: Point2, dt: float) -> FollowResult:
+    def update(
+        self,
+        pose: Point2,
+        dt: float,
+        *,
+        lookahead: Optional[float] = None,
+        command_validator=None,
+    ) -> FollowResult:
         if self.path is None:
             raise RuntimeError("no path")
         if not all(math.isfinite(v) for v in (*pose, dt)) or dt <= 0.0:
             raise ValueError("pose and dt must be finite, and dt positive")
 
+        effective_lookahead = self.lookahead if lookahead is None else float(lookahead)
+        if not math.isfinite(effective_lookahead) or effective_lookahead < 0.0:
+            raise ValueError("lookahead must be finite and non-negative")
         projection = self.path.project(pose)
         candidate_progress = max(self.path_progress, projection.along)
         remaining = max(0.0, self.path.length - candidate_progress)
-        desired = self.path.point_at(candidate_progress + self.lookahead)
+        desired = self.path.point_at(candidate_progress + effective_lookahead)
         desired_offset = desired[0] - pose[0], desired[1] - pose[1]
 
         if projection.cross_track > self.max_cross_track:
@@ -420,10 +436,6 @@ class PositionRouteFollower:
             self.cross_track_fault_generation = 0
             self.cross_track_recovery_elapsed = 0.0
 
-        self.progress += candidate_progress - self.path_progress
-        self.path_progress = candidate_progress
-        remaining = max(0.0, self.path.length - self.path_progress)
-
         error = (
             desired_offset[0] - self.commanded_displacement[0],
             desired_offset[1] - self.commanded_displacement[1],
@@ -439,14 +451,44 @@ class PositionRouteFollower:
         )
         step = (velocity[0] * dt, velocity[1] * dt)
         if math.hypot(*step) >= math.hypot(*error):
-            self.commanded_displacement = desired_offset
-            self.command_velocity = (0.0, 0.0)
+            next_displacement = desired_offset
+            next_velocity = (0.0, 0.0)
         else:
-            self.commanded_displacement = (
+            next_displacement = (
                 self.commanded_displacement[0] + step[0],
                 self.commanded_displacement[1] + step[1],
             )
-            self.command_velocity = velocity
+            next_velocity = velocity
+
+        next_carrot = (
+            pose[0] + next_displacement[0],
+            pose[1] + next_displacement[1],
+        )
+        if command_validator is not None and not command_validator(next_carrot):
+            # The adapter treats invalidity as a stationary hold. Reset the
+            # relative proposal too, so a future safe recovery accelerates from
+            # the held pose instead of reviving a stale direction.
+            self.commanded_displacement = (0.0, 0.0)
+            self.command_velocity = (0.0, 0.0)
+            self.at_goal = False
+            return FollowResult(
+                "CLEARANCE_BLOCKED",
+                False,
+                desired,
+                pose,
+                self.commanded_displacement,
+                self.path_progress,
+                self.progress,
+                remaining,
+                projection.cross_track,
+                self.generation,
+            )
+
+        self.progress += candidate_progress - self.path_progress
+        self.path_progress = candidate_progress
+        remaining = max(0.0, self.path.length - self.path_progress)
+        self.commanded_displacement = next_displacement
+        self.command_velocity = next_velocity
 
         carrot = (pose[0] + self.commanded_displacement[0], pose[1] + self.commanded_displacement[1])
         # Arrival latches: entering needs arrival_tolerance, leaving needs the

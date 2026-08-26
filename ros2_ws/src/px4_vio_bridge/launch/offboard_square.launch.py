@@ -32,6 +32,7 @@ from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from px4_vio_bridge.log_paths import timestamped_bag
 
 STORAGE_PRESET = "fastwrite"
 
@@ -65,10 +66,7 @@ def write_run_marker(context, *args, **kwargs):
 
 
 def generate_launch_description():
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    bag_root = Path.cwd() / "flight_logs"
-    bag_root.mkdir(parents=True, exist_ok=True)
-    default_bag_output = str(bag_root / f"offboard_square_{stamp}")
+    default_bag_output = timestamped_bag("offboard_square")
 
     arguments = [
         DeclareLaunchArgument("auto_arm", default_value="false"),

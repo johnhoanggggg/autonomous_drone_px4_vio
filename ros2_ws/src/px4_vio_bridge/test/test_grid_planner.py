@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 from px4_vio_bridge.grid_planner import (
     GridMap,
     LETHAL,
@@ -10,11 +12,17 @@ from px4_vio_bridge.grid_planner import (
     inflate_occupancy,
     inflation_display_data,
     inflation_offsets,
+    grid_lethal_radius,
     line_is_clear,
+    line_max_cost,
     path_length,
+    path_projection,
     recover_start,
+    should_replace_path,
     simplify_path,
+    segment_has_clearance,
     traversable,
+    trim_path_to,
 )
 
 
@@ -213,6 +221,57 @@ def test_simplification_keeps_required_corner_but_removes_collinear_cells():
     assert all(line_is_clear(world, a, b) for a, b in zip(simple, simple[1:]))
 
 
+def test_cost_preserving_simplification_does_not_reenter_high_cost_band():
+    rows = [[0] * 7 for _ in range(5)]
+    rows[2][3] = 220
+    costs = grid(rows)
+    detour = ((0, 2), (0, 0), (6, 0), (6, 2))
+
+    assert simplify_path(costs, detour) == ((0, 2), (6, 2))
+    preserved = simplify_path(costs, detour, preserve_cost=True)
+    assert len(preserved) > 2
+    assert all(
+        line_max_cost(costs, first, second) == 0
+        for first, second in zip(preserved, preserved[1:])
+    )
+
+
+def test_continuous_segment_clearance_uses_occupied_cell_edges():
+    rows = [[0] * 9 for _ in range(9)]
+    rows[3][3] = 100
+    source = grid(rows, resolution=0.1)
+    # Occupied square spans x/y=0.3..0.4. A horizontal segment at y=0.75
+    # clears its edge by 0.35 m, although it clears the cell centre by 0.40 m.
+    assert not segment_has_clearance(source, (0.05, 0.75), (0.85, 0.75), 0.40)
+    assert segment_has_clearance(source, (0.05, 0.81), (0.85, 0.81), 0.40)
+
+
+def test_continuous_segment_clearance_blocks_unknown_and_outside_map():
+    source = grid([[0, 0, -1, 0, 0]], resolution=0.1)
+    assert not segment_has_clearance(source, (0.05, 0.05), (0.45, 0.05), 0.0)
+    assert not segment_has_clearance(source, (-0.05, 0.05), (0.15, 0.05), 0.0)
+
+
+def test_simplification_rejects_a_geometrically_unsafe_adjacent_edge():
+    rows = [[0] * 9 for _ in range(9)]
+    rows[3][3] = 100
+    source = grid(rows, resolution=0.1)
+    free_costs = grid([[0] * 9 for _ in range(9)], resolution=0.1)
+    cells = ((0, 7), (8, 7))
+    assert simplify_path(
+        free_costs,
+        cells,
+        source_grid=source,
+        required_clearance=0.40,
+    ) == ()
+
+
+def test_grid_inflation_radius_accounts_for_occupied_cell_half_diagonal():
+    assert grid_lethal_radius(0.40, 0.05) == pytest.approx(
+        0.40 + 0.05 / math.sqrt(2.0)
+    )
+
+
 def test_world_cell_round_trip_uses_cell_centres():
     world = GridMap(10, 10, 0.2, -1.0, -2.0, (0,) * 100)
     cell = world.world_to_cell((-0.31, -0.71))
@@ -285,3 +344,63 @@ def test_exact_reachable_goal_is_exact_and_terminal():
         True,
         True,
     )
+
+
+PATH = ((0.0, 0.0), (1.0, 0.0), (2.0, 0.0))
+
+
+def test_path_projection_reports_offset_and_remaining_length():
+    projection = path_projection(PATH, (0.5, 0.25))
+    assert math.isclose(projection.distance, 0.25)
+    assert math.isclose(projection.remaining, 1.5)
+    assert path_projection((), (0.0, 0.0)) is None
+    assert math.isclose(path_projection(((3.0, 4.0),), (0.0, 0.0)).distance, 5.0)
+
+
+def test_projection_remaining_is_measured_from_the_projection_not_the_head():
+    # Comparable with a fresh candidate's total length, which is what makes the
+    # switch_improvement test like-for-like.
+    assert math.isclose(path_projection(PATH, (1.9, 0.0)).remaining, 0.1)
+
+
+def test_advancing_along_the_path_is_not_a_reason_to_replace_it():
+    # The old policy replaced whenever the vehicle's start cell changed, which
+    # on a 0.05 m grid meant essentially every planner tick while translating.
+    for x in (0.05, 0.5, 1.0, 1.95):
+        projection = path_projection(PATH, (x, 0.0))
+        assert not should_replace_path(
+            projection, 2.0, retain_tolerance=0.35, switch_improvement=0.10
+        )
+
+
+def test_replace_when_off_the_corridor_or_materially_shorter():
+    off = path_projection(PATH, (0.5, 0.40))
+    assert should_replace_path(off, 2.0, retain_tolerance=0.35, switch_improvement=0.10)
+    on = path_projection(PATH, (0.5, 0.0))
+    assert should_replace_path(on, 1.2, retain_tolerance=0.35, switch_improvement=0.10)
+    assert not should_replace_path(on, 1.4, retain_tolerance=0.35, switch_improvement=0.10)
+    assert should_replace_path(None, 5.0, retain_tolerance=0.35, switch_improvement=0.10)
+
+
+def test_trim_leaves_a_fresh_path_untouched_so_the_fingerprint_is_stable():
+    assert trim_path_to(PATH, (0.10, 0.0), 0.50) == PATH
+    # Lateral offset from the head is not progress and must not re-anchor.
+    assert trim_path_to(PATH, (-0.60, 0.0), 0.50) == PATH
+
+
+def test_trim_advances_the_head_and_keeps_the_geometry_ahead():
+    trimmed = trim_path_to(PATH, (1.20, 0.0), 0.50)
+    assert trimmed[0] == (1.2, 0.0)
+    assert trimmed[1:] == ((2.0, 0.0),)
+    # Cross-track against the trimmed path matches the untrimmed one.
+    for probe in ((1.5, 0.2), (1.9, -0.1)):
+        assert math.isclose(
+            path_projection(trimmed, probe).distance,
+            path_projection(PATH, probe).distance,
+        )
+
+
+def test_trim_never_returns_a_degenerate_path():
+    trimmed = trim_path_to(PATH, (2.0, 0.0), 0.50)
+    assert len(trimmed) >= 2
+    assert trimmed[-1] == (2.0, 0.0)

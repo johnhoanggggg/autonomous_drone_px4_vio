@@ -81,6 +81,12 @@ class StartRecovery:
     distance: float
 
 
+@dataclass(frozen=True)
+class PathProjection:
+    distance: float
+    remaining: float
+
+
 def inflation_offsets(resolution, lethal_radius, inflation_radius, cost_scaling):
     """Return `(dx, dy, cost)` for every cell offset inside the inflation disc."""
     cells = int(math.ceil(inflation_radius / resolution))
@@ -390,19 +396,314 @@ def line_is_clear(grid, start, end):
     return True
 
 
-def simplify_path(grid, cells):
+def line_max_cost(grid, start, end):
+    """Highest traversable cost touched by the conservative grid line."""
+    x0, y0 = start
+    x1, y1 = end
+    dx, dy = x1 - x0, y1 - y0
+    steps = max(abs(dx), abs(dy)) * 2 + 1
+    previous = start
+    highest = 0
+    for i in range(steps + 1):
+        t = i / max(1, steps)
+        cell = (int(round(x0 + dx * t)), int(round(y0 + dy * t)))
+        if not traversable(grid, cell):
+            return LETHAL
+        highest = max(highest, grid.value(cell))
+        sx, sy = cell[0] - previous[0], cell[1] - previous[1]
+        if sx and sy:
+            for corner in (
+                (previous[0] + sx, previous[1]),
+                (previous[0], previous[1] + sy),
+            ):
+                if not traversable(grid, corner):
+                    return LETHAL
+                highest = max(highest, grid.value(corner))
+        previous = cell
+    return highest
+
+
+def _point_segment_distance(point, start, end):
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1.0e-18:
+        return math.dist(point, start)
+    fraction = max(
+        0.0,
+        min(
+            1.0,
+            ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+            / length_sq,
+        ),
+    )
+    projection = (start[0] + fraction * dx, start[1] + fraction * dy)
+    return math.dist(point, projection)
+
+
+def _orientation(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _on_segment(a, b, point, tolerance=1.0e-12):
+    return (
+        min(a[0], b[0]) - tolerance <= point[0] <= max(a[0], b[0]) + tolerance
+        and min(a[1], b[1]) - tolerance <= point[1] <= max(a[1], b[1]) + tolerance
+        and abs(_orientation(a, b, point)) <= tolerance
+    )
+
+
+def _segments_intersect(a, b, c, d):
+    oa, ob = _orientation(a, b, c), _orientation(a, b, d)
+    oc, od = _orientation(c, d, a), _orientation(c, d, b)
+    if ((oa > 0 > ob) or (oa < 0 < ob)) and ((oc > 0 > od) or (oc < 0 < od)):
+        return True
+    return (
+        (abs(oa) <= 1.0e-12 and _on_segment(a, b, c))
+        or (abs(ob) <= 1.0e-12 and _on_segment(a, b, d))
+        or (abs(oc) <= 1.0e-12 and _on_segment(c, d, a))
+        or (abs(od) <= 1.0e-12 and _on_segment(c, d, b))
+    )
+
+
+def _segment_segment_distance(a, b, c, d):
+    if _segments_intersect(a, b, c, d):
+        return 0.0
+    return min(
+        _point_segment_distance(a, c, d),
+        _point_segment_distance(b, c, d),
+        _point_segment_distance(c, a, b),
+        _point_segment_distance(d, a, b),
+    )
+
+
+def _segment_box_distance(start, end, box):
+    x0, x1, y0, y1 = box
+    if (
+        (x0 <= start[0] <= x1 and y0 <= start[1] <= y1)
+        or (x0 <= end[0] <= x1 and y0 <= end[1] <= y1)
+    ):
+        return 0.0
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    return min(
+        _segment_segment_distance(
+            start, end, corners[index], corners[(index + 1) % 4]
+        )
+        for index in range(4)
+    )
+
+
+def segment_has_clearance(
+    source_grid,
+    start,
+    end,
+    required_clearance,
+    *,
+    occupied_threshold=65,
+):
+    """Whether a world-frame segment clears every occupied cell square.
+
+    Inflation operates between grid-cell centres. This check instead treats an
+    occupied cell as its full axis-aligned square and measures the continuous
+    path segment against its edges. Only cells in the segment's clearance-sized
+    bounding box are visited, keeping the check practical on the Pi.
+    """
+    if required_clearance < 0.0:
+        raise ValueError("required_clearance must be non-negative")
+    if not all(math.isfinite(value) for value in (*start, *end, required_clearance)):
+        return False
+    resolution = source_grid.resolution
+    known_steps = max(1, int(math.ceil(math.dist(start, end) * 2.0 / resolution)))
+    for index in range(known_steps + 1):
+        fraction = index / known_steps
+        point = (
+            start[0] + fraction * (end[0] - start[0]),
+            start[1] + fraction * (end[1] - start[1]),
+        )
+        cell = source_grid.world_to_cell(point)
+        if cell is None or source_grid.value(cell) < 0:
+            return False
+    x0 = int(math.floor((min(start[0], end[0]) - required_clearance - source_grid.origin_x) / resolution))
+    x1 = int(math.floor((max(start[0], end[0]) + required_clearance - source_grid.origin_x) / resolution))
+    y0 = int(math.floor((min(start[1], end[1]) - required_clearance - source_grid.origin_y) / resolution))
+    y1 = int(math.floor((max(start[1], end[1]) + required_clearance - source_grid.origin_y) / resolution))
+    x0, x1 = max(0, x0), min(source_grid.width - 1, x1)
+    y0, y1 = max(0, y0), min(source_grid.height - 1, y1)
+    if x0 > x1 or y0 > y1:
+        return False
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            if source_grid.value((x, y)) < occupied_threshold:
+                continue
+            cell_x0 = source_grid.origin_x + x * resolution
+            cell_y0 = source_grid.origin_y + y * resolution
+            box = (
+                cell_x0,
+                cell_x0 + resolution,
+                cell_y0,
+                cell_y0 + resolution,
+            )
+            if _segment_box_distance(start, end, box) + 1.0e-9 < required_clearance:
+                return False
+    return True
+
+
+def grid_lethal_radius(required_clearance, resolution):
+    """Centre-distance inflation that protects a cell-edge clearance."""
+    if required_clearance < 0.0 or resolution <= 0.0:
+        raise ValueError("clearance must be non-negative and resolution positive")
+    return required_clearance + resolution / math.sqrt(2.0)
+
+
+def simplify_path(
+    grid,
+    cells,
+    *,
+    preserve_cost=False,
+    source_grid=None,
+    required_clearance=None,
+    occupied_threshold=65,
+):
+    """Greedily simplify a path without weakening its obstacle clearance.
+
+    ``preserve_cost`` prevents a shortcut from touching a higher inflation cost
+    than the A* edges it replaces. Supplying ``source_grid`` and
+    ``required_clearance`` additionally checks the continuous world-frame
+    segment against occupied cell edges. An empty tuple means even an adjacent
+    A* edge failed the requested continuous clearance.
+    """
     if len(cells) <= 2:
-        return tuple(cells)
+        result = tuple(cells)
+        if (
+            len(result) == 2
+            and source_grid is not None
+            and required_clearance is not None
+            and not segment_has_clearance(
+                source_grid,
+                grid.cell_center(result[0]),
+                grid.cell_center(result[1]),
+                required_clearance,
+                occupied_threshold=occupied_threshold,
+            )
+        ):
+            return ()
+        return result
+    edge_costs = tuple(
+        line_max_cost(grid, first, second)
+        for first, second in zip(cells, cells[1:])
+    )
     simplified = [cells[0]]
     anchor = 0
     while anchor < len(cells) - 1:
         candidate = len(cells) - 1
-        while candidate > anchor + 1 and not line_is_clear(grid, cells[anchor], cells[candidate]):
+        accepted = None
+        while candidate > anchor:
+            shortcut_cost = line_max_cost(grid, cells[anchor], cells[candidate])
+            valid = shortcut_cost < LETHAL
+            if valid and preserve_cost:
+                valid = shortcut_cost <= max(edge_costs[anchor:candidate])
+            if valid and source_grid is not None and required_clearance is not None:
+                valid = segment_has_clearance(
+                    source_grid,
+                    grid.cell_center(cells[anchor]),
+                    grid.cell_center(cells[candidate]),
+                    required_clearance,
+                    occupied_threshold=occupied_threshold,
+                )
+            if valid:
+                accepted = candidate
+                break
             candidate -= 1
-        simplified.append(cells[candidate])
-        anchor = candidate
+        if accepted is None:
+            return ()
+        simplified.append(cells[accepted])
+        anchor = accepted
     return tuple(simplified)
 
 
 def path_length(points):
     return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:]))
+
+
+def path_projection(points, point):
+    """Where `point` sits relative to a polyline: how far off it, how far left.
+
+    `remaining` is measured from the projection to the end of the path, so it is
+    comparable with a fresh candidate's total length. Returns None for a path
+    too short to project onto.
+    """
+    if not points:
+        return None
+    px, py = float(point[0]), float(point[1])
+    if len(points) == 1:
+        return PathProjection(math.dist((px, py), points[0]), 0.0)
+    best = None
+    travelled = 0.0
+    for start, end in zip(points, points[1:]):
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length = math.hypot(dx, dy)
+        if length <= 0.0:
+            continue
+        fraction = max(0.0, min(1.0, ((px - start[0]) * dx + (py - start[1]) * dy) / (length * length)))
+        projected = (start[0] + fraction * dx, start[1] + fraction * dy)
+        distance = math.dist((px, py), projected)
+        if best is None or distance < best[0]:
+            best = (distance, travelled + fraction * length)
+        travelled += length
+    if best is None:
+        return None
+    return PathProjection(best[0], max(0.0, travelled - best[1]))
+
+
+def trim_path_to(points, point, margin):
+    """Advance a retained path's head onto the vehicle once it lags behind.
+
+    Retention keeps the follower's reference still, but the head stays where the
+    vehicle was when the path was accepted, and the follower refuses a path
+    whose first point is far from the vehicle (`PATH_START_MISMATCH`). Move the
+    head to the projection once it lags by more than `margin`. Everything ahead
+    of the projection is copied unchanged, so cross-track is continuous across
+    the trim, and an untrimmed path is returned identically so the follower's
+    fingerprint check treats it as the same path.
+    """
+    if len(points) < 2 or math.dist(point, points[0]) <= margin:
+        return tuple(points)
+    px, py = float(point[0]), float(point[1])
+    best = None
+    for index, (start, end) in enumerate(zip(points, points[1:])):
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0.0:
+            continue
+        fraction = max(0.0, min(1.0, ((px - start[0]) * dx + (py - start[1]) * dy) / length_sq))
+        projected = (start[0] + fraction * dx, start[1] + fraction * dy)
+        distance = math.dist((px, py), projected)
+        if best is None or distance < best[0]:
+            best = (distance, index, fraction, projected)
+    if best is None:
+        return tuple(points)
+    _, index, fraction, projected = best
+    if index == 0 and fraction <= 0.0:
+        # Lateral offset from the head, not progress along the path. Trimming
+        # would only restate the same path under a new fingerprint.
+        return tuple(points)
+    trimmed = (projected,) + tuple(points[index + 1:])
+    if len(trimmed) < 2:
+        trimmed = (projected, tuple(points)[-1])
+    return trimmed
+
+
+def should_replace_path(projection, candidate_length, *, retain_tolerance, switch_improvement):
+    """Decide whether a fresh candidate should displace the accepted path.
+
+    Advancing along the accepted path is not a reason to rebuild it. Replacing
+    it every time the vehicle crossed a cell boundary made the follower's
+    reference move ~0.06 m per replan, which on a 0.05 m grid at route speed
+    meant a new path roughly every planner tick. Replace only when the vehicle
+    has genuinely left the corridor, or when the candidate is materially
+    shorter than what is actually left of the accepted path.
+    """
+    if projection is None:
+        return True
+    if projection.distance > retain_tolerance:
+        return True
+    return candidate_length < projection.remaining * (1.0 - switch_improvement)

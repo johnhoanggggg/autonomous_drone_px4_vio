@@ -28,6 +28,7 @@ from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from px4_vio_bridge.log_paths import timestamped_bag
 
 
 STORAGE_PRESET = "fastwrite"
@@ -54,8 +55,7 @@ def write_run_marker(context, *args, **kwargs):
 
 
 def generate_launch_description():
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    default_bag = str(Path.cwd() / "flight_logs" / f"offboard_global_{stamp}")
+    default_bag = timestamped_bag("offboard_global")
     arguments = [
         DeclareLaunchArgument("auto_arm", default_value="false"),
         DeclareLaunchArgument("hover_height", default_value="0.40"),
@@ -79,7 +79,7 @@ def generate_launch_description():
         DeclareLaunchArgument("yaw_follows_heading", default_value="true"),
         DeclareLaunchArgument("yaw_rate_deg", default_value="20.0"),
         DeclareLaunchArgument("yaw_track_min_displacement", default_value="0.15"),
-        DeclareLaunchArgument("yaw_track_deadband_deg", default_value="8.0"),
+        DeclareLaunchArgument("yaw_track_deadband_deg", default_value="15.0"),
         DeclareLaunchArgument("yaw_align_error_deg", default_value="40.0"),
         DeclareLaunchArgument("yaw_resume_error_deg", default_value="15.0"),
         DeclareLaunchArgument("tracking_loss_land", default_value="true"),

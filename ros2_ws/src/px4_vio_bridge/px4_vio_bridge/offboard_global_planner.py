@@ -62,7 +62,7 @@ class OffboardGlobalPlanner(OffboardHover):
         # yaw_rate_deg, so these only choose WHICH heading is commanded.
         self.declare_parameter("yaw_follows_heading", True)
         self.declare_parameter("yaw_track_min_displacement", 0.15)
-        self.declare_parameter("yaw_track_deadband_deg", 8.0)
+        self.declare_parameter("yaw_track_deadband_deg", 15.0)
         # Translation pauses above yaw_align_error_deg and resumes below
         # yaw_resume_error_deg, so a leg is flown forward rather than sideways.
         # yaw_align_error_deg <= 0 turns and translates simultaneously instead.

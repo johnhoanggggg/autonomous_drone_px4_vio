@@ -15,6 +15,7 @@ from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from px4_vio_bridge.log_paths import timestamped_bag
 
 
 def typed(name, value_type):
@@ -62,6 +63,8 @@ def generate_launch_description():
         DeclareLaunchArgument("route_follower", default_value="true"),
         DeclareLaunchArgument("follower_rate_hz", default_value="10.0"),
         DeclareLaunchArgument("lookahead", default_value="0.60"),
+        DeclareLaunchArgument("lookahead_step", default_value="0.05"),
+        DeclareLaunchArgument("min_lookahead", default_value="0.05"),
         DeclareLaunchArgument("max_carrot_speed", default_value="0.25"),
         DeclareLaunchArgument("max_carrot_acceleration", default_value="0.50"),
         DeclareLaunchArgument("max_cross_track", default_value="0.60"),
@@ -71,8 +74,11 @@ def generate_launch_description():
         DeclareLaunchArgument("correction_timeout", default_value="1.0"),
         DeclareLaunchArgument("max_correction_m", default_value="0.50"),
         DeclareLaunchArgument("max_correction_yaw_deg", default_value="15.0"),
+        DeclareLaunchArgument("switch_improvement", default_value="0.10"),
+        DeclareLaunchArgument("path_retain_tolerance", default_value="0.35"),
+        DeclareLaunchArgument("path_head_margin", default_value="0.50"),
         DeclareLaunchArgument("record_bag", default_value="false"),
-        DeclareLaunchArgument("bag_output", default_value="flight_logs/global_planner_monitor"),
+        DeclareLaunchArgument("bag_output", default_value=timestamped_bag("global_planner_monitor")),
     ]
     simulator = Node(
         package="px4_vio_bridge",
@@ -99,6 +105,9 @@ def generate_launch_description():
             "start_recovery_radius": typed("start_recovery_radius", float),
             "heuristic_weight": typed("heuristic_weight", float),
             "planning_timeout_ms": typed("planning_timeout_ms", float),
+            "switch_improvement": typed("switch_improvement", float),
+            "path_retain_tolerance": typed("path_retain_tolerance", float),
+            "path_head_margin": typed("path_head_margin", float),
         }],
     )
     follower = Node(
@@ -110,7 +119,13 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("route_follower")),
         parameters=[{
             "rate_hz": typed("follower_rate_hz", float),
+            "map_timeout": typed("map_timeout", float),
+            "occupied_threshold": typed("occupied_threshold", int),
+            "robot_radius": typed("robot_radius", float),
+            "safety_margin": typed("safety_margin", float),
             "lookahead": typed("lookahead", float),
+            "lookahead_step": typed("lookahead_step", float),
+            "min_lookahead": typed("min_lookahead", float),
             "max_carrot_speed": typed("max_carrot_speed", float),
             "max_carrot_acceleration": typed("max_carrot_acceleration", float),
             "max_cross_track": typed("max_cross_track", float),
