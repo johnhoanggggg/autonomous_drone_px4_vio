@@ -61,8 +61,23 @@ def generate_launch_description():
         DeclareLaunchArgument("hover_height", default_value="0.40"),
         DeclareLaunchArgument("climb_timeout", default_value="15.0"),
         DeclareLaunchArgument("max_flight_time", default_value="45.0"),
-        DeclareLaunchArgument("command_speed", default_value="0.15"),
+        DeclareLaunchArgument("command_speed", default_value="0.10"),
         DeclareLaunchArgument("command_acceleration", default_value="0.30"),
+        DeclareLaunchArgument(
+            "path_command_projection_tolerance", default_value="0.05"
+        ),
+        DeclareLaunchArgument(
+            "path_command_entry_tolerance", default_value="0.30"
+        ),
+        DeclareLaunchArgument(
+            "path_command_connector_tolerance", default_value="0.20"
+        ),
+        DeclareLaunchArgument(
+            "path_command_suffix_tolerance", default_value="0.01"
+        ),
+        DeclareLaunchArgument("path_corner_tolerance", default_value="0.05"),
+        DeclareLaunchArgument("route_command_grace", default_value="2.0"),
+        DeclareLaunchArgument("replan_during_yaw_align", default_value="false"),
         DeclareLaunchArgument("geofence_radius", default_value="1.0"),
         DeclareLaunchArgument("planner_fault_land_time", default_value="3.0"),
         DeclareLaunchArgument("goal_hold_time", default_value="3.0"),
@@ -105,6 +120,21 @@ def generate_launch_description():
             "max_flight_time": typed("max_flight_time", float),
             "command_speed": typed("command_speed", float),
             "command_acceleration": typed("command_acceleration", float),
+            "path_command_projection_tolerance": typed(
+                "path_command_projection_tolerance", float
+            ),
+            "path_command_entry_tolerance": typed(
+                "path_command_entry_tolerance", float
+            ),
+            "path_command_connector_tolerance": typed(
+                "path_command_connector_tolerance", float
+            ),
+            "path_command_suffix_tolerance": typed(
+                "path_command_suffix_tolerance", float
+            ),
+            "path_corner_tolerance": typed("path_corner_tolerance", float),
+            "route_command_grace": typed("route_command_grace", float),
+            "replan_during_yaw_align": typed("replan_during_yaw_align", bool),
             "geofence_radius": typed("geofence_radius", float),
             "planner_fault_land_time": typed("planner_fault_land_time", float),
             "goal_hold_time": typed("goal_hold_time", float),

@@ -626,7 +626,7 @@ Live observation requires the map output to be explicitly enabled:
 ```bash
 ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py \
   slam_publish_grid:=true slam_grid_3d:=false \
-  slam_grid_ray_tracing:=true slam_grid_footprint_radius:=0.40
+  slam_grid_ray_tracing:=true slam_grid_footprint_radius:=0.25
 ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge global_planner_monitor.launch.py
 ```
 
@@ -639,9 +639,11 @@ structured `/planner/follower/valid` boolean. Its
 `/planner/follower/displacement` is the smoothed position displacement in the
 corrected `world` frame. `/planner/follower/vio_displacement` rotates that
 vector back into continuous VIO axes. The separately launched
-`offboard_global_planner` adapter can apply the latter relative to PX4's current
-local position; it defaults `auto_arm=false` and must pass a real-PX4 props-off
-run before first use. Neither displacement topic is a velocity command.
+`offboard_global_planner` adapter applies the latter relative to PX4's current
+local position. Its final command advances along `/planner/path` (with a
+0.05 m bounded rejoin band after a replan), and the exact post-limiter segment
+is checked against `/rtabmap/grid` before publication. It defaults
+`auto_arm=false`. Neither displacement topic is a velocity command.
 
 A cross-track violation is latched: the follower freezes its relative carrot
 and remains invalid until it receives a newer path and cross-track stays below
@@ -649,19 +651,20 @@ and remains invalid until it receives a newer path and cross-track stays below
 `cross_track_recovery_time` (default 1.0 s). Samples merely dipping below
 `max_cross_track` cannot restart flight or reset the adapter's LAND timer.
 
-Props-off attempt 1 remained disarmed and validated OFFBOARD entry, fixed yaw,
-position-only fields, the 0.15 m/s speed cap, geofence and data health. It also
-found a target-arrival snap that bypassed the 0.30 m/s^2 limiter near noisy
-rebased targets. The snap has been removed and regression-tested. A second
-props-off bag with an exact known-free goal and a deliberate planner-loss HOLD
-is still required before `auto_arm=true`; see `HANDOFF_GLOBAL_PLANNER.md`.
+The follower and final PX4 command now both default to 0.10 m/s and 0.30 m/s².
+The measured caged-airframe radius and current safety margin default to
+0.25 + 0.05 = 0.30 m. The flight adapter refuses flight if the follower's
+advertised speed differs from its final-command speed. After changing this
+command boundary, perform another props-off run with an exact known-free goal
+and a deliberate planner-loss HOLD before the next armed flight; see
+`HANDOFF_GLOBAL_PLANNER.md`.
 
 The click expresses the requested destination and is accepted even if it lies
 in unknown space, outside the current map, or on an obstacle. Unknown and
 lethal cells remain blocked. For unknown/outside/disconnected requests the
 planner reports `EXPLORING` and flies only to the closest reachable known-safe
 frontier, updating that endpoint as the map expands. For obstacle clicks it
-reports `SAFE_APPROACH` and stops outside the 0.40 m lethal envelope. The
+reports `SAFE_APPROACH` and stops outside the 0.30 m lethal envelope. The
 orange `/planner/effective_goal` marker shows where the current route actually
 ends; the white marker remains the requested goal. A temporary exploration
 frontier is not reported as final arrival, so the PX4 adapter holds and waits

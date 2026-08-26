@@ -1,7 +1,8 @@
 # Global A* Planner — Experimental Handoff
 
-Global planning and position-only PX4 adapter work. Nothing here has been
-armed. Last updated: 2026-08-06.
+Global planning and the position-only PX4 adapter have flown. The 2026-08-26
+bags exposed a final-command chord/bias that is now fixed in code. Last updated:
+2026-08-26.
 
 ## Status
 
@@ -136,11 +137,10 @@ and the combined Foxglove whitelist were extended for the new topics.
 - Diagonals cannot cut between occupied corners.
 - Unknown and lethal cells are forbidden.
 - Occupied threshold: 65/100.
-- Lethal radius: `robot_radius + safety_margin = 0.30 + 0.10 = 0.40 m`.
-- The 0.40 m value is the centre-to-obstacle envelope, not 0.40 m of empty
-  padding: it represents an assumed 0.30 m centre-to-prop-tip radius plus only
-  0.10 m clearance. Do not reduce the total envelope to 0.10 m unless the
-  physical vehicle radius is first measured and proven much smaller.
+- Lethal radius: `robot_radius + safety_margin = 0.25 + 0.05 = 0.30 m`.
+- The 0.30 m value is the centre-to-obstacle envelope, not 0.30 m of empty
+  padding: it represents the measured 0.25 m caged-airframe radius plus 0.05 m
+  clearance. Re-measure before reducing either value.
 - Additional graded inflation: 0.20 m, used as search cost rather than a hard block.
 - Cost-aware route search prefers clearance over grazing inflated obstacles.
 - 100 ms planning deadline and 2 Hz observation loop.
@@ -192,7 +192,7 @@ All remain opt-in and do not change the normal flight-stack defaults.
 ```bash
 ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py \
   slam_publish_grid:=true slam_grid_3d:=false \
-  slam_grid_ray_tracing:=true slam_grid_footprint_radius:=0.40
+  slam_grid_ray_tracing:=true slam_grid_footprint_radius:=0.25
 
 ROS_DOMAIN_ID=42 ros2 launch px4_vio_bridge global_planner_monitor.launch.py
 ```
@@ -244,9 +244,21 @@ This remains global planning, not dynamic collision avoidance. The
 `offboard_global_planner` adapter now supplies the PX4 position setpoint,
 stale-data HOLD/LAND behavior, strict 0.25 m / 5 degree correction gate,
 one-metre takeoff-centred geofence, PX4-reset rebasing,
-and independent 0.15 m/s / 0.30 m/s² launch-default limiter. It does not add a
+and a path-constrained 0.10 m/s / 0.30 m/s² launch-default limiter. It does not add a
 fresh local obstacle layer, so any eventual flight is limited to a controlled
 static room.
+
+The final limiter consumes `/planner/path` directly. Normal commands use scalar
+arc-length progress, stop at a polyline vertex, and wait there until the vehicle
+is within `path_corner_tolerance=0.05 m` before changing direction. This keeps
+the controller from seeing a diagonal chord while the aircraft still trails
+the bend. A replacement route may rejoin through
+at most the configured 0.05 m band; a larger discontinuity is rejected. After
+that limiting step, the adapter re-runs continuous raw-map clearance from the
+current map pose to the exact final command. A failed check latches the existing
+stationary HOLD and LAND timer before the point can be published. The adapter
+also consumes the follower's latched configuration and refuses flight when its
+maximum carrot speed differs from the final 0.10 m/s speed.
 
 Battery authority is intentionally not duplicated in the adapter: the ROS
 `/battery/*` topics are telemetry only, while PX4 owns battery arming checks and
@@ -299,6 +311,15 @@ must contain position-only trajectory setpoints, no arm command, continuous
 bounded NED setpoint motion, healthy VIO/estimator inputs, and correct
 HOLD behavior if follower validity is deliberately removed. Only after that
 gate passes should the same launch be considered with `auto_arm:=true`.
+
+For the post-2026-08-26 regression flight, additionally require:
+
+1. `/planner/flight/status` reports `command_speed<=0.10m/s` and normally
+   `path_offset=0.000m` (up to 0.05 m only during a bounded rejoin).
+2. The final `/fmu/in/trajectory_setpoint` projected into the map stays on that
+   route band at every bend; there must be no old free-space chord.
+3. Stop the planner while moving and confirm immediate stationary HOLD, then
+   restore it and confirm the command restarts from actual pose without a jump.
 
 ### Props-off attempt 1 and required repeat
 
@@ -406,7 +427,7 @@ limits. A later flight-capable adapter must apply `/planner/follower/displacemen
 from PX4's current local position after ENU-to-NED conversion. It must never
 send `/planner/follower/carrot` as an absolute PX4 coordinate.
 
-Defaults are a 0.60 m lookahead, 0.25 m/s maximum carrot motion, 0.50 m/s²
+Defaults are a 0.60 m lookahead, 0.10 m/s maximum carrot motion, 0.30 m/s²
 maximum carrot acceleration, 0.60 m maximum cross-track error, and 0.12 m
 arrival tolerance. The cross-track latch resumes below 0.05 m only after 1.0 s
 of continuously healthy input; a new requested goal explicitly clears the old

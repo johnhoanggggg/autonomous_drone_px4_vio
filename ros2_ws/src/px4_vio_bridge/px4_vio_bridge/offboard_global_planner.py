@@ -1,10 +1,10 @@
 """Position-only PX4 adapter for the validated global-planner follower.
 
-This node never consumes an absolute SLAM-world carrot. It rebases the
-follower's continuous-VIO-frame displacement from PX4's current local position,
-then applies an independent speed/acceleration limiter before publishing a NED
-position setpoint. Invalid planner data latches a stationary HOLD; persistent
-faults request AUTO.LAND.
+This node rebases the follower's continuous-VIO-frame displacement from PX4's
+current local position, advances the final command along the accepted map-frame
+polyline, and validates that exact output against the raw occupancy map before
+publishing a NED position setpoint. Invalid planner data latches a stationary
+HOLD; persistent faults request AUTO.LAND.
 
 The published yaw tracks the heading of that same commanded displacement, so
 the airframe (and the forward-facing camera the VIO depends on) points along
@@ -12,23 +12,29 @@ the route. Translation pauses while a turn larger than yaw_align_error_deg
 slews in, and the tracked heading is dropped whenever PX4 resets its own.
 """
 
+import json
 import math
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from nav_msgs.msg import OccupancyGrid, Path
 from px4_msgs.msg import TrajectorySetpoint
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
+from px4_vio_bridge.grid_planner import GridMap, segment_has_clearance
 from px4_vio_bridge.offboard_hover import OffboardHover, wrap_pi
 from px4_vio_bridge.path_follower import (
     correction_rejection_reason,
+    map_displacement_to_vio,
     yaw_from_quaternion,
 )
 from px4_vio_bridge.planner_flight import (
     HorizontalCommandLimiter,
-    clamp_to_disc,
+    PathCommandLimiter,
     ned_track_heading,
     track_yaw_target,
+    vio_displacement_to_map,
     vio_enu_displacement_to_ned,
 )
 
@@ -45,15 +51,30 @@ class OffboardGlobalPlanner(OffboardHover):
             "follower_goal_topic", "/planner/follower/goal_reached"
         )
         self.declare_parameter("correction_topic", "/rtabmap/odom_correction")
+        self.declare_parameter("path_topic", "/planner/path")
+        self.declare_parameter("map_topic", "/rtabmap/grid")
+        self.declare_parameter("map_pose_topic", "/rtabmap/pose")
+        self.declare_parameter("follower_config_topic", "/planner/follower/config")
+        self.declare_parameter("frame_id", "world")
         self.declare_parameter("follower_timeout", 0.30)
         self.declare_parameter("correction_timeout", 1.0)
+        self.declare_parameter("path_timeout", 3.0)
+        self.declare_parameter("map_timeout", 3.0)
+        self.declare_parameter("map_pose_timeout", 1.0)
         self.declare_parameter("planner_fault_land_time", 3.0)
         self.declare_parameter("goal_hold_time", 3.0)
         self.declare_parameter("max_follower_displacement", 1.0)
         self.declare_parameter("max_correction_m", 0.25)
         self.declare_parameter("max_correction_yaw_deg", 5.0)
-        self.declare_parameter("command_speed", 0.20)
-        self.declare_parameter("command_acceleration", 0.40)
+        self.declare_parameter("command_speed", 0.10)
+        self.declare_parameter("command_acceleration", 0.30)
+        self.declare_parameter("path_command_projection_tolerance", 0.05)
+        self.declare_parameter("path_command_entry_tolerance", 0.30)
+        self.declare_parameter("path_command_connector_tolerance", 0.20)
+        self.declare_parameter("path_command_suffix_tolerance", 0.01)
+        self.declare_parameter("path_corner_tolerance", 0.05)
+        self.declare_parameter("route_command_grace", 2.0)
+        self.declare_parameter("replan_during_yaw_align", False)
         self.declare_parameter("geofence_radius", 1.0)
         self.declare_parameter("geofence_tolerance", 0.15)
         self.declare_parameter("transit_horizontal_error", 0.60)
@@ -73,6 +94,12 @@ class OffboardGlobalPlanner(OffboardHover):
         self.correction_timeout = float(
             self.get_parameter("correction_timeout").value
         )
+        self.path_timeout = float(self.get_parameter("path_timeout").value)
+        self.map_timeout = float(self.get_parameter("map_timeout").value)
+        self.map_pose_timeout = float(
+            self.get_parameter("map_pose_timeout").value
+        )
+        self.frame_id = str(self.get_parameter("frame_id").value)
         self.planner_fault_land_time = float(
             self.get_parameter("planner_fault_land_time").value
         )
@@ -117,6 +144,31 @@ class OffboardGlobalPlanner(OffboardHover):
                 self.get_parameter("command_acceleration").value
             ),
         )
+        self.route_limiter = PathCommandLimiter(
+            max_speed=self.limiter.max_speed,
+            max_acceleration=self.limiter.max_acceleration,
+            max_projection_error=float(
+                self.get_parameter("path_command_projection_tolerance").value
+            ),
+            corner_tolerance=float(
+                self.get_parameter("path_corner_tolerance").value
+            ),
+            max_entry_error=float(
+                self.get_parameter("path_command_entry_tolerance").value
+            ),
+            max_connector_error=float(
+                self.get_parameter("path_command_connector_tolerance").value
+            ),
+            suffix_tolerance=float(
+                self.get_parameter("path_command_suffix_tolerance").value
+            ),
+        )
+        self.route_command_grace = float(
+            self.get_parameter("route_command_grace").value
+        )
+        self.replan_during_yaw_align = bool(
+            self.get_parameter("replan_during_yaw_align").value
+        )
 
         self.follower_valid = False
         self.follower_valid_received = None
@@ -127,8 +179,22 @@ class OffboardGlobalPlanner(OffboardHover):
         self.correction_valid = False
         self.correction_reason = "not received"
         self.correction_received = None
+        self.correction = None
+        self.path_points = None
+        self.path_received = None
+        self.grid = None
+        self.map_received = None
+        self.map_pose = None
+        self.map_pose_received = None
+        self.follower_config_received = None
+        self.follower_required_clearance = None
+        self.follower_occupied_threshold = None
+        self.follower_command_speed = None
+        self.follower_config_reason = "not received"
         self.planner_fault_since = None
         self.planner_fault_reason_text = ""
+        self.route_command_stall_since = None
+        self.route_command_holding = False
         self.goal_since = None
         self.yaw_target = None      # latched NED heading of the current leg
         self.yaw_holding = False    # translation paused while turning onto it
@@ -147,6 +213,12 @@ class OffboardGlobalPlanner(OffboardHover):
         )
         self.follower_goal_topic = str(
             self.get_parameter("follower_goal_topic").value
+        )
+        self.path_topic = str(self.get_parameter("path_topic").value)
+        self.map_topic = str(self.get_parameter("map_topic").value)
+        self.map_pose_topic = str(self.get_parameter("map_pose_topic").value)
+        self.follower_config_topic = str(
+            self.get_parameter("follower_config_topic").value
         )
         self.create_subscription(
             Vector3Stamped,
@@ -171,6 +243,18 @@ class OffboardGlobalPlanner(OffboardHover):
             str(self.get_parameter("correction_topic").value),
             self.on_correction,
             10,
+        )
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, map_qos)
+        self.create_subscription(Path, self.path_topic, self.on_path, 10)
+        self.create_subscription(PoseStamped, self.map_pose_topic, self.on_map_pose, 10)
+        self.create_subscription(
+            String, self.follower_config_topic, self.on_follower_config, map_qos
         )
         self.route_status_pub = self.create_publisher(
             String, "/planner/flight/status", 10
@@ -234,6 +318,80 @@ class OffboardGlobalPlanner(OffboardHover):
             self.vio_displacement = vector
         self.displacement_received = now
 
+    def on_follower_config(self, msg):
+        self.follower_config_received = self.monotonic_time()
+        try:
+            config = json.loads(msg.data)
+            if config.get("frame_id") != self.frame_id:
+                raise ValueError(
+                    f"frame_id {config.get('frame_id')!r} != {self.frame_id!r}"
+                )
+            radius = float(config["robot_radius"])
+            margin = float(config["safety_margin"])
+            threshold = int(config["occupied_threshold"])
+            speed = float(config["max_carrot_speed"])
+            if not all(math.isfinite(value) for value in (radius, margin, speed)):
+                raise ValueError("clearance and speed values must be finite")
+            if radius < 0.0 or margin < 0.0 or radius + margin <= 0.0:
+                raise ValueError("robot_radius + safety_margin must be positive")
+            if not 0 <= threshold <= 100 or speed <= 0.0:
+                raise ValueError("occupied threshold or speed is invalid")
+            self.follower_required_clearance = radius + margin
+            self.follower_occupied_threshold = threshold
+            self.follower_command_speed = speed
+            self.follower_config_reason = ""
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.follower_required_clearance = None
+            self.follower_occupied_threshold = None
+            self.follower_command_speed = None
+            self.follower_config_reason = str(exc)
+
+    def on_path(self, msg):
+        if msg.header.frame_id != self.frame_id:
+            return
+        points = tuple(
+            (float(pose.pose.position.x), float(pose.pose.position.y))
+            for pose in msg.poses
+        )
+        if points and all(math.isfinite(value) for point in points for value in point):
+            self.path_points = points
+            self.path_received = self.monotonic_time()
+
+    def on_map_pose(self, msg):
+        if msg.header.frame_id != self.frame_id:
+            return
+        point = float(msg.pose.position.x), float(msg.pose.position.y)
+        if all(math.isfinite(value) for value in point):
+            self.map_pose = point
+            self.map_pose_received = self.monotonic_time()
+
+    def on_map(self, msg):
+        if msg.header.frame_id != self.frame_id:
+            return
+        q = msg.info.origin.orientation
+        if (
+            abs(q.x) > 1.0e-6
+            or abs(q.y) > 1.0e-6
+            or abs(q.z) > 1.0e-6
+            or abs(q.w - 1.0) > 1.0e-6
+        ):
+            return
+        try:
+            values = tuple(int(value) for value in msg.data)
+            if any(value < -1 or value > 100 for value in values):
+                raise ValueError("values must be -1 or 0..100")
+            self.grid = GridMap(
+                int(msg.info.width),
+                int(msg.info.height),
+                float(msg.info.resolution),
+                float(msg.info.origin.position.x),
+                float(msg.info.origin.position.y),
+                values,
+            )
+        except ValueError:
+            return
+        self.map_received = self.monotonic_time()
+
     def on_correction(self, msg):
         now = self.monotonic_time()
         position = msg.pose.position
@@ -256,6 +414,7 @@ class OffboardGlobalPlanner(OffboardHover):
         )
         self.correction_valid = reason is None
         self.correction_reason = reason or ""
+        self.correction = correction if reason is None else None
         self.correction_received = now
 
     def on_local_position(self, msg):
@@ -268,6 +427,7 @@ class OffboardGlobalPlanner(OffboardHover):
             now = self.monotonic_time()
             if self.x0 is not None and math.isfinite(msg.x) and math.isfinite(msg.y):
                 self.limiter.reset((float(msg.x), float(msg.y)))
+                self.route_limiter.clear()
                 self.holding_for_fault = True
                 self.require_follower_after = now
                 self.planner_fault_since = now
@@ -295,6 +455,7 @@ class OffboardGlobalPlanner(OffboardHover):
             ("/planner/status", "global planner status"),
             ("/planner/path", "global planner path"),
             ("/planner/inflated_map", "global planner costmap"),
+            (self.follower_config_topic, "follower configuration"),
             (self.follower_valid_topic, "follower validity"),
             (self.follower_displacement_topic, "follower displacement"),
             (self.follower_goal_topic, "follower goal state"),
@@ -323,6 +484,24 @@ class OffboardGlobalPlanner(OffboardHover):
                 return f"{label} stale for >{self.follower_timeout:.2f}s"
         if self.vio_displacement is None:
             return "VIO displacement is invalid"
+        if self.follower_config_received is None:
+            return "follower configuration not received"
+        if self.follower_config_reason:
+            return f"follower configuration rejected: {self.follower_config_reason}"
+        if abs(self.follower_command_speed - self.limiter.max_speed) > 1.0e-6:
+            return (
+                f"follower speed {self.follower_command_speed:.2f}m/s does not match "
+                f"final command speed {self.limiter.max_speed:.2f}m/s"
+            )
+        for received, timeout, label in (
+            (self.path_received, self.path_timeout, "path"),
+            (self.map_received, self.map_timeout, "raw map"),
+            (self.map_pose_received, self.map_pose_timeout, "map pose"),
+        ):
+            if received is None or now - received > timeout:
+                return f"{label} stale for >{timeout:.2f}s"
+        if self.path_points is None or self.grid is None or self.map_pose is None:
+            return "path-clearance validation inputs are invalid"
         if self.displacement_received <= self.require_follower_after:
             return "waiting for follower data after PX4 local reset"
         if (
@@ -332,6 +511,8 @@ class OffboardGlobalPlanner(OffboardHover):
             return f"native correction stale for >{self.correction_timeout:.2f}s"
         if not self.correction_valid:
             return f"native correction rejected: {self.correction_reason}"
+        if self.correction is None:
+            return "native correction is invalid"
         return None
 
     def preflight_reason(self):
@@ -398,6 +579,9 @@ class OffboardGlobalPlanner(OffboardHover):
             if self.pos is not None and math.isfinite(self.pos.x) and math.isfinite(self.pos.y):
                 self.limiter.reset((float(self.pos.x), float(self.pos.y)))
             self.holding_for_fault = True
+        # Never let an unvalidated route command advance internally while the
+        # published command is holding. A recovery restarts from actual pose.
+        self.route_limiter.clear()
         if self.planner_fault_since is None:
             self.planner_fault_since = now
         self.planner_fault_reason_text = reason
@@ -414,6 +598,30 @@ class OffboardGlobalPlanner(OffboardHover):
         self.planner_fault_since = None
         self.planner_fault_reason_text = ""
         self.holding_for_fault = False
+
+    def hold_route_command(self, reason):
+        """Hold the published command through a transient route-command reject.
+
+        The accepted path stays installed and the last cleared setpoint stays on
+        the wire, so ordinary replanning jitter cannot start the land timer.
+        Only a stall that outlives the grace window becomes a flight fault.
+        """
+        now = self.monotonic_time()
+        if self.route_command_stall_since is None:
+            self.route_command_stall_since = now
+        elapsed = now - self.route_command_stall_since
+        if elapsed >= self.route_command_grace:
+            return f"route command stalled {elapsed:.1f}s: {reason}"
+        self.route_command_holding = True
+        self.publish_route_status(
+            f"COMMAND_HOLD {reason}; fault in "
+            f"{max(0.0, self.route_command_grace - elapsed):.1f}s",
+            "COMMAND_HOLD",
+        )
+        return None
+
+    def clear_route_command_stall(self):
+        self.route_command_stall_since = None
 
     # --- heading tracking --------------------------------------------------
     def route_yaw(self):
@@ -456,21 +664,101 @@ class OffboardGlobalPlanner(OffboardHover):
         if self.yaw_track and self.yaw_cmd is not None:
             self.yaw_target = float(self.yaw_cmd)
 
+    def map_segment_has_clearance(self, start, end):
+        """Occupancy test for a map-frame segment, at the follower's clearance."""
+        return segment_has_clearance(
+            self.grid,
+            start,
+            end,
+            self.follower_required_clearance,
+            occupied_threshold=self.follower_occupied_threshold,
+        )
+
     def update_route_command(self):
+        """Return `(fault, deferral)` for this tick's final command.
+
+        `fault` is a flight fault and lands the aircraft on the usual timer.
+        `deferral` is a transient the accepted route survives: the installed
+        path and the last validated setpoint both stand, and the caller holds
+        the command instead of starting that timer.
+        """
         ned_displacement = vio_enu_displacement_to_ned(self.vio_displacement)
         self.update_yaw_target(ned_displacement)
-        if self.yaw_holding:
-            # Translating with a large heading error flies the vehicle sideways
-            # and points the camera off the path. Decelerate to a stop through
-            # the same limiter and let the yaw slew catch up first.
-            self.limiter.update(self.hold_point, self.dt)
-            return
-        target = (
-            float(self.pos.x) + ned_displacement[0],
-            float(self.pos.y) + ned_displacement[1],
+        deferral = None
+
+        # Replanning mid-slew is what generates unjoinable paths: translation is
+        # paused, the vehicle drifts as it pivots, and each republished route
+        # comes out shifted from the command that is standing still.  Keep the
+        # accepted path until the nose is back on the leg.
+        if self.yaw_holding and not self.replan_during_yaw_align:
+            if self.route_limiter.path is None:
+                return None, "waiting for yaw alignment before route entry"
+        else:
+            try:
+                self.route_limiter.set_path(
+                    self.path_points,
+                    self.map_pose,
+                    clearance_check=self.map_segment_has_clearance,
+                )
+            except (RuntimeError, ValueError) as exc:
+                # An unjoinable replacement is not a flight fault.  The accepted
+                # path is still installed and still validated, so keep flying it
+                # and retry when the planner republishes.
+                deferral = f"path replacement deferred: {exc}"
+
+        if self.route_limiter.path is None:
+            return None, deferral or "waiting for a joinable route path"
+
+        restore_point = self.route_limiter.snapshot()
+        try:
+            map_displacement = vio_displacement_to_map(
+                self.vio_displacement, self.correction[3]
+            )
+            desired_map = (
+                self.map_pose[0] + map_displacement[0],
+                self.map_pose[1] + map_displacement[1],
+            )
+            final_map = self.route_limiter.update(
+                desired_map,
+                self.dt,
+                advance=not self.yaw_holding,
+                reference_point=self.map_pose,
+            )
+        except (RuntimeError, ValueError) as exc:
+            self.route_limiter.restore(restore_point)
+            return None, f"path-constrained command rejected: {exc}"
+
+        # This is deliberately after every limiting/projection operation: the
+        # exact point and swept segment that PX4 will receive must be safe.
+        # Rewinding leaves last tick's cleared command on the wire.
+        if not self.map_segment_has_clearance(self.map_pose, final_map):
+            self.route_limiter.restore(restore_point)
+            return None, "post-limiter command has insufficient clearance"
+
+        final_map_displacement = (
+            final_map[0] - self.map_pose[0],
+            final_map[1] - self.map_pose[1],
         )
-        target = clamp_to_disc(target, (self.x0, self.y0), self.geofence_radius)
-        self.limiter.update(target, self.dt)
+        final_vio_displacement = map_displacement_to_vio(
+            final_map_displacement, self.correction[3]
+        )
+        final_ned_displacement = vio_enu_displacement_to_ned(final_vio_displacement)
+        final_ned = (
+            float(self.pos.x) + final_ned_displacement[0],
+            float(self.pos.y) + final_ned_displacement[1],
+        )
+        if math.dist(final_ned, (self.x0, self.y0)) > self.geofence_radius:
+            # The vehicle itself is still inside; holding the last command is the
+            # recovery.  An actual breach is caught by geofence_breached().
+            self.route_limiter.restore(restore_point)
+            return None, "path-constrained command lies outside flight geofence"
+
+        velocity_vio = map_displacement_to_vio(
+            self.route_limiter.velocity, self.correction[3]
+        )
+        velocity_ned = vio_enu_displacement_to_ned(velocity_vio)
+        self.limiter.adopt(final_ned, velocity_ned)
+        return None, deferral
 
     def geofence_breached(self):
         if self.pos is None or self.x0 is None:
@@ -490,14 +778,13 @@ class OffboardGlobalPlanner(OffboardHover):
             self.trigger_landing("vehicle crossed planner-flight geofence")
             return True
 
-        planner_reason = self.planner_health_reason()
-        fault = planner_reason
-        if fault is not None:
-            self.latch_fault_hold(fault)
-        else:
-            self.clear_planner_fault()
+        fault = self.planner_health_reason()
 
         if self.state == "CLIMB_HOLD":
+            if fault is not None:
+                self.latch_fault_hold(fault)
+            else:
+                self.clear_planner_fault()
             self.publish_setpoint(self.hover_height, self.yaw0)
             if fault is not None:
                 return True
@@ -521,13 +808,24 @@ class OffboardGlobalPlanner(OffboardHover):
                 self.set_state("ROUTE")
             return True
 
+        self.route_command_holding = False
         if fault is None:
-            self.update_route_command()
-        else:
+            command_fault, deferral = self.update_route_command()
+            if command_fault is not None:
+                fault = command_fault
+            elif deferral is not None:
+                fault = self.hold_route_command(deferral)
+            else:
+                self.clear_route_command_stall()
+        if fault is not None:
+            self.latch_fault_hold(fault)
             self.freeze_yaw_target()
+            self.clear_route_command_stall()
+        else:
+            self.clear_planner_fault()
         self.publish_setpoint(self.hover_height, self.route_yaw())
 
-        if self.goal_reached and fault is None:
+        if self.goal_reached and fault is None and not self.route_command_holding:
             if self.goal_since is None:
                 self.goal_since = self.monotonic_time()
             goal_elapsed = self.monotonic_time() - self.goal_since
@@ -539,7 +837,7 @@ class OffboardGlobalPlanner(OffboardHover):
                 self.trigger_landing("planner goal reached")
         else:
             self.goal_since = None
-            if fault is None:
+            if fault is None and not self.route_command_holding:
                 self.publish_route_status(self.route_status_text(), self.route_status_kind())
         return True
 
@@ -553,14 +851,33 @@ class OffboardGlobalPlanner(OffboardHover):
         return text
 
     def route_status_kind(self):
-        return "YAW_ALIGN" if self.yaw_holding else "ROUTE"
+        if self.yaw_holding:
+            return "YAW_ALIGN"
+        if self.route_limiter.waiting_vertex is not None:
+            return "CORNER_HOLD"
+        return "ROUTE"
 
     def route_status_text(self):
         if self.yaw_holding:
             return f"YAW_ALIGN translation paused while turning;{self.yaw_status_text()}"
+        if self.route_limiter.waiting_vertex is not None:
+            vertex = self.route_limiter.path.point_at(
+                self.route_limiter.waiting_vertex
+            )
+            return (
+                "CORNER_HOLD final command waiting for vehicle "
+                f"distance={math.dist(self.map_pose, vertex):.2f}m"
+                f"{self.yaw_status_text()}"
+            )
+        path_offset = math.nan
+        if self.route_limiter.path is not None and self.route_limiter.position is not None:
+            path_offset = self.route_limiter.path.project(
+                self.route_limiter.position
+            ).cross_track
         return (
             f"ROUTE valid displacement={math.hypot(*self.vio_displacement):.2f}m "
-            f"command_speed={math.hypot(*self.limiter.velocity):.2f}m/s"
+            f"command_speed={math.hypot(*self.limiter.velocity):.2f}m/s "
+            f"path_offset={path_offset:.3f}m"
             f"{self.yaw_status_text()}"
         )
 

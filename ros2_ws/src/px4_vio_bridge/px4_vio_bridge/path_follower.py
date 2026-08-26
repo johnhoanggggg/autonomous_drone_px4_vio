@@ -282,8 +282,8 @@ class PositionRouteFollower:
     def __init__(
         self,
         lookahead: float = 0.60,
-        max_carrot_speed: float = 0.25,
-        max_carrot_acceleration: float = 0.50,
+        max_carrot_speed: float = 0.10,
+        max_carrot_acceleration: float = 0.30,
         max_cross_track: float = 0.60,
         cross_track_resume: float = 0.05,
         cross_track_recovery_time: float = 1.0,
