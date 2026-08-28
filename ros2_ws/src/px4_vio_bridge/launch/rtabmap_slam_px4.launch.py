@@ -29,6 +29,7 @@ def generate_launch_description():
     xrce_verbosity = LaunchConfiguration("xrce_verbosity")
     oak_startup_delay = LaunchConfiguration("oak_startup_delay")
     px4_startup_delay = LaunchConfiguration("px4_startup_delay")
+    slam_fps = LaunchConfiguration("slam_fps")
     slam_publish_image = LaunchConfiguration("slam_publish_image")
     slam_publish_depth = LaunchConfiguration("slam_publish_depth")
     slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
@@ -82,6 +83,7 @@ def generate_launch_description():
             DeclareLaunchArgument("xrce_verbosity", default_value="4"),
             DeclareLaunchArgument("oak_startup_delay", default_value="5.0"),
             DeclareLaunchArgument("px4_startup_delay", default_value="0.0"),
+            DeclareLaunchArgument("slam_fps", default_value="20"),
             DeclareLaunchArgument("slam_publish_image", default_value="true"),
             DeclareLaunchArgument("slam_publish_depth", default_value="false"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
@@ -177,6 +179,7 @@ def generate_launch_description():
                                 # This launch owns the single combined Foxglove bridge below.
                                 launch_arguments={
                                     "foxglove": "false",
+                                    "slam_fps": slam_fps,
                                     "slam_publish_image": slam_publish_image,
                                     "slam_publish_depth": slam_publish_depth,
                                     "slam_depth_publish_hz": slam_depth_publish_hz,

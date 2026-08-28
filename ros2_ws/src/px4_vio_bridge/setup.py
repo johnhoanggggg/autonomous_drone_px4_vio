@@ -23,6 +23,7 @@ setup(
             "basalt_odometry_test = px4_vio_bridge.basalt_odometry_test:main",
             "offboard_hold_yaw = px4_vio_bridge.offboard_hold_yaw:main",
             "offboard_hover = px4_vio_bridge.offboard_hover:main",
+            "process_monitor = px4_vio_bridge.process_monitor:main",
             "px4_local_position_to_ros = px4_vio_bridge.px4_local_position_to_ros:main",
             "vio_to_px4_odometry = px4_vio_bridge.vio_to_px4_odometry:main",
         ],

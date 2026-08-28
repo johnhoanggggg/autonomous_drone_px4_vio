@@ -3,6 +3,7 @@ import argparse
 from collections import deque
 from datetime import timedelta
 import io
+import json
 import time
 import threading
 import numpy as np
@@ -15,7 +16,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import CameraInfo, PointCloud2, PointField, Image, CompressedImage
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 from tf2_ros import TransformBroadcaster
 
 from px4_vio_bridge.rtabmap_grid import make_occupancy_grid
@@ -151,6 +152,31 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.ground_pub = self.ros_node.create_publisher(PointCloud2, '/rtabmap/ground_cloud', 10)
         self.feature_count_pub = self.ros_node.create_publisher(
             Int32, '/rtabmap/vio_feature_count', 10)
+        # Latched settings snapshot, so a bag records WHAT WAS CONFIGURED and not
+        # only what was achieved. /rtabmap/vio_feature_count reports the features
+        # actually tracked; without this there is no record of the --num-features
+        # target, the grid resolution or the frame rate a flight was flown at, so
+        # runs cannot be compared after the fact. Mirrors /planner/config.
+        self.config_pub = self.ros_node.create_publisher(
+            String, '/rtabmap/config',
+            QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       history=HistoryPolicy.KEEP_LAST, depth=1))
+        self.config_pub.publish(String(data=json.dumps({
+            'vio_backend': args.vio_backend,
+            'num_features': args.num_features,
+            'fps': args.fps,
+            'width': args.width,
+            'height': args.height,
+            'grid_3d': args.grid_3d,
+            'grid_cell_size': args.grid_cell_size,
+            'grid_ray_tracing': args.grid_ray_tracing,
+            'grid_footprint_radius': args.grid_footprint_radius,
+            'publish_grid': args.publish_grid,
+            'publish_clouds': args.publish_clouds,
+            'publish_image': args.publish_image,
+            'publish_depth': args.publish_depth,
+        }, sort_keys=True)))
         self.last_feature_report = 0.0
         self.tf_broadcaster = TransformBroadcaster(self.ros_node)
         sensor_qos = QoSProfile(

@@ -68,6 +68,19 @@ class OffboardGlobalPlanner(OffboardHover):
         self.declare_parameter("max_correction_yaw_deg", 5.0)
         self.declare_parameter("command_speed", 0.10)
         self.declare_parameter("command_acceleration", 0.30)
+        # Publish the limiter's own velocity as a PX4 feedforward instead of
+        # making the position loop rediscover it. Default since the 2026-08-28
+        # 03:5x runs; set false to fall back to the position-only command.
+        self.declare_parameter("horizontal_feedforward", True)
+        # Corner blending: carry speed through a bend at the speed that keeps
+        # the airframe within junction_deviation of the vertex, instead of the
+        # full stop-and-wait the limiter takes by default. Off by default -- it
+        # removes a stop the route has always had, so it wants a deliberate
+        # first flight. junction_deviation must stay inside the follower's
+        # cross-track allowance, since that is what the vehicle is permitted
+        # to cut off the corner.
+        self.declare_parameter("corner_blending", False)
+        self.declare_parameter("junction_deviation", 0.05)
         self.declare_parameter("path_command_projection_tolerance", 0.05)
         self.declare_parameter("path_command_entry_tolerance", 0.30)
         self.declare_parameter("path_command_connector_tolerance", 0.20)
@@ -138,6 +151,9 @@ class OffboardGlobalPlanner(OffboardHover):
         )
         if self.yaw_resume_error > self.yaw_align_error:
             self.yaw_resume_error = self.yaw_align_error
+        self.horizontal_feedforward = bool(
+            self.get_parameter("horizontal_feedforward").value
+        )
         self.limiter = HorizontalCommandLimiter(
             max_speed=float(self.get_parameter("command_speed").value),
             max_acceleration=float(
@@ -162,6 +178,10 @@ class OffboardGlobalPlanner(OffboardHover):
             suffix_tolerance=float(
                 self.get_parameter("path_command_suffix_tolerance").value
             ),
+            corner_blending=bool(self.get_parameter("corner_blending").value),
+            junction_deviation=float(
+                self.get_parameter("junction_deviation").value
+            ),
         )
         self.route_command_grace = float(
             self.get_parameter("route_command_grace").value
@@ -170,6 +190,7 @@ class OffboardGlobalPlanner(OffboardHover):
             self.get_parameter("replan_during_yaw_align").value
         )
 
+        self.last_ff_velocity = None
         self.follower_valid = False
         self.follower_valid_received = None
         self.goal_reached = False
@@ -547,18 +568,77 @@ class OffboardGlobalPlanner(OffboardHover):
         # if PX4 ever stayed in OFFBOARD instead of taking AUTO.LAND.
         target_yaw = float(self.route_yaw() if yaw is None else yaw)
         yaw_sp, yawspeed = self.ramp_yaw(target_yaw)
+        z_sp, vz_sp = self.ramp_z(float(z_up))
+        vx_sp, vy_sp = self.setpoint_velocity_xy()
+        ax_sp, ay_sp = self.setpoint_acceleration_xy(vx_sp, vy_sp)
         msg = TrajectorySetpoint()
         msg.timestamp = self.now_us()
         msg.position = [
             float(self.limiter.position[0]),
             float(self.limiter.position[1]),
-            float(-z_up),
+            float(-z_sp),
         ]
-        msg.velocity = [math.nan, math.nan, math.nan]
-        msg.acceleration = [math.nan, math.nan, math.nan]
+        msg.velocity = [vx_sp, vy_sp, vz_sp]
+        msg.acceleration = [ax_sp, ay_sp, math.nan]
         msg.yaw = yaw_sp
         msg.yawspeed = yawspeed
         self.sp_pub.publish(msg)
+
+    def setpoint_velocity_xy(self):
+        """Horizontal feedforward for the published command, or NaN when off.
+
+        `HorizontalCommandLimiter.velocity` is already the speed- and
+        acceleration-limited velocity of the point being published, in the same
+        NED frame, and by construction it is that point's own derivative
+        (`update` advances position by `velocity * dt`; `adopt` takes the route
+        limiter's velocity through the same map->VIO->NED transform as the
+        position). Publishing it costs nothing to compute and is the value PX4
+        would otherwise have to rediscover from position error alone.
+
+        Why it matters (bag 20260828T021240Z): every accepted path replacement
+        restarts the carrot from zero speed, and MPC_XY_P=0.95 on the few
+        centimetres of position error that leaves asks for far less than the
+        0.20 m/s the limiter actually wants. The route ran at 0.106 m/s
+        effective against a 0.20 m/s cruise, in accelerate/coast/stall cycles
+        every ~3.9 s. This is the same fix as ramp_z, one axis over.
+
+        Gated to an advancing route on purpose. In a fault hold latch_fault_hold
+        resets the limiter, but a command hold does not, and the base-class LAND
+        state publishes through here too — in either case the last route
+        velocity is stale and would keep pushing the vehicle. NaN restores pure
+        position control for that tick.
+        """
+        if not self.horizontal_feedforward:
+            return math.nan, math.nan
+        if self.state != "ROUTE" or self.holding_for_fault or self.route_command_holding:
+            return math.nan, math.nan
+        return float(self.limiter.velocity[0]), float(self.limiter.velocity[1])
+
+    def setpoint_acceleration_xy(self, vx, vy):
+        """Acceleration feedforward: the derivative of the velocity just published.
+
+        PX4 sums TrajectorySetpoint.acceleration into the velocity loop the same
+        way it sums velocity into the position loop, so this completes the p/v/a
+        triple and removes the last stage of lag from the command. It is safe to
+        differentiate because the limiter has already acceleration-bounded that
+        velocity -- this is reading back a quantity it computed, not amplifying
+        noise from an estimate.
+
+        Returns NaN whenever the velocity feedforward itself is NaN, so a hold
+        or a LAND never carries a stale acceleration onto the wire.
+        """
+        if math.isnan(vx) or math.isnan(vy) or self.last_ff_velocity is None:
+            self.last_ff_velocity = None if math.isnan(vx) else (vx, vy)
+            return math.nan, math.nan
+        limit = self.limiter.max_acceleration
+        ax = (vx - self.last_ff_velocity[0]) / self.dt
+        ay = (vy - self.last_ff_velocity[1]) / self.dt
+        self.last_ff_velocity = (vx, vy)
+        magnitude = math.hypot(ax, ay)
+        if magnitude > limit and magnitude > 0.0:
+            scale = limit / magnitude
+            ax, ay = ax * scale, ay * scale
+        return ax, ay
 
     def publish_route_status(self, text, kind):
         now = self.monotonic_time()

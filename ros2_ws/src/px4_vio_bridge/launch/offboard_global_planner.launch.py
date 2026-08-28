@@ -33,6 +33,92 @@ from px4_vio_bridge.log_paths import timestamped_bag
 
 STORAGE_PRESET = "fastwrite"
 
+# Keep the flight bag useful for safety review and offline planner replay without
+# subscribing the recorder to every high-rate PX4 and visualization topic on the
+# graph.  `/perf/processes` is the canonical per-process record; the scalar perf
+# topics remain for direct Foxglove plotting.  Marker arrays, camera/depth/cloud
+# data, inflated-map playback and duplicate ROS odometry representations are
+# deliberately omitted.
+FLIGHT_RECORD_TOPICS = (
+    "/rosout",
+    # Commands sent to PX4 and the state needed to reconstruct the flight.
+    "/fmu/in/offboard_control_mode",
+    "/fmu/in/trajectory_setpoint",
+    "/fmu/in/vehicle_command",
+    "/fmu/in/vehicle_visual_odometry",
+    "/fmu/out/battery_status_v1",
+    "/fmu/out/estimator_status_flags",
+    "/fmu/out/failsafe_flags",
+    "/fmu/out/sensor_combined",
+    "/fmu/out/vehicle_attitude",
+    "/fmu/out/vehicle_command_ack",
+    "/fmu/out/vehicle_control_mode",
+    "/fmu/out/vehicle_land_detected",
+    "/fmu/out/vehicle_local_position_v1",
+    "/fmu/out/vehicle_odometry",
+    "/fmu/out/vehicle_status_v1",
+    # SLAM/VIO health, map and effective configuration.
+    "/rtabmap/config",
+    "/rtabmap/grid",
+    "/rtabmap/odom_correction",
+    "/rtabmap/pose",
+    "/rtabmap/vio_feature_count",
+    "/rtabmap/vio_pose",
+    "/vio/yaw_offset/pose",
+    # Requested goal and A* outputs needed by evaluate_planner_bags.py.
+    "/waypoint/clicked",
+    "/planner/candidate_path",
+    "/planner/config",
+    "/planner/effective_goal",
+    "/planner/expanded_cells",
+    "/planner/goal_exact",
+    "/planner/goal_terminal",
+    "/planner/path",
+    "/planner/path_length",
+    "/planner/planning_ms",
+    "/planner/status",
+    # Route-follower geometry, validity and flight-adapter decisions.
+    "/planner/follower/carrot",
+    "/planner/follower/config",
+    "/planner/follower/cross_track",
+    "/planner/follower/displacement",
+    "/planner/follower/goal_reached",
+    "/planner/follower/lookahead",
+    "/planner/follower/path_generation",
+    "/planner/follower/path_progress",
+    "/planner/follower/progress",
+    "/planner/follower/remaining",
+    "/planner/follower/status",
+    "/planner/follower/valid",
+    "/planner/follower/vio_displacement",
+    "/planner/flight/status",
+    "/planner/flight/teleop",
+    # Full machine/process snapshot plus plot-friendly scalar companions.
+    "/perf/processes",
+    "/perf/cpu_percent",
+    "/perf/cpu_temp_c",
+    "/perf/load1",
+    "/perf/mem_percent",
+    "/perf/throttled",
+    "/perf/process/astar/cpu_percent",
+    "/perf/process/bag_record/cpu_percent",
+    "/perf/process/follower/cpu_percent",
+    "/perf/process/foxglove/cpu_percent",
+    "/perf/process/planner/cpu_percent",
+    "/perf/process/px4_pos/cpu_percent",
+    "/perf/process/slam/cpu_percent",
+    "/perf/process/vio_bridge/cpu_percent",
+    "/perf/process/xrce_agent/cpu_percent",
+    # Low-rate battery topics used by the existing Foxglove panels.
+    "/battery/cell_voltage",
+    "/battery/current",
+    "/battery/level",
+    "/battery/percent",
+    "/battery/power",
+    "/battery/status",
+    "/battery/voltage",
+)
+
 
 def typed(name, value_type):
     return ParameterValue(LaunchConfiguration(name), value_type=value_type)
@@ -60,7 +146,17 @@ def generate_launch_description():
         DeclareLaunchArgument("auto_arm", default_value="false"),
         DeclareLaunchArgument("hover_height", default_value="0.40"),
         DeclareLaunchArgument("climb_timeout", default_value="15.0"),
+        # Altitude ramp + vz feedforward (see OffboardHover.ramp_z). climb_rate
+        # 0 restores the pre-2026-08-28 position step that took 20.4 s to climb
+        # 0.30 m.
+        DeclareLaunchArgument("climb_rate", default_value="0.25"),
+        DeclareLaunchArgument("climb_leash", default_value="0.12"),
+        DeclareLaunchArgument("climb_feedforward", default_value="true"),
+        # Horizontal equivalent. Default since the 2026-08-28 03:5x runs;
+        # false restores the position-only command.
+        DeclareLaunchArgument("horizontal_feedforward", default_value="true"),
         DeclareLaunchArgument("max_flight_time", default_value="45.0"),
+        DeclareLaunchArgument("perf_monitor", default_value="true"),
         DeclareLaunchArgument("command_speed", default_value="0.10"),
         DeclareLaunchArgument("command_acceleration", default_value="0.30"),
         DeclareLaunchArgument(
@@ -76,6 +172,10 @@ def generate_launch_description():
             "path_command_suffix_tolerance", default_value="0.01"
         ),
         DeclareLaunchArgument("path_corner_tolerance", default_value="0.05"),
+        # Carry speed through bends instead of stopping at each one.
+        DeclareLaunchArgument("corner_blending", default_value="false"),
+        DeclareLaunchArgument("junction_deviation", default_value="0.05"),
+        DeclareLaunchArgument("climb_release", default_value="0.05"),
         DeclareLaunchArgument("route_command_grace", default_value="2.0"),
         DeclareLaunchArgument("replan_during_yaw_align", default_value="false"),
         DeclareLaunchArgument("geofence_radius", default_value="1.0"),
@@ -117,6 +217,10 @@ def generate_launch_description():
             "auto_arm": typed("auto_arm", bool),
             "hover_height": typed("hover_height", float),
             "climb_timeout": typed("climb_timeout", float),
+            "climb_rate": typed("climb_rate", float),
+            "climb_leash": typed("climb_leash", float),
+            "climb_feedforward": typed("climb_feedforward", bool),
+            "horizontal_feedforward": typed("horizontal_feedforward", bool),
             "max_flight_time": typed("max_flight_time", float),
             "command_speed": typed("command_speed", float),
             "command_acceleration": typed("command_acceleration", float),
@@ -133,6 +237,9 @@ def generate_launch_description():
                 "path_command_suffix_tolerance", float
             ),
             "path_corner_tolerance": typed("path_corner_tolerance", float),
+            "corner_blending": typed("corner_blending", bool),
+            "junction_deviation": typed("junction_deviation", float),
+            "climb_release": typed("climb_release", float),
             "route_command_grace": typed("route_command_grace", float),
             "replan_during_yaw_align": typed("replan_during_yaw_align", bool),
             "geofence_radius": typed("geofence_radius", float),
@@ -162,15 +269,10 @@ def generate_launch_description():
     )
     recorder = ExecuteProcess(
         cmd=[
-            "ros2", "bag", "record", "--all-topics", "--storage", "mcap",
+            "ros2", "bag", "record", "--storage", "mcap",
             "--storage-preset-profile", STORAGE_PRESET,
             "--disable-keyboard-controls", "--polling-interval", "100",
-            "--exclude-regex",
-            (
-                r"^/(parameter_events|tf|tf_static|"
-                r"rtabmap/(image.*|depth|camera_info|obstacle_cloud|ground_cloud|path)|"
-                r"px4/local_position/path|vio/yaw_offset/path)$"
-            ),
+            "--topics", *FLIGHT_RECORD_TOPICS,
             "--output", LaunchConfiguration("bag_output"),
         ],
         name="global_planner_flight_recorder",
@@ -178,6 +280,16 @@ def generate_launch_description():
         sigterm_timeout="20",
         sigkill_timeout="20",
         condition=IfCondition(LaunchConfiguration("record_bag")),
+    )
+    # Started with the recorder rather than with the flight node, so the CPU /
+    # memory trace covers the whole recorded window and a late setpoint can be
+    # checked against Pi load on the same time base.
+    perf_monitor = Node(
+        package="px4_vio_bridge",
+        executable="process_monitor",
+        name="process_monitor",
+        output="log",
+        condition=IfCondition(LaunchConfiguration("perf_monitor")),
     )
     start = TimerAction(period=3.0, actions=[node])
     stop_after_node = RegisterEventHandler(
@@ -202,6 +314,7 @@ def generate_launch_description():
         LogInfo(msg=["Flight bag output: ", LaunchConfiguration("bag_output")]),
         OpaqueFunction(function=write_run_marker),
         recorder,
+        perf_monitor,
         stop_after_node,
         stop_if_recorder_exits,
         start,

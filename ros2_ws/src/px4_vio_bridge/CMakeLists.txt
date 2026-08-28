@@ -19,6 +19,7 @@ install(PROGRAMS
   scripts/offboard_square
   scripts/offboard_vfh
   scripts/offboard_waypoint
+  scripts/process_monitor
   scripts/px4_local_position_to_ros
   scripts/vfh_monitor
   scripts/vio_to_px4_odometry
@@ -37,6 +38,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_path_follower test/test_path_follower.py)
   ament_add_pytest_test(test_offboard_hover test/test_offboard_hover.py)
   ament_add_pytest_test(test_planner_flight test/test_planner_flight.py)
+  ament_add_pytest_test(test_process_monitor test/test_process_monitor.py)
   ament_add_pytest_test(test_process_singleton test/test_process_singleton.py)
   ament_add_pytest_test(test_offboard_square test/test_offboard_square.py)
   ament_add_pytest_test(test_offboard_vfh test/test_offboard_vfh.py)

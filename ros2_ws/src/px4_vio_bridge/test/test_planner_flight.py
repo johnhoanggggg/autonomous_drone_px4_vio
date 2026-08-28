@@ -359,6 +359,15 @@ def route_stub(**overrides):
         route_command_grace=2.0,
         route_command_stall_since=None,
         route_command_holding=False,
+        # Pass the altitude straight through with no vz feedforward, so these
+        # yaw/position tests see exactly what they did before ramp_z existed.
+        # The ramp itself is covered by test_offboard_hover.py.
+        ramp_z=lambda target_up: (target_up, math.nan),
+        # Likewise pure position control by default; the feedforward tests bind
+        # the real setpoint_velocity_xy and set the state it reads.
+        horizontal_feedforward=False,
+        setpoint_velocity_xy=lambda: (math.nan, math.nan),
+        setpoint_acceleration_xy=lambda vx, vy: (math.nan, math.nan),
     )
     stub.__dict__.update(overrides)
     for name in (
@@ -704,3 +713,168 @@ def test_replanning_is_suppressed_while_the_yaw_slew_pauses_translation():
     fault, deferral = OffboardGlobalPlanner.update_route_command(stub)
     assert fault is None
     assert "path replacement deferred" in deferral
+
+
+def feedforward_stub(**overrides):
+    """route_stub wired for publish_setpoint, defaulting to an advancing route."""
+    published = []
+    stub = route_stub(
+        state="ROUTE",
+        holding_for_fault=False,
+        horizontal_feedforward=True,
+        ramp_yaw=lambda target: (target, math.nan),
+    )
+    stub.__dict__.update(overrides)
+    stub.now_us = lambda: 0
+    stub.ensure_limiter = lambda: None
+    stub.sp_pub = SimpleNamespace(publish=published.append)
+    stub.setpoint_velocity_xy = OffboardGlobalPlanner.setpoint_velocity_xy.__get__(stub)
+    stub.setpoint_acceleration_xy = OffboardGlobalPlanner.setpoint_acceleration_xy.__get__(stub)
+    stub.last_ff_velocity = None
+    stub.limiter.velocity = (0.06, -0.08)
+    return stub, published
+
+
+def test_horizontal_feedforward_publishes_the_limiter_velocity() -> None:
+    stub, published = feedforward_stub()
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+
+    assert published[-1].velocity[0] == pytest.approx(0.06)
+    assert published[-1].velocity[1] == pytest.approx(-0.08)
+
+
+def test_horizontal_feedforward_off_is_the_previous_position_only_command() -> None:
+    stub, published = feedforward_stub(horizontal_feedforward=False)
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+
+    assert math.isnan(published[-1].velocity[0])
+    assert math.isnan(published[-1].velocity[1])
+
+
+def test_stale_route_velocity_never_leaks_into_a_hold_or_land() -> None:
+    """A held or landing command must not keep pushing at the last route speed.
+
+    latch_fault_hold resets the limiter, but a command hold does not, and the
+    base-class LAND state publishes through the same method.
+    """
+    for label, overrides in (
+        ("command hold", {"route_command_holding": True}),
+        ("fault hold", {"holding_for_fault": True}),
+        ("land", {"state": "LAND"}),
+        ("climb", {"state": "CLIMB_HOLD"}),
+    ):
+        stub, published = feedforward_stub(**overrides)
+        OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+        assert math.isnan(published[-1].velocity[0]), label
+        assert math.isnan(published[-1].velocity[1]), label
+
+
+def test_horizontal_feedforward_leaves_the_published_position_unchanged() -> None:
+    """The feedforward must be additive telemetry, not a different command."""
+    off, off_pub = feedforward_stub(horizontal_feedforward=False)
+    on, on_pub = feedforward_stub()
+    OffboardGlobalPlanner.publish_setpoint(off, 0.30)
+    OffboardGlobalPlanner.publish_setpoint(on, 0.30)
+
+    assert list(on_pub[-1].position) == pytest.approx(list(off_pub[-1].position))
+    assert on_pub[-1].yaw == pytest.approx(off_pub[-1].yaw)
+
+
+def test_acceleration_feedforward_is_the_derivative_of_published_velocity() -> None:
+    stub, published = feedforward_stub()
+    stub.dt = 0.02
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)      # primes, no history yet
+    assert math.isnan(published[-1].acceleration[0])
+
+    stub.limiter.velocity = (0.06 + 0.002, -0.08)           # +0.1 m/s^2 over 0.02 s
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+    assert published[-1].acceleration[0] == pytest.approx(0.1)
+    assert published[-1].acceleration[1] == pytest.approx(0.0)
+
+
+def test_acceleration_feedforward_is_bounded_by_the_limiter() -> None:
+    stub, published = feedforward_stub()
+    stub.dt = 0.02
+    stub.limiter.max_acceleration = 0.30
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+    stub.limiter.velocity = (0.06 + 0.05, -0.08)            # would be 2.5 m/s^2
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+
+    a = published[-1].acceleration
+    assert math.hypot(a[0], a[1]) == pytest.approx(0.30)
+
+
+def test_acceleration_is_nan_whenever_the_velocity_is() -> None:
+    """A hold must not carry a stale acceleration onto the wire."""
+    stub, published = feedforward_stub()
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+    assert not math.isnan(published[-1].acceleration[0])
+
+    stub.route_command_holding = True
+    OffboardGlobalPlanner.publish_setpoint(stub, 0.30)
+    assert math.isnan(published[-1].velocity[0])
+    assert math.isnan(published[-1].acceleration[0])
+
+
+def blend_limiter(**kw):
+    lim = PathCommandLimiter(max_speed=0.20, max_acceleration=0.30,
+                             max_projection_error=0.10, max_entry_error=0.50, **kw)
+    # An L: 3 m east then 3 m north, one 90 degree bend at arc length 3.
+    assert lim.set_path(((0.0, 0.0), (3.0, 0.0), (3.0, 3.0)), (0.0, 0.0))
+    return lim
+
+
+def test_corner_blending_off_still_stops_dead_at_the_bend() -> None:
+    lim = blend_limiter(corner_blending=False)
+    for _ in range(4000):
+        lim.update((3.0, 3.0), 0.02, reference_point=(0.0, 0.0))
+        if lim.waiting_vertex is not None:
+            break
+    assert lim.waiting_vertex == pytest.approx(3.0)
+    assert lim.speed == 0.0
+
+
+def test_corner_blending_carries_speed_through_the_bend() -> None:
+    lim = blend_limiter(corner_blending=True, junction_deviation=0.05)
+    slowest_at_corner = None
+    for _ in range(4000):
+        lim.update((3.0, 3.0), 0.02, reference_point=(0.0, 0.0))
+        if abs(lim.progress - 3.0) < 0.02:
+            slowest_at_corner = lim.speed
+        if lim.progress > 3.5:
+            break
+    assert lim.waiting_vertex is None, "blending must not latch a stop"
+    assert lim.progress > 3.5, "command must pass the bend without waiting"
+    assert slowest_at_corner is not None and slowest_at_corner > 0.0
+
+
+def test_corner_speed_matches_the_junction_deviation_model() -> None:
+    """t is the turn away from straight, so cos(t/2), not sin(t/2).
+
+    Getting this inverted makes sharper corners faster than shallow ones, which
+    is exactly backwards and would drive the command hardest through the turns
+    it should slow for.
+    """
+    lim = blend_limiter(corner_blending=True, junction_deviation=0.05)
+    expected = math.sqrt(0.30 * 0.05 * math.cos(math.pi / 4)
+                         / (1.0 - math.cos(math.pi / 4)))
+    assert lim._corner_speed(math.pi / 2) == pytest.approx(min(0.20, expected))
+    # Monotonic: shallower turns are never slower, a reversal stops.
+    assert lim._corner_speed(math.radians(33)) >= lim._corner_speed(math.radians(90))
+    assert lim._corner_speed(math.radians(90)) >= lim._corner_speed(math.radians(170))
+    assert lim._corner_speed(math.pi) == 0.0
+    assert lim._corner_speed(0.0) == pytest.approx(0.20)
+
+
+def test_observed_corner_geometry_needs_no_slowdown_at_current_speed() -> None:
+    """Measured 2026-08-28 corners: median 33, p90 44, max 70 degrees.
+
+    At 0.20 m/s cruise and 0.05 m junction deviation none of these require a
+    slowdown, so blending removes the stop-and-wait outright rather than just
+    shortening it. If this starts failing, command_speed has outgrown the
+    deviation budget and junction_deviation needs revisiting.
+    """
+    lim = blend_limiter(corner_blending=True, junction_deviation=0.05)
+    for degrees in (33.0, 44.0, 70.0):
+        assert lim._corner_speed(math.radians(degrees)) >= 0.20

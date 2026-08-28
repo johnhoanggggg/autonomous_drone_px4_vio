@@ -32,7 +32,7 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument("slam_fps", default_value="30"),
+            DeclareLaunchArgument("slam_fps", default_value="20"),
             DeclareLaunchArgument("slam_width", default_value="640"),
             DeclareLaunchArgument("slam_height", default_value="400"),
             DeclareLaunchArgument("slam_publish_image", default_value="true"),

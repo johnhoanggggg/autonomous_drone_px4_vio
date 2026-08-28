@@ -203,6 +203,8 @@ class PathCommandLimiter:
         max_entry_error: float = 0.30,
         max_connector_error: float = 0.20,
         suffix_tolerance: float = 0.01,
+        corner_blending: bool = False,
+        junction_deviation: float = 0.05,
     ):
         values = (
             max_speed,
@@ -212,6 +214,7 @@ class PathCommandLimiter:
             max_entry_error,
             max_connector_error,
             suffix_tolerance,
+            junction_deviation,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in values):
             raise ValueError("path command limits must be finite and positive")
@@ -226,6 +229,8 @@ class PathCommandLimiter:
         self.max_entry_error = float(max_entry_error)
         self.max_connector_error = float(max_connector_error)
         self.suffix_tolerance = float(suffix_tolerance)
+        self.corner_blending = bool(corner_blending)
+        self.junction_deviation = float(junction_deviation)
         self.path: Optional[Polyline] = None
         self.fingerprint = ()
         self.progress = 0.0
@@ -236,6 +241,7 @@ class PathCommandLimiter:
         self.join_limit = 0.0
         self.waiting_vertex: Optional[float] = None
         self.bends = ()
+        self.bend_turns = {}
 
     def clear(self) -> None:
         self.path = None
@@ -295,7 +301,7 @@ class PathCommandLimiter:
             cross = first[0] * second[1] - first[1] * second[0]
             dot = first[0] * second[0] + first[1] * second[1]
             if abs(cross) > 1.0e-9 or dot <= 0.0:
-                bends.append(path.cumulative[index])
+                bends.append((path.cumulative[index], math.atan2(abs(cross), dot)))
         return tuple(bends)
 
     def _shared_suffix_offset(self, new_path: Polyline) -> Optional[float]:
@@ -409,7 +415,9 @@ class PathCommandLimiter:
         self.path = new_path
         self.fingerprint = fingerprint
         self.progress = min(max(0.0, float(progress)), new_path.length)
-        self.bends = self._bends_of(new_path)
+        turns = self._bends_of(new_path)
+        self.bends = tuple(arc for arc, _ in turns)
+        self.bend_turns = dict(turns)
         self.join_target = None
         self.join_limit = 0.0
         self.waiting_vertex = None
@@ -463,11 +471,69 @@ class PathCommandLimiter:
         return self.position
 
     def _next_motion_target(self, desired_progress: float) -> float:
-        """Stop at the next vertex before proceeding onto another segment."""
-        for vertex in (*self.bends, self.path.length):
+        """Stop at the next vertex before proceeding onto another segment.
+
+        With corner blending on, only the path end is a stop; bends are handled
+        as speed limits by _corner_speed_limit instead of as stops.
+        """
+        stops = (self.path.length,) if self.corner_blending else (*self.bends, self.path.length)
+        for vertex in stops:
             if self.progress + 1.0e-9 < vertex < desired_progress - 1.0e-9:
                 return vertex
         return desired_progress
+
+    def _corner_speed(self, turn: float) -> float:
+        """Speed at which a turn of `turn` radians costs junction_deviation.
+
+        Junction-deviation model: rounding the corner inside a circle of
+        deviation d from the vertex needs
+            v <= sqrt(a * d * cos(t/2) / (1 - cos(t/2)))
+        where t is the turn away from straight, so t=0 imposes no limit and a
+        180 degree reversal forces a stop. (Grbl writes the same expression as
+        sin(theta/2) because its theta is the *interior* angle, pi - t.)
+        The published command still rides the polyline exactly -- only the
+        vehicle rounds the corner -- so every existing projection and clearance
+        check applies unchanged to the point that is actually sent to PX4. The
+        deviation is what the airframe is permitted to cut, and must therefore
+        stay inside the follower's cross-track allowance.
+
+        Measured 2026-08-28: A* corners are median 33 deg, p90 44 deg, max 70.
+        At a=0.30 m/s^2 and d=0.05 m even the 70 deg worst case allows 0.26 m/s,
+        above the 0.20 m/s cruise -- so at present speeds no observed corner
+        needs any slowdown at all, and the whole stop-and-wait disappears. The
+        cap still bites if command_speed rises or the route gets sharper.
+        """
+        half = 0.5 * max(0.0, min(turn, math.pi))
+        cos_half = math.cos(half)
+        if cos_half >= 1.0 - 1.0e-9:
+            return self.max_speed       # straight through; no limit
+        if cos_half <= 1.0e-9:
+            return 0.0                  # a full reversal genuinely has to stop
+        return min(
+            self.max_speed,
+            math.sqrt(
+                self.max_acceleration * self.junction_deviation * cos_half
+                / (1.0 - cos_half)
+            ),
+        )
+
+    def _corner_speed_limit(self) -> float:
+        """Speed cap now, so every bend ahead can still be met at its corner speed."""
+        limit = self.max_speed
+        for vertex in self.bends:
+            distance = vertex - self.progress
+            if distance <= 1.0e-9:
+                continue
+            corner = self._corner_speed(self.bend_turns.get(vertex, math.pi))
+            # Fastest we may go now and still brake to `corner` by the vertex.
+            reachable = math.sqrt(corner * corner + 2.0 * self.max_acceleration * distance)
+            if reachable < limit:
+                limit = reachable
+            if corner >= self.max_speed and distance > self.max_speed ** 2 / (
+                2.0 * self.max_acceleration
+            ):
+                break
+        return limit
 
     def update(
         self,
@@ -536,6 +602,8 @@ class PathCommandLimiter:
                     remaining / dt,
                     braking_speed,
                 )
+                if self.corner_blending:
+                    desired_speed = min(desired_speed, self._corner_speed_limit())
                 delta = max(
                     -self.max_acceleration * dt,
                     min(self.max_acceleration * dt, desired_speed - self.speed),

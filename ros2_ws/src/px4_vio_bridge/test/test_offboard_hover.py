@@ -1,6 +1,8 @@
 import math
 from types import SimpleNamespace
 
+import pytest
+
 from px4_vio_bridge.offboard_hover import OffboardHover, wrap_pi, yaw_from_quaternion
 
 
@@ -120,3 +122,150 @@ def test_yaw_ramp_converges_at_commanded_rate() -> None:
         assert steps < 10_000, "ramp failed to converge"
     # 15 deg at 5 deg/s and 50 Hz = 150 ticks.
     assert 145 <= steps <= 155
+
+
+def make_climb_stub(rate=0.25, leash=0.12, feedforward=True, z_now=0.0, release=0.05):
+    """Stand-in for the altitude ramp, mirroring make_hover_stub.
+
+    Regression guard for the 2026-08-28 flight (ULog 209): a hard z step left
+    PX4's vz integrator preloaded ~0.08 of collective low after the takeoff
+    ramp, and the 0.30 m climb took 20.4 s. `pos.z` is NED, so z_now metres up
+    is a negative z.
+    """
+    return SimpleNamespace(
+        z_cmd=None,
+        commanded_climb_rate=rate,
+        climb_leash=leash,
+        climb_release=release,
+        climb_feedforward=feedforward,
+        dt=0.02,
+        pos=SimpleNamespace(z=-z_now),
+    )
+
+
+def test_climb_ramp_disabled_restores_the_raw_step() -> None:
+    stub = make_climb_stub(rate=0.0)
+    height, vz = OffboardHover.ramp_z(stub, 0.30)
+
+    assert height == 0.30
+    assert math.isnan(vz)
+
+
+def test_climb_ramp_publishes_nan_velocity_without_feedforward() -> None:
+    stub = make_climb_stub(feedforward=False)
+    stub.z_cmd = 0.0
+    for _ in range(10):
+        _, vz = OffboardHover.ramp_z(stub, 0.30)
+        assert math.isnan(vz)
+
+
+def test_climb_feedforward_is_negative_when_climbing() -> None:
+    """TrajectorySetpoint.velocity is NED, so a climb is a negative vz."""
+    climbing = make_climb_stub(z_now=0.0)
+    climbing.z_cmd = 0.0
+    assert OffboardHover.ramp_z(climbing, 0.30)[1] == -0.25
+
+    descending = make_climb_stub(z_now=0.30)
+    descending.z_cmd = 0.30
+    assert OffboardHover.ramp_z(descending, 0.0)[1] == 0.25
+
+
+def test_climb_ramp_converges_at_commanded_rate_without_overshoot() -> None:
+    stub = make_climb_stub()
+    stub.z_cmd = 0.0
+    steps = 0
+    highest = 0.0
+    while stub.z_cmd != 0.30:
+        height, _ = OffboardHover.ramp_z(stub, 0.30)
+        stub.pos = SimpleNamespace(z=-height)  # a vehicle that tracks perfectly
+        highest = max(highest, height)
+        steps += 1
+        assert steps < 10_000, "ramp failed to converge"
+    # 0.30 m at 0.25 m/s and 50 Hz = 60 ticks.
+    assert 58 <= steps <= 62
+    assert highest <= 0.30
+
+
+def test_climb_ramp_holds_the_target_once_reached() -> None:
+    stub = make_climb_stub(z_now=0.30)
+    stub.z_cmd = 0.30
+    height, vz = OffboardHover.ramp_z(stub, 0.30)
+
+    assert height == 0.30
+    assert vz == 0.0
+
+
+def test_leash_bounds_the_setpoint_but_keeps_the_feedforward() -> None:
+    """A vehicle that cannot climb must get a bounded error, not a late step.
+
+    Without the leash the ramp runs away from a stuck vehicle and eventually
+    delivers exactly the position step the ramp exists to avoid. The velocity
+    demand must survive the clamp: that error is what the integrator winds on.
+    """
+    stub = make_climb_stub(z_now=0.05)
+    for _ in range(500):
+        height, vz = OffboardHover.ramp_z(stub, 0.30)
+
+    assert height == pytest.approx(0.05 + 0.12)
+    assert vz == -0.25
+
+
+def test_leash_is_applied_even_on_the_first_call() -> None:
+    """A node whose first setpoint is already the hover target must not step.
+
+    z_cmd seeds at the target, so only the leash bounds that first publish.
+    """
+    stub = make_climb_stub(z_now=0.0)
+    height, vz = OffboardHover.ramp_z(stub, 0.30)
+
+    assert height == pytest.approx(0.12)
+    assert vz == -0.25
+
+
+def test_climb_ramp_runs_before_any_position_estimate() -> None:
+    stub = make_climb_stub()
+    stub.pos = None
+    stub.z_cmd = 0.0
+    for _ in range(500):
+        height, _ = OffboardHover.ramp_z(stub, 0.30)
+
+    assert height == pytest.approx(0.30)
+
+
+def test_feedforward_persists_while_the_VEHICLE_is_short_of_target() -> None:
+    """Regress ULog 03_53_16: the ramp finished, the vehicle had not.
+
+    The ramp reached 0.30 while the drone was still at 0.21 -- inside
+    climb_leash, so the leash never clamped -- and keying the release off the
+    ramp switched the feedforward off with 0.09 m still to climb. The last
+    stretch then reverted to the slow position-P crawl, 18 s of it.
+    """
+    stub = make_climb_stub(z_now=0.21)
+    stub.z_cmd = 0.30
+    height, vz = OffboardHover.ramp_z(stub, 0.30)
+
+    assert height == 0.30                 # ramp stays converged
+    assert vz == -0.25                    # but the feedforward keeps pulling
+
+
+def test_feedforward_tapers_instead_of_switching_off() -> None:
+    """No step at the target, and no chatter from altitude noise near it."""
+    stub = make_climb_stub(z_now=0.275, release=0.05)   # 0.025 m short = half band
+    stub.z_cmd = 0.30
+    _, vz = OffboardHover.ramp_z(stub, 0.30)
+    assert vz == pytest.approx(-0.125)
+
+    stub = make_climb_stub(z_now=0.30, release=0.05)
+    stub.z_cmd = 0.30
+    _, vz = OffboardHover.ramp_z(stub, 0.30)
+    assert vz == 0.0
+
+
+def test_feedforward_reverses_gently_on_overshoot() -> None:
+    """Above the target the feedforward pulls back, bounded by the taper."""
+    stub = make_climb_stub(z_now=0.32, release=0.05)
+    stub.z_cmd = 0.30
+    _, vz = OffboardHover.ramp_z(stub, 0.30)
+
+    assert 0.0 < vz <= 0.25               # NED positive = descending
+    assert vz == pytest.approx(0.10)

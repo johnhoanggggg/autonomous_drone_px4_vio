@@ -64,12 +64,19 @@ class OffboardHover(Node):
         self.declare_parameter("hold_time", 10.0)         # seconds at altitude
         self.declare_parameter("yaw_rate_deg", 5.0)       # deg/s slew of commanded yaw (<=0 disables)
         self.declare_parameter("yaw_feedforward", False)  # publish yawspeed matching the slew (NaN when off)
+        self.declare_parameter("climb_rate", 0.25)        # m/s slew of commanded altitude (<=0 = raw step)
+        self.declare_parameter("climb_leash", 0.12)       # m the ramp may lead the vehicle (<=0 disables)
+        self.declare_parameter("climb_release", 0.05)     # m band where the vz feedforward tapers out
+        self.declare_parameter("climb_feedforward", True) # publish velocity[2] matching the ramp (NaN when off)
         self.declare_parameter("rate_hz", 50.0)
         self.declare_parameter("stream_time", 1.0)        # setpoint pre-stream before engage
         self.declare_parameter("engage_timeout", 5.0)     # arm+offboard must confirm within
         # 2026-07-25 flight: the PX4 takeoff ramp winds the vz integrator down
         # and thrust needs ~10 s to reach hover after arm; 8 s aborted a healthy
         # climb. Armed yaw tests LAND on this timeout, so longer is safe.
+        # 2026-08-28 (ULog 209): that ~10 s was measured at 20.4 s for 0.30 m and
+        # root-caused — see ramp_z. Kept at 15 s as a safety bound, not as the
+        # expected climb time: with the ramp+feedforward the climb is ~2 s.
         self.declare_parameter("climb_timeout", 15.0)     # start hold clock by here regardless
         self.declare_parameter("reach_tol", 0.07)         # m, "reached" altitude band
         self.declare_parameter("max_flight_time", 40.0)   # armed watchdog -> force land
@@ -112,6 +119,12 @@ class OffboardHover(Node):
         # here (a past collision fed the gyro back into ramp_yaw -> runaway yaw).
         self.commanded_yaw_rate = math.radians(float(self.get_parameter("yaw_rate_deg").value))
         self.yaw_feedforward = bool(self.get_parameter("yaw_feedforward").value)
+        # Same contract as the yaw slew: a configured command rate, never a
+        # measured one. See ramp_z for why the altitude is ramped at all.
+        self.commanded_climb_rate = float(self.get_parameter("climb_rate").value)
+        self.climb_leash = float(self.get_parameter("climb_leash").value)
+        self.climb_release = float(self.get_parameter("climb_release").value)
+        self.climb_feedforward = bool(self.get_parameter("climb_feedforward").value)
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         self.stream_time = float(self.get_parameter("stream_time").value)
         self.engage_timeout = float(self.get_parameter("engage_timeout").value)
@@ -219,6 +232,7 @@ class OffboardHover(Node):
         self.vcm = None            # latest VehicleControlMode
         self.x0 = self.y0 = self.yaw0 = None
         self.yaw_cmd = None        # rate-limited yaw setpoint actually published
+        self.z_cmd = None          # rate-limited altitude setpoint actually published (m up)
 
         self.state = "WAIT_POS"
         self.t = 0.0               # seconds in current state
@@ -463,14 +477,79 @@ class OffboardHover(Node):
     def publish_setpoint(self, z_up, yaw=None):
         target = float(self.yaw0 if yaw is None else yaw)
         yaw_sp, yawspeed = self.ramp_yaw(target)
+        z_sp, vz_sp = self.ramp_z(float(z_up))
         m = TrajectorySetpoint()
         m.timestamp = self.now_us()
-        m.position = [float(self.x0), float(self.y0), float(-z_up)]  # NED, z down-negative-up
-        m.velocity = [math.nan, math.nan, math.nan]
+        m.position = [float(self.x0), float(self.y0), float(-z_sp)]  # NED, z down-negative-up
+        m.velocity = [math.nan, math.nan, vz_sp]
         m.acceleration = [math.nan, math.nan, math.nan]
         m.yaw = yaw_sp
         m.yawspeed = yawspeed
         self.sp_pub.publish(m)
+
+    def ramp_z(self, target_up):
+        """Slew the published altitude toward target_up at commanded_climb_rate.
+
+        Returns (altitude_up_m, vz_ned) ready to drop into TrajectorySetpoint;
+        vz is NaN unless climb_feedforward is on. Mirrors ramp_yaw, and like it
+        uses ONLY the configured rate — never a measured climb rate.
+
+        Why the altitude is ramped at all (ULog 209, 2026-08-28): PX4's takeoff
+        ramp hands the position controller a collective of 0.475 against a true
+        hover of 0.554, so the vz integrator starts ~0.08 low. A hard z step
+        gives the controller nothing but a position error, and MPC_Z_VEL_P_ACC=4
+        converts 0.12 m/s of velocity error into only ~0.03 of collective — a
+        third of the deficit. The climb then runs entirely on MPC_Z_VEL_I_ACC
+        unwinding at 0.004 collective/s: 20.4 s to cover 0.30 m, against a
+        commanded 48 mm/s that only ever delivered 7.8 mm/s.
+
+        The ramp alone would not fix that — a small position error commands an
+        even smaller climb. The fix is the feedforward: PX4 sums
+        TrajectorySetpoint.velocity with the position-P output, so publishing
+        vz puts the full commanded rate into the velocity loop and drives the
+        integrator with a real error instead of a shrinking one. The ramp is
+        what keeps the position setpoint honest while that happens.
+
+        climb_leash caps how far the ramp may lead the vehicle, so a drone that
+        cannot follow gets a bounded error rather than the same step delivered
+        late. climb_rate <= 0 restores the raw step behavior exactly.
+        """
+        if self.commanded_climb_rate <= 0.0:
+            self.z_cmd = target_up
+            return target_up, math.nan
+        if self.z_cmd is None:
+            self.z_cmd = target_up
+        # Advance toward the target, clamped to the remaining distance so the
+        # ramp lands exactly on it and never overshoots.
+        step = self.commanded_climb_rate * self.dt
+        self.z_cmd += max(-step, min(step, target_up - self.z_cmd))
+        # The leash is applied on every path, including the first call: it is
+        # what bounds the setpoint if z_cmd was seeded straight at the target.
+        if self.climb_leash > 0.0 and self.pos is not None:
+            z_now = -float(self.pos.z)
+            self.z_cmd = max(min(self.z_cmd, z_now + self.climb_leash),
+                             z_now - self.climb_leash)
+        if not self.climb_feedforward:
+            return self.z_cmd, math.nan
+        # Release on the VEHICLE's remaining distance, not the ramp's. ULog
+        # 03_53_16 (2026-08-28): the ramp reached the target at t=4 s while the
+        # vehicle was still 0.09 m low -- inside climb_leash, so the leash never
+        # clamped -- the feedforward switched off, and the last 0.09 m reverted
+        # to exactly the slow position-P crawl this exists to avoid: 18 s of it.
+        z_ref = -float(self.pos.z) if self.pos is not None else self.z_cmd
+        remaining = target_up - z_ref
+        # Taper inside the release band rather than switching off, so there is
+        # no discontinuity and measurement noise near the target cannot chatter
+        # the feedforward between +/- full rate.
+        span = max(self.climb_release, 1e-6)
+        rate = self.commanded_climb_rate * min(1.0, abs(remaining) / span)
+        if rate < 1e-3:
+            return self.z_cmd, 0.0
+        # Deliberately the commanded rate, not d(z_cmd)/dt: while the leash is
+        # holding the setpoint back the vehicle is failing to keep up, which is
+        # exactly when the velocity loop needs a real error to wind against.
+        # TrajectorySetpoint.velocity is NED, so climbing is negative vz.
+        return self.z_cmd, -math.copysign(rate, remaining)
 
     def ramp_yaw(self, target):
         """Slew the published yaw toward target at the configured commanded_yaw_rate.

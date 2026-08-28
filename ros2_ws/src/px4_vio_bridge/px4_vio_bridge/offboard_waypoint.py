@@ -274,20 +274,25 @@ class OffboardWaypoint(OffboardHover):
 
         self.settled_t = 0.0 if moved else self.settled_t + self.dt
 
-    def setpoint_velocity(self):
-        """Optional feedforward that cancels most of the position-tracking lag."""
+    def setpoint_velocity(self, vz=math.nan):
+        """Optional feedforward that cancels most of the position-tracking lag.
+
+        vz comes from ramp_z and is independent of the horizontal feedforward:
+        the altitude ramp stays active even with velocity_feedforward off.
+        """
         if not self.velocity_feedforward:
-            return [math.nan, math.nan, math.nan]
-        return [float(self.cmd_vx), float(self.cmd_vy), math.nan]
+            return [math.nan, math.nan, vz]
+        return [float(self.cmd_vx), float(self.cmd_vy), vz]
 
     def publish_setpoint(self, z_up, yaw=None):
         self.ensure_commanded_position()
         target_yaw = float(self.yaw0 if yaw is None else yaw)
         yaw_sp, yawspeed = self.ramp_yaw(target_yaw)
+        z_sp, vz_sp = self.ramp_z(float(z_up))
         m = TrajectorySetpoint()
         m.timestamp = self.now_us()
-        m.position = [float(self.x_cmd), float(self.y_cmd), float(-z_up)]
-        m.velocity = self.setpoint_velocity()
+        m.position = [float(self.x_cmd), float(self.y_cmd), float(-z_sp)]
+        m.velocity = self.setpoint_velocity(vz_sp)
         m.acceleration = [math.nan, math.nan, math.nan]
         m.yaw = yaw_sp
         m.yawspeed = yawspeed
