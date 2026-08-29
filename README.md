@@ -204,7 +204,7 @@ fixture/planner resolution:
 ```bash
 ros2 launch px4_vio_bridge global_planner_3d_monitor.launch.py \
   simulate:=true fixture_resolution:=0.10 voxel_size:=0.10 \
-  fixture_loop_correction_after:=3.0 record_bag:=true
+  fixture_loop_correction_after:=3.0 foxglove:=true record_bag:=true
 ```
 
 That fixture publishes one observed room with a floor and obstacle, then shifts
@@ -214,6 +214,20 @@ Recorded generations can be extracted to the line-oriented JSON accepted by
 `planner_3d_replay`; the verifier reruns planning and rejects any accepted path
 or follower chord whose generation differs or whose swept sphere intersects
 occupied, unknown, or outside-map volume.
+
+Connect Foxglove to `ws://<pi-ip>:8765`, add a **3D** panel, set its display
+frame to `world`, and enable `/rtabmap/octomap_markers`. Brown cubes are occupied
+ground/floor and red cubes are occupied obstacles. Add `/planner3d/path` and
+`/planner3d/markers` to see the accepted route and its clearance envelope. The
+raw `octomap_msgs/Octomap` is intentionally not sent over the WebSocket because
+Foxglove does not render that schema directly; the marker topic is generated
+from the same OctoMap leaves and is visualization-only. `max_marker_voxels`
+(default 20000 in this launch) bounds browser bandwidth.
+
+When `rtabmap_slam_px4.launch.py` is already running, leave `foxglove:=false` on
+the 3D launch: the existing bridge now exposes the OctoMap markers and all
+`/planner3d/*` topics. Enable `foxglove:=true` only for a standalone 3D monitor,
+because only one bridge should own port 8765.
 
 `min_z` and `max_z` are hard planning boundaries and must be replaced with
 independently measured site values. The launch refuses configurations where

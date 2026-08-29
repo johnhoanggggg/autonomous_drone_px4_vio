@@ -9,6 +9,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
     ExecuteProcess,
+    IncludeLaunchDescription,
     LogInfo,
     RegisterEventHandler,
     TimerAction,
@@ -16,9 +17,11 @@ from launch.actions import (
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
-from launch.substitutions import LaunchConfiguration
+from launch.launch_description_sources import AnyLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.substitutions import FindPackageShare
 from px4_vio_bridge.log_paths import timestamped_bag
 
 
@@ -91,6 +94,8 @@ def generate_launch_description():
         DeclareLaunchArgument("max_correction_yaw_deg", default_value="15.0"),
         DeclareLaunchArgument("max_correction_roll_pitch_deg", default_value="5.0"),
         DeclareLaunchArgument("max_marker_voxels", default_value="20000"),
+        DeclareLaunchArgument("foxglove", default_value="false"),
+        DeclareLaunchArgument("foxglove_port", default_value="8765"),
         DeclareLaunchArgument("record_bag", default_value="false"),
         DeclareLaunchArgument(
             "bag_output", default_value=timestamped_bag("global_planner_3d_monitor")
@@ -139,6 +144,7 @@ def generate_launch_description():
         parameters=[{
             "map_data_topic": LaunchConfiguration("map_data_topic"),
             "frame_id": LaunchConfiguration("frame_id"),
+            "max_marker_voxels": typed("max_marker_voxels", int),
         }],
     )
     follower = Node(
@@ -192,6 +198,7 @@ def generate_launch_description():
             "--storage-preset-profile", "fastwrite",
             "--disable-keyboard-controls", "--topics",
             "/rtabmap/mapData", "/rtabmap/octomap", "/rtabmap/octomap_metadata",
+            "/rtabmap/octomap_markers",
             "/rtabmap/pose", "/rtabmap/vio_pose",
             "/rtabmap/odom_correction", "/waypoint/clicked",
             "/planner3d/path", "/planner3d/candidate_path",
@@ -206,6 +213,30 @@ def generate_launch_description():
         output="screen",
         condition=IfCondition(LaunchConfiguration("record_bag")),
     )
+    foxglove = IncludeLaunchDescription(
+        AnyLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("foxglove_bridge"),
+                "launch",
+                "foxglove_bridge_launch.xml",
+            ])
+        ),
+        condition=IfCondition(LaunchConfiguration("foxglove")),
+        launch_arguments={
+            "port": LaunchConfiguration("foxglove_port"),
+            "topic_whitelist": (
+                "['^/tf$', "
+                "'^/rtabmap/(octomap_markers|octomap_metadata|pose|vio_pose|odom_correction)$', "
+                "'^/planner3d/.*$', '^/waypoint/clicked$']"
+            ),
+            "service_whitelist": "['^$']",
+            "param_whitelist": "['^$']",
+            "client_topic_whitelist": "['^/waypoint/clicked$']",
+            "capabilities": "[clientPublish,connectionGraph]",
+            "min_qos_depth": "1",
+            "max_qos_depth": "1",
+        }.items(),
+    )
     return LaunchDescription(arguments + [
         LogInfo(msg=(
             "3D planner monitor is observation only; it has no /fmu/in publishers. "
@@ -216,6 +247,7 @@ def generate_launch_description():
         RegisterEventHandler(OnProcessExit(target_action=follower, on_exit=required_node_exited)),
         RegisterEventHandler(OnProcessExit(target_action=recorder, on_exit=recorder_exited)),
         recorder,
+        foxglove,
         producer,
         fixture,
         planner,

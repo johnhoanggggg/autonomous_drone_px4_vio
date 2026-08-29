@@ -62,7 +62,8 @@ target_link_libraries(
   rtabmap_octomap_node rtabmap_octomap_cpp nlohmann_json::nlohmann_json
   rtabmap_conversions::rtabmap_conversions ${OCTOMAP_LIBRARIES})
 ament_target_dependencies(rtabmap_octomap_node
-  octomap_msgs rclcpp rtabmap_conversions rtabmap_msgs std_msgs
+  geometry_msgs octomap_msgs rclcpp rtabmap_conversions rtabmap_msgs std_msgs
+  visualization_msgs
 )
 
 add_executable(rtabmap_3d_fixture src/rtabmap_3d_fixture_node.cpp)

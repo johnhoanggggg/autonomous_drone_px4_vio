@@ -107,7 +107,7 @@ def generate_launch_description():
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf$', "
-                    "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count|grid)$', "
+                    "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count|grid|octomap_markers|octomap_metadata)$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
@@ -120,6 +120,7 @@ def generate_launch_description():
                     # nothing under /vfh is subscribed by any node.
                     "'^/vfh/.*$', "
                     "'^/planner/.*$', "
+                    "'^/planner3d/.*$', "
                     "'^/battery/(percent|voltage|current|power|cell_voltage|level|status)$', "
                     "'^/fmu/in/vehicle_visual_odometry$', "
                     "'^/fmu/out/(vehicle_local_position_v1|vehicle_odometry|estimator_status_flags)$']"
