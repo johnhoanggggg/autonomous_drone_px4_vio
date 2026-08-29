@@ -22,10 +22,8 @@ rehearsed props-off first.
 3. [Flight parameters](#flight-parameters)
 4. [Observability](#observability)
 5. [Launch reference](#launch-reference)
-6. [Health checks, NSH and calibration](#health-checks-nsh-and-calibration)
-7. [Measured facts](#measured-facts)
-8. [Known issues](#known-issues)
-9. [Safety](#safety)
+6. [Measured facts](#measured-facts)
+7. [Known issues](#known-issues)
 
 ## Install and pinned versions
 
@@ -49,7 +47,8 @@ source /home/john/ros2_ws/install/setup.bash
 colcon build --packages-select px4_vio_bridge
 ```
 
-Run the test suite (272 tests, no hardware needed):
+Run the Python test suite (404 tests, no hardware needed; `colcon test` also
+runs the C++ gtests):
 
 ```bash
 cd /home/john/autonomous_drone_px4_vio/ros2_ws
@@ -105,12 +104,19 @@ ros2 launch px4_vio_bridge global_planner_monitor.launch.py \
   inflation_extra:=0.20 \
   max_carrot_speed:=0.20 \
   max_carrot_acceleration:=0.30 \
-  max_cross_track:=0.30 \
+  max_cross_track:=0.20 \
   cross_track_resume:=0.05 \
   cross_track_recovery_time:=1.0 \
+  path_retain_tolerance:=0.15 \
   max_correction_m:=1 \
   max_correction_yaw_deg:=10.0
 ```
+
+`path_retain_tolerance` **must stay below `max_cross_track`**, or the follower
+faults on cross-track before the planner will rebuild the path and the vehicle
+stalls in the gap between them with no new route coming. The node default is
+0.35, which is wrong for any `max_cross_track` below that — see
+[Known issues](#known-issues).
 
 Click a `world` goal with the Foxglove 3D panel's Publish tool on
 `/waypoint/clicked`, and confirm `/planner/follower/valid: true` before terminal 3.
@@ -131,7 +137,9 @@ ros2 launch px4_vio_bridge offboard_global_planner.launch.py \
   max_correction_yaw_deg:=10.0
 ```
 
-Set `auto_arm:=false` for a props-off dry run — the whole state machine runs and
+Add `cpp_mode:=true` to fly the C++ adapter instead of the Python one; see
+[Which flight adapter](#which-flight-adapter). Set `auto_arm:=false` for a
+props-off dry run — the whole state machine runs and
 records, and no arm command is ever sent. Terminal 3 records the flight bag and
 starts the process monitor; **do not pass `bag_output`**, every launch names its
 own bag `<mode>_<UTC>` through `px4_vio_bridge.log_paths`. Set
@@ -213,7 +221,78 @@ or routes get sharper. `junction_deviation` must stay well inside the follower's
 **Off by default**: it removes a stop the route has always had, so give it one
 deliberate flight before trusting it.
 
+### Which flight adapter
+
+Two implementations of the same flight adapter exist. `cpp_mode` selects which
+process `offboard_global_planner.launch.py` starts; both take the identical
+parameter set (the launch file builds one dict and hands it to whichever runs).
+
+| `cpp_mode` | executable | node |
+|---|---|---|
+| `false` (default) | `offboard_global_planner` | Python, the flown implementation |
+| `true` | `cpp_flight_adapter` | C++, flown armed 6x on 2026-08-28 |
+
+**`cpp_nodes` is the master switch.** Both launch files accept it under the same
+name, and every per-node C++ flag defaults to it, so one argument moves the whole
+stack:
+
+```bash
+ros2 launch px4_vio_bridge global_planner_monitor.launch.py  cpp_nodes:=true ...
+ros2 launch px4_vio_bridge offboard_global_planner.launch.py cpp_nodes:=true ...
+```
+
+| flag | defaults to | selects |
+|---|---|---|
+| `cpp_nodes` | `false` | every node below |
+| `cpp_astar` | `cpp_nodes` | `cpp_astar_planner` instead of `global_planner_monitor` |
+| `cpp_follower` | `cpp_nodes` | `cpp_route_follower` instead of `route_follower_monitor` |
+| `cpp_mode` | `cpp_nodes` | `cpp_flight_adapter` instead of `offboard_global_planner` |
+
+A single node can still be pinned back to Python to bisect a regression:
+`cpp_nodes:=true cpp_astar:=false`. Because the two launch files are separate
+commands there is no shared process to carry the toggle — spelling the same
+argument on both is the whole mechanism.
+
+`cpp_shadow:=true` runs a third, **non-commanding** node (`cpp_clearance_shadow`)
+alongside the Python adapter. It publishes no `/fmu/in/*` topics — it re-derives
+the Python adapter's final map-frame command and independently checks clearance,
+reporting on `/planner/flight/cpp_shadow/*`. It exists for parity and CPU
+measurement while Python keeps flight authority.
+
+The C++ port's command math is parity-tested against the Python limiters to 1e-9
+over randomized replay (`test_planner_flight_parity.py` drives both through the
+`planner_flight_replay` binary). Its state machine, watchdogs and PX4 command
+sequencing are **not** covered by that test.
+
+The C++ route follower is separately parity-tested against Python to 1e-9 over
+randomized routes, replans, clearance refusals, cross-track recovery and arrival
+hysteresis (`test_route_follower_parity.py`). Both follower executables publish
+the same topics, take the same parameters and share the same singleton lock.
+
+The three executable names deliberately share no substring, because
+`process_monitor` matches on command lines — see
+[Process load](#process-load--perf).
+
+### Control mode: position, not velocity
+
+`OffboardControlMode` is published in exactly one place
+(`offboard_hover.publish_offboard_mode`) and sets `position=true`,
+`velocity=false`, `acceleration=false`. Every flight mode inherits it. The
+velocity and acceleration fields of `TrajectorySetpoint` are **feedforward terms
+summed into the position loop**, not commands — nothing in this repo has ever
+flown velocity control.
+
+The practical consequence: a hold is not "stop", it is "return to the latched
+point". When the follower blocks, PX4 actively flies the vehicle back to the
+position it was blocked at.
+
 ### Everything else worth knowing
+
+`rate_hz` is **20 Hz** for the global-planner adapter; every other offboard mode
+runs the node default of 50. PX4 only requires the offboard stream to stay above
+about 2 Hz, so 20 keeps a wide margin while matching the rates that actually feed
+the adapter (follower 10 Hz, VIO 11-15 Hz, planner 2 Hz). Dropping 50 to 20 was
+expected to save CPU and did not — see [Measured facts](#measured-facts).
 
 `hover_height` is 0.30 m in the quick start — very low. Height is pure vision with
 no rangefinder, and ground effect disturbs VIO features near the floor. Confirm Z
@@ -242,9 +321,26 @@ that happened?" after the fact. It starts with the flight launch
 | `/perf/throttled` | `Int32` | Raspberry Pi throttle word, `-1` if unavailable |
 | `/perf/processes` | `String` | JSON with everything, incl. per-core and PIDs |
 
-Labels: `slam`, `xrce_agent`, `vio_bridge`, `planner`, `astar`, `follower`,
-`planner_sim`, `bag_record`, `foxglove`, `battery`, `px4_pos`. They are parameters
-(`labels` / `patterns`), so the set can be retargeted without editing code.
+Labels: `slam`, `xrce_agent`, `vio_bridge`, `planner`, `planner_cpp`,
+`planner_cpp_shadow`, `astar`, `astar_cpp`, `follower`, `follower_cpp`,
+`planner_sim`, `bag_record`,
+`foxglove`, `battery`, `px4_pos`. They are parameters (`labels` / `patterns`), so
+the set can be retargeted without editing code.
+
+Patterns match **command-line substrings**, which has two consequences worth
+knowing:
+
+- Node executables are matched by their install path
+  (`lib/px4_vio_bridge/offboard_global_planner`), not by bare name. Until
+  2026-08-28 the bare name also matched `ros2 launch px4_vio_bridge
+  offboard_global_planner.launch.py`, so the launch process's own CPU was added
+  to the adapter's row — and in a `cpp_mode` run, where no Python adapter exists
+  at all, that row was measuring *only* the launcher. `astar` had the same
+  defect. **Bags recorded before 2026-08-28 09:00 carry roughly 1.5-3 percentage
+  points of launcher CPU in the `planner` and `astar` rows.**
+- No label's pattern may be a substring of another's, or one process fills two
+  rows. This is why the adapters are named `offboard_global_planner`,
+  `cpp_flight_adapter` and `cpp_clearance_shadow` rather than sharing a prefix.
 
 CPU follows psutil's convention — **100% is one core**, so threaded RTAB-Map
 legitimately reads above 100 on this 4-core Pi. `cpu_percent_of_machine` in the
@@ -418,8 +514,13 @@ and `HANDOFF_GLOBAL_PLANNER.md`.
 
 Key launch defaults: `hover_height` 0.40, `command_speed` 0.10,
 `geofence_radius` 1.0, `max_flight_time` 45, `yaw_rate_deg` 20,
-`min_vio_features` 80, `planner_fault_land_time` 3.0, `goal_hold_time` 3.0.
-The quick start overrides several of these.
+`min_vio_features` 80, `planner_fault_land_time` 3.0, `goal_hold_time` 3.0,
+`rate_hz` 20.0, `cpp_mode` false, `cpp_shadow` false. The quick start overrides
+several of these.
+
+`cpp_mode:=true` replaces the Python adapter process with the C++ one;
+`cpp_shadow:=true` co-runs the non-commanding clearance shadow alongside Python.
+See [Which flight adapter](#which-flight-adapter).
 
 A cross-track violation is **latched**: the follower freezes its relative carrot
 and stays invalid until it receives a newer path *and* cross-track stays below
@@ -439,6 +540,15 @@ PX4 topics and cannot move the drone. Simulator needs no camera or vehicle:
 ros2 launch px4_vio_bridge global_planner_monitor.launch.py simulate:=true
 ```
 
+`cpp_nodes:=true` selects both `cpp_astar_planner` and `cpp_route_follower`.
+Pin either back independently with `cpp_astar:=false` or
+`cpp_follower:=false`. Each C++ process takes the identical parameters and the
+same role-specific singleton lock as its Python counterpart, so two
+implementations can never drive the same topics. Never delete a lock file to
+clear a "duplicate" error — kill the holding process instead
+(`pkill -f lib/px4_vio_bridge/<executable>`); deleting it lets a second process
+take a new inode's lock while the first still holds the old one.
+
 A click is accepted even if it lies in unknown space, outside the map, or on an
 obstacle; unknown and lethal cells stay blocked. For unknown/outside/disconnected
 requests the planner reports `EXPLORING` and flies only to the closest reachable
@@ -450,9 +560,11 @@ so the adapter holds rather than landing there.
 
 ### `offboard_hover` — the base flight node
 
-Latch NED x/y/yaw, stream `TrajectorySetpoint` at 50 Hz, request OFFBOARD, arm,
-climb, hold, then `NAV_LAND`. Every other flight node subclasses it, so the
-watchdogs below apply everywhere.
+Latch NED x/y/yaw, stream `TrajectorySetpoint` at `rate_hz` (node default 50 Hz;
+the global-planner launch sets 20), request OFFBOARD, arm, climb, hold, then
+`NAV_LAND`. Every other flight node subclasses it, so the watchdogs below apply
+everywhere. The C++ adapter reimplements this state machine rather than
+subclassing it.
 
 ```bash
 # props-off dry run: STREAM -> ENGAGE -> CLIMB_HOLD -> LAND -> DONE, never arms
@@ -598,3 +710,329 @@ recommended** — it is more timing-sensitive here, with native DepthAI/Basalt
 assertions from non-monotonic IMU/frame timestamps. Basalt VIO + RTAB-Map SLAM
 was tried and removed. Treat Basalt as a dead end unless revisiting DepthAI
 internals.
+
+## Measured facts
+
+Numbers here come from recorded bags, not estimates. Dates are the flights they
+came from.
+
+### SLAM dominates, and VIO rate is thread-bound — not core-starved
+
+`RTABMapVIO` + `RTABMapSLAM` on the Pi run **~195-210% of a core** and are the
+single largest cost by an order of magnitude. `--num-features` is **not** a CPU
+lever — CPU sat at 215-230% across 100, 300 and 500 features — so keep
+`slam_num_features` at 400-500 where tracking is healthy.
+
+Per-thread profiling of the SLAM process (2026-08-29; sample
+`/proc/<pid>/task/*/stat`, group by `task/*/comm`; 44 threads), flight grid args,
+`--fps 20`, **nothing else running on the machine**:
+
+```
+RTABMapVIO(4)     101.0%   <- one host core, saturated
+RTABMapSLAM(6)    100.5%   <- one host core, saturated
+HostNode(9)         5.7%   <- the Python Ros2Node: ALL of the Python in this process
+XLink / Sync / Scheduler / dds    ~8%
+every bare python3 thread          0.0%
+```
+
+Two consequences, both load-bearing:
+
+1. **Freeing cores cannot raise the VIO rate.** Those two threads are each
+   single-threaded and already at 100% of a core. On an otherwise idle machine
+   VIO still only reached 11.6-13.0 Hz, so `bag_record` was not the cause. The
+   measured levers are marginal: `--publish-image false` takes 11.6 -> 12.0 Hz
+   (and `HostNode` 7.1% -> 4.4%); adding `--publish-grid false` reaches 12.25 Hz.
+   Reclaiming CPU is still worth doing for headroom and jitter — it just is not
+   how the rate goes up.
+2. **Porting the SLAM host script to C++ would reclaim ~5.7% of a core, not
+   ~200%.** `RTABMapVIO`, `RTABMapSLAM`, `StereoDepth` and `FeatureTracker` are
+   DepthAI nodes already implemented in C++ inside libdepthai; the Python is only
+   the `Ros2Node` marshalling layer. The reference C++ pipeline
+   (`depthai-core/examples/cpp/RVC2/VSLAM/rtabmap_vio_slam.cpp`) mirrors this
+   script almost exactly and is buildable here — RTABMap 0.22.1, PCL 1.14 and
+   OpenCV 4.6 are all installed, so `-DDEPTHAI_RTABMAP_SUPPORT=ON` finds them —
+   but the ROS-shipped `libdepthai-core.so` has **zero** RTABMap symbols, so it
+   means rebuilding depthai-core from source for a few percent of a core.
+
+### VIO backend: Basalt is faster and cheaper, RTABMapVIO holds position better
+
+`--vio-backend basalt|rtabmap`, identical flight grid args, OAK-D **stationary**
+on a desk (2026-08-29). `BasaltVIO` runs on the OAK-D, so it removes the pinned
+`RTABMapVIO` host thread entirely:
+
+| | RTABMapVIO | BasaltVIO (stock) |
+|---|---|---|
+| VIO rate | 11.6-13.0 Hz | **19.4-20.0 Hz** (hits the requested fps) |
+| process CPU | 204-212% | **155%** |
+| VIO host thread | 101%, pinned | **gone** — ~50% in XLink transport instead |
+| `RTABMapSLAM` thread | 100.5% | 100.1% (unchanged) |
+| drift, 45 s stationary | **0.45 mm** | 19.29 mm |
+| max single-frame step | **1.5 mm** | 15.2 mm |
+
+This is the only change measured so far that moves the VIO rate at all, and it
+frees half a core doing it. It is not yet a decision: a 15 mm single-frame jump
+fused into EKF2 at 20 Hz is a ~0.3 m/s velocity spike, and the follower already
+spends 8.8% of its time in `POSE_INSIDE_CLEARANCE`.
+
+#### Tuning Basalt
+
+The node otherwise runs entirely on `setDefaultVIOConfig()`, whose settings come
+from Basalt's EuRoC reference rig — 1 point per 50 px cell (only ~104 points at
+640x400) and an industrial-grade IMU. The `--basalt-*` flags expose the knobs;
+all default to the node's own defaults, so `--vio-backend basalt` alone is
+unchanged. Measured on this airframe, 45 s stationary:
+
+| config | Hz | drift mm | max step mm | rms step mm |
+|---|---|---|---|---|
+| RTABMapVIO (reference) | 13.0 | **0.45** | **1.53** | 0.639 |
+| Basalt, stock defaults | 19.4 | 19.29 | 15.23 | 0.747 |
+| + measured IMU noise, `init-bg-weight 1` | 19.4 | 11.30 | 7.82 | 0.527 |
+| + `grid-size 30`, 2 pts/cell | 19.4 | 26.30 | 4.34 | 0.420 |
+| + `obs-std-dev 0.25`, `image-safe-radius 320` | 18.3 | 11.16 | 2.32 | **0.349** |
+| same, but default `init-bg-weight` | 19.4 | 19.28 | 7.55 | 0.618 |
+
+What that says:
+
+- **The IMU model is the biggest single lever.** This OAK-D measures a real
+  stationary gyro bias of ~0.0035 rad/s (0.2 deg/s) — enough to integrate to ~9
+  degrees of attitude over 45 s. Supplying the measured noise and weakening the
+  prior that pins gyro bias at zero (`--basalt-init-bg-weight 1.0`) halves the
+  drift; restoring the default prior puts it straight back (last row).
+- **Jitter is essentially solved, slow drift is not.** The tuned config brings
+  the max single-frame step from 15.2 mm to 2.32 mm and the rms step to 0.349 mm,
+  *better* than RTABMapVIO. What remains is slow bias walk: 11 mm over 45 s
+  against RTABMapVIO's 0.45 mm.
+- **`setAccelNoiseStd`/`setGyroNoiseStd` take VARIANCE**, not standard deviation
+  — depthai applies `cwiseSqrt()` to whatever it is given. `setAccelBias` /
+  `setGyroBias` are deliberately unused: in depthai 3.5.0 they comma-initialise a
+  12-element Eigen vector from 9 values.
+- **One setting is unreachable from Python.** `MatchingGuessType`,
+  `LinearizationType` and `KeyframeMargCriteria` are unregistered pybind types in
+  3.5.0, so `setConfig()` leaves them value-initialised at 0. For two that is the
+  intended default; for the third it silently demotes
+  `optical_flow_matching_guess_type` from `REPROJ_AVG_DEPTH` to `SAME_PIXEL`.
+  Reaching it needs the C++ node — a better argument for the C++ port than CPU.
+- **Some combinations abort inside Basalt.** `vio_max_kfs 12` + `vio_max_states 5`
+  together with the denser grid tripped an assertion in
+  `LandmarkBlockAbsDynamic::allocateLandmark` during marginalization. Change one
+  knob at a time.
+
+Best config found so far:
+
+```bash
+--vio-backend basalt \
+  --basalt-accel-noise-var 1.637e-4 1.559e-4 1.243e-4 \
+  --basalt-gyro-noise-var  1.070e-6 1.180e-6 1.172e-6 \
+  --basalt-init-bg-weight 1.0 \
+  --basalt-grid-size 30 --basalt-points-per-cell 2 \
+  --basalt-obs-std-dev 0.25 --basalt-image-safe-radius 320
+```
+
+**All of the above is stationary**, which is the worst case for a tightly-coupled
+IMU VIO like Basalt and the best case for RTABMapVIO — IMU excitation in flight
+makes the biases observable. Do not conclude from this table alone. The next test
+is a hand-carried closed loop returning to a marked start, scoring loop-closure
+error, before Basalt goes anywhere near a flight. `rtabmap_slam_px4.launch.py`
+does not expose `vio_backend`; add the launch argument first.
+
+### The C++ A* planner is worth ~30 points of a core
+
+`cpp_astar_planner` against `global_planner_monitor`, replaying the real
+`094653Z` flight grid (269x272 @ 3 cm), 8 runs per stage (2026-08-29):
+
+| stage | Python | C++ | |
+|---|---|---|---|
+| inflate costmap | 144.2 ms | 14.6 ms | 10x |
+| goal-selection BFS | 41.1 ms | 0.25 ms | 163x |
+| A* search | 2.4 ms | 0.15 ms | 16x |
+| **total per plan** | **187.8 ms** | **15.0 ms** | **13x** |
+
+At `rate_hz:=2.0` that is **38% of a core down to 3.0%**, consistent with the
+~30% the `astar` row shows in flight bags.
+
+Worth knowing: **the Python planner exceeds its own planning budget.**
+`planning_timeout_ms:=100` covers goal selection plus A* only, where Python
+spends 44 ms — but inflation, which the timeout does not cover, is another
+144 ms. Each Python plan occupies ~188 ms of a 500 ms tick. C++ is 0.41 ms inside
+the budget and 15.0 ms in total.
+
+The two implementations are held together by `test_grid_planner_parity.py`, which
+drives both over randomized maps through the `grid_planner_replay` binary and
+compares the costmap, display encoding, start recovery, goal selection, A* cells,
+expansion count, cost and simplified path exactly. Replaying a real flight bag
+through each node end to end gave 51 accepted paths from both, the same status
+mix, the same first path length (2.51 m), the same peak expansions (1629) and the
+same waypoint counts.
+
+C++ inflation uses a different loop shape from the Python one and is *not* a
+transliteration: `grid_planner.py` dilates the whole mask once per kernel offset
+because in numpy each pass is a single vectorised max, whereas scalar C++ pays
+per cell touched, so it stamps the kernel around each obstacle instead
+(`obstacles x offsets` rather than `width x height x offsets`). Flight maps are
+~8% occupied, which makes that ~12x cheaper. It picks between the two loops at
+runtime, so a map dense enough to invert the tradeoff still takes the mask path.
+Both produce identical costmaps, which is what the parity test pins.
+
+### The C++ adapter is worth ~23 points of a core; the rate change was not
+
+Both adapters measured at 20 Hz, launcher CPU excluded (2026-08-28):
+
+| | Python | C++ |
+|---|---|---|
+| Adapter CPU | **29.2%** of a core | **6.6%** |
+| RSS | 85 MB | 39 MB |
+| Machine total | 82.1% | 77.3-80.2% |
+| SLAM | 201% | 204-209% |
+
+The rate change was separately worthless: the Python adapter cost ~30.5% at 50 Hz
+and 29.2% at 20 Hz — about **1.3 points for a 2.5x rate cut**. Its cost is rclpy
+fixed overhead in the callbacks, not per-tick work, so essentially the whole
+22.6-point saving is the language.
+
+Machine-level gain is much smaller than the adapter delta, because **SLAM expands
+into whatever is freed** (201% to 204-209%). Do not expect adapter savings to
+show up one-for-one in `/perf/cpu_percent`.
+
+### Bag recording costs ~16% of a core, and it is already C++
+
+`ros2 bag record` is a Python CLI around a C++ recorder: `rosbag2_py.Recorder` is
+a pybind11 wrapper over `rosbag2_transport::Recorder`, and the verb only parses
+arguments before calling `record()`, which blocks inside C++. Per-message work
+happens in C++ subscription callbacks with no Python involved. **Rewriting the
+recorder in C++ would gain nothing** — it is not a language cost.
+
+Measured by replaying a real flight bag (`094301Z`, ~50 topics, 611 msg/s) and
+profiling the recorder's threads over 30 s (2026-08-29). Use thread sampling, not
+`ps -o %cpu`, which reports a lifetime average and overstates a short run:
+
+| recorded set | steady-state CPU |
+|---|---|
+| everything | **16.5%** of a core |
+| minus the 3 ~95 Hz PX4 topics (47% of all messages) | 13.4% (−3.1) |
+| minus 16 redundant `/perf/*` scalars | 15.1% (−1.4) |
+| a single 12 Hz topic (the floor) | 0.4% |
+
+Both trims together land near 12%, a ~27% reduction — worth doing, not
+transformative. Note that dropping 47% of the messages removed only 19% of the
+CPU, so cost is split between per-message work and per-subscription overhead
+across 77 recorded topics.
+
+What to trim, in order of value per unit of lost capability:
+
+1. **The 16 `/perf/*` scalar topics.** `/perf/processes` already carries
+   everything they do — `cpu_percent`, `cpu_temp_c`, `load1`, `mem_percent` and
+   a full per-process table — plus `per_core` and thread counts the scalars lack.
+   Keep publishing them so the Foxglove plots keep working; just leave them out
+   of the recorder's `--topics` list. Zero information lost.
+2. **`/fmu/out/vehicle_odometry`** — 15.6% of messages and 10.7% of bytes, and
+   its only consumer is `calibrate_ev_position_offset.py`, run deliberately.
+3. `/fmu/out/sensor_combined` costs `analyze_flight.py` its gyro-RMS section;
+   `analyze_ulog.py` covers it if the ULog is fetched. **Keep**
+   `/fmu/out/vehicle_attitude` and `/fmu/out/vehicle_local_position_v1` —
+   `analyze_flight.py` reads the *bag*, not the ULog, and they carry the
+   roll/pitch/yaw and position analysis.
+
+By bytes rather than messages the picture is different: **`/rtabmap/grid` alone is
+53.7% of the payload** (2.76 MB of 5.13 MB) from only 49 messages at 1 Hz. Do not
+drop it — it is what makes offline planner replay and `evaluate_planner_bags.py`
+possible, and 49 messages cost almost no CPU. For disk instead of CPU, add
+`--compression-mode file`: the bag compresses 6.31 MB to 1.41 MB (4.5x) in 0.2 s,
+and file mode compresses at close, i.e. after landing rather than in flight.
+
+`--max-cache-size` is already 100 MB — a whole flight fits — and `fastwrite` is
+already the lowest-CPU storage preset. Neither is a lever.
+
+### The planner routes well; the vehicle is what goes out of tolerance
+
+Flight 091006Z, 2026-08-28. Sweeping +/-0.60 m laterally at every point of the
+published path:
+
+- path clearance **0.36-0.58 m** along its whole length
+- the best available lateral alternative was only **0.05-0.15 m** better
+- vehicle clearance over the same window fell to **0.22 m**
+
+So the A* route was within 0.15 m of the local optimum and the excursions were
+the vehicle's, not the planner's. The map was not moving either: holding one
+fixed point and re-evaluating it against every published map over 6 s gives
+0.370 m *every time*.
+
+The path's first vertex is anchored at the vehicle, so it inherits whatever
+position the vehicle occupies — it cannot start at the corridor centre.
+
+### Corner blending removes a real stop
+
+`PathCommandLimiter` without blending stops at every vertex; measured A* paths
+carry 4.5-6 vertices over 1.7-2.7 m, so that is a full stop roughly every 50 cm
+and about half the commanded cruise. Measured corners are median 33 deg, p90
+44 deg, max 70 deg; at `a=0.30` and `d=0.05` even the 70 deg worst case allows
+0.26 m/s against a 0.20 m/s cruise, so no observed corner needs any slowdown.
+Flown 2026-08-28 with `corner_blending:=true`.
+
+## Known issues
+
+### `POSE_INSIDE_CLEARANCE` is a deadlock, not a safety stop
+
+`RouteFollowerMonitor.safe_lookahead` tests
+`segment_has_clearance(pose -> target)` and **the segment starts at the pose**.
+Once the vehicle's own position violates `required_clearance`, every candidate
+lookahead fails at its first point — including the shortest — so the search
+cannot succeed by construction. The follower then calls `hold_command()`, the
+carrot collapses onto the vehicle, and commanded motion goes to zero. Because the
+stack is position-controlled, that is an active instruction to stay in the
+offending spot.
+
+Observed 2026-08-28: flight 091228Z spent its final **8 s** frozen 0.27 m from an
+obstacle (airframe radius 0.25 m) and never reached its goal; flight 091006Z
+chattered BLOCKED/FOLLOWING three times in 5 s while sitting on the threshold.
+Both escaped only via position-hold error — the vehicle sagging ~0.12 m off its
+own latched setpoint — i.e. by luck of which way the airframe drifts.
+
+The fix is to relax the requirement, when the pose is already inside clearance,
+to "the swept segment never gets closer than the pose already is". Not yet
+implemented.
+
+### Clearance budget: `safety_margin` must cover `max_cross_track`
+
+The planner guarantees every point of the path clears
+`lethal_radius = robot_radius + safety_margin`. The follower separately permits
+the vehicle to sit `max_cross_track` off that path. Nothing links the two, so the
+vehicle's worst-case clearance is:
+
+```text
+lethal_radius - max_cross_track
+```
+
+At `robot_radius 0.25`, `safety_margin 0.05`, `max_cross_track 0.30` that is
+**-0.02 m** — the airframe is permitted 0.27 m inside an obstacle. The invariant
+that makes contact impossible is:
+
+```text
+safety_margin >= max_cross_track
+```
+
+which is not met by any configuration flown so far. Raising `safety_margin` costs
+corridor width (`2 * lethal_radius`), so this is a deliberate trade, not a bug to
+silently fix: at `safety_margin 0.0` the block threshold becomes the airframe
+radius itself and the minimum plannable gap is 0.50 m; at `safety_margin 0.20`
+contact becomes impossible but the minimum gap is 0.90 m.
+
+### `path_retain_tolerance` inverts the replan/fault ordering
+
+`should_replace_path` rebuilds the accepted path only when cross-track exceeds
+`path_retain_tolerance` (node default **0.35**), while the follower faults at
+`max_cross_track`. With `max_cross_track` below 0.35 the vehicle stalls in the
+band between them: faulted, but with no new path coming. Keep
+`path_retain_tolerance` below `max_cross_track`.
+
+In four flights on 2026-08-28, cross-track never once exceeded 0.35 m — so a
+cross-track excursion has never actually triggered a replan on this vehicle.
+
+### A killed recorder leaves an unreadable bag
+
+If the flight launch is stopped before `ros2 bag record` finalizes, `metadata.yaml`
+is written 0 bytes and the bag will not open, though the `.mcap` itself is intact.
+Recover with:
+
+```bash
+ros2 bag reindex flight_logs/<bag_dir> -s mcap
+```

@@ -285,6 +285,7 @@ class RouteFollowerMonitor(Node):
             name: self.get_parameter(name).value
             for name in self.CONFIG_PARAMETERS
         }
+        config["implementation"] = "python"
         self.config_pub.publish(
             String(data=json.dumps(config, sort_keys=True, separators=(",", ":")))
         )

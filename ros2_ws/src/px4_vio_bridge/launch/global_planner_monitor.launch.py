@@ -5,11 +5,12 @@ from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
     ExecuteProcess,
+    GroupAction,
     LogInfo,
     RegisterEventHandler,
     TimerAction,
 )
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
@@ -48,6 +49,22 @@ def required_node_exited(event, context):
 
 def generate_launch_description():
     args = [
+        # MASTER C++ TOGGLE. One flag flips every node in this launch that has
+        # a C++ port; the per-node flags below default to it, so
+        # `cpp_nodes:=true` is the whole switch and a single node can still be
+        # pinned back to Python (`cpp_nodes:=true cpp_astar:=false`) to bisect a
+        # regression. Spell it the same way on offboard_global_planner.launch.py
+        # to move the whole flight stack together.
+        DeclareLaunchArgument("cpp_nodes", default_value="false"),
+        # The A* planner. The C++ port is parity-tested against grid_planner.py
+        # over randomized maps (costmap, start recovery, goal selection, A*
+        # cells, expansions and the simplified path all compared exactly) and
+        # takes the same singleton lock as the Python node, so the two can never
+        # both drive /planner/path.
+        DeclareLaunchArgument("cpp_astar", default_value=LaunchConfiguration("cpp_nodes")),
+        # Observation-only route follower. Both implementations publish the
+        # same topics and share one singleton lock.
+        DeclareLaunchArgument("cpp_follower", default_value=LaunchConfiguration("cpp_nodes")),
         DeclareLaunchArgument("simulate", default_value="false"),
         DeclareLaunchArgument("dynamic_obstacle", default_value="true"),
         DeclareLaunchArgument("rate_hz", default_value="2.0"),
@@ -88,13 +105,7 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("simulate")),
         parameters=[{"dynamic_obstacle": typed("dynamic_obstacle", bool)}],
     )
-    monitor = Node(
-        package="px4_vio_bridge",
-        executable="global_planner_monitor",
-        name="global_planner_monitor",
-        output="screen",
-        emulate_tty=True,
-        parameters=[{
+    planner_parameters = [{
             "rate_hz": typed("rate_hz", float),
             "map_timeout": typed("map_timeout", float),
             "pose_timeout": typed("pose_timeout", float),
@@ -108,36 +119,61 @@ def generate_launch_description():
             "switch_improvement": typed("switch_improvement", float),
             "path_retain_tolerance": typed("path_retain_tolerance", float),
             "path_head_margin": typed("path_head_margin", float),
-        }],
+    }]
+    monitor = Node(
+        package="px4_vio_bridge",
+        executable="global_planner_monitor",
+        name="global_planner_monitor",
+        output="screen",
+        emulate_tty=True,
+        condition=UnlessCondition(LaunchConfiguration("cpp_astar")),
+        parameters=planner_parameters,
     )
+    cpp_monitor = Node(
+        package="px4_vio_bridge",
+        executable="cpp_astar_planner",
+        name="global_planner_monitor",
+        output="screen",
+        emulate_tty=True,
+        condition=IfCondition(LaunchConfiguration("cpp_astar")),
+        parameters=planner_parameters,
+    )
+    follower_parameters = [{
+        "rate_hz": typed("follower_rate_hz", float),
+        "map_timeout": typed("map_timeout", float),
+        "occupied_threshold": typed("occupied_threshold", int),
+        "robot_radius": typed("robot_radius", float),
+        "safety_margin": typed("safety_margin", float),
+        "lookahead": typed("lookahead", float),
+        "lookahead_step": typed("lookahead_step", float),
+        "min_lookahead": typed("min_lookahead", float),
+        "max_carrot_speed": typed("max_carrot_speed", float),
+        "max_carrot_acceleration": typed("max_carrot_acceleration", float),
+        "max_cross_track": typed("max_cross_track", float),
+        "cross_track_resume": typed("cross_track_resume", float),
+        "cross_track_recovery_time": typed("cross_track_recovery_time", float),
+        "vio_timeout": typed("vio_timeout", float),
+        "correction_timeout": typed("correction_timeout", float),
+        "max_correction_m": typed("max_correction_m", float),
+        "max_correction_yaw_deg": typed("max_correction_yaw_deg", float),
+    }]
     follower = Node(
         package="px4_vio_bridge",
         executable="route_follower_monitor",
         name="route_follower_monitor",
         output="screen",
         emulate_tty=True,
-        condition=IfCondition(LaunchConfiguration("route_follower")),
-        parameters=[{
-            "rate_hz": typed("follower_rate_hz", float),
-            "map_timeout": typed("map_timeout", float),
-            "occupied_threshold": typed("occupied_threshold", int),
-            "robot_radius": typed("robot_radius", float),
-            "safety_margin": typed("safety_margin", float),
-            "lookahead": typed("lookahead", float),
-            "lookahead_step": typed("lookahead_step", float),
-            "min_lookahead": typed("min_lookahead", float),
-            "max_carrot_speed": typed("max_carrot_speed", float),
-            "max_carrot_acceleration": typed("max_carrot_acceleration", float),
-            "max_cross_track": typed("max_cross_track", float),
-            "cross_track_resume": typed("cross_track_resume", float),
-            "cross_track_recovery_time": typed(
-                "cross_track_recovery_time", float
-            ),
-            "vio_timeout": typed("vio_timeout", float),
-            "correction_timeout": typed("correction_timeout", float),
-            "max_correction_m": typed("max_correction_m", float),
-            "max_correction_yaw_deg": typed("max_correction_yaw_deg", float),
-        }],
+        condition=UnlessCondition(LaunchConfiguration("cpp_follower")),
+        parameters=follower_parameters,
+    )
+    cpp_follower = Node(
+        package="px4_vio_bridge",
+        executable="cpp_route_follower",
+        name="route_follower_monitor",
+        output="screen",
+        emulate_tty=True,
+        condition=IfCondition(LaunchConfiguration("cpp_follower")),
+        parameters=follower_parameters,
     )
     recorder = ExecuteProcess(
         cmd=[
@@ -175,15 +211,45 @@ def generate_launch_description():
     monitor_watchdog = RegisterEventHandler(
         OnProcessExit(target_action=monitor, on_exit=required_node_exited)
     )
+    # Only one of the two planners ever starts, so the other's handler simply
+    # never fires -- but whichever did start must still take the launch down
+    # with it, including when it exits on a held singleton lock.
+    cpp_monitor_watchdog = RegisterEventHandler(
+        OnProcessExit(target_action=cpp_monitor, on_exit=required_node_exited)
+    )
     follower_watchdog = RegisterEventHandler(
         OnProcessExit(target_action=follower, on_exit=required_node_exited)
+    )
+    cpp_follower_watchdog = RegisterEventHandler(
+        OnProcessExit(target_action=cpp_follower, on_exit=required_node_exited)
     )
     # Let the planner singleton gate run first. If a stale planner exists, the
     # launch shuts down before starting a follower that would immediately race
     # the stale follower on the flight-validity topics.
-    follower_start = TimerAction(period=2.0, actions=[follower])
+    follower_start = TimerAction(period=2.0, actions=[GroupAction(
+        condition=IfCondition(LaunchConfiguration("route_follower")),
+        actions=[follower, cpp_follower],
+    )])
     return LaunchDescription(args + [
         LogInfo(msg="global planner monitor is observation only; it cannot command PX4"),
-        recorder_watchdog, monitor_watchdog, follower_watchdog,
-        recorder, simulator, monitor, follower_start,
+        LogInfo(
+            msg=["A* planner: C++ (cpp_astar_planner). cpp_astar=",
+                 LaunchConfiguration("cpp_astar")],
+            condition=IfCondition(LaunchConfiguration("cpp_astar")),
+        ),
+        LogInfo(
+            msg="A* planner: Python (global_planner_monitor).",
+            condition=UnlessCondition(LaunchConfiguration("cpp_astar")),
+        ),
+        LogInfo(
+            msg="Route follower: C++ (cpp_route_follower).",
+            condition=IfCondition(LaunchConfiguration("cpp_follower")),
+        ),
+        LogInfo(
+            msg="Route follower: Python (route_follower_monitor).",
+            condition=UnlessCondition(LaunchConfiguration("cpp_follower")),
+        ),
+        recorder_watchdog, monitor_watchdog, cpp_monitor_watchdog,
+        follower_watchdog, cpp_follower_watchdog,
+        recorder, simulator, monitor, cpp_monitor, follower_start,
     ])

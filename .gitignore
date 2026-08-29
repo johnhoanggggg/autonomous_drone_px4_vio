@@ -3,6 +3,12 @@ ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
 
+# Package-local colcon output (created when colcon is run from the package
+# directory instead of the workspace root).
+ros2_ws/src/px4_vio_bridge/build/
+ros2_ws/src/px4_vio_bridge/install/
+ros2_ws/src/px4_vio_bridge/log/
+
 # Stray colcon workspace at the PROJECT ROOT. Running `colcon build` from here
 # instead of inside ros2_ws creates a second install space that shadows the real
 # one, with launch files copied rather than symlinked -- so they silently stop

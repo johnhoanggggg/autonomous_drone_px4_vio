@@ -42,6 +42,50 @@ parser.add_argument('--publish-depth', type=parse_bool, default=False,
                     help='Publish RAW16 metric depth for Foxglove.')
 parser.add_argument('--depth-publish-hz', type=float, default=3.0,
                     help='Maximum depth publish rate in Hz.')
+# BasaltVIO tuning. The node otherwise runs entirely on setDefaultVIOConfig(),
+# whose optical-flow and IMU settings come from Basalt's EuRoC reference rig
+# (1 point per 50 px cell on a larger image, and an industrial IMU). On this
+# 640x400 OAK-D Lite that default yields only ~104 tracked points and assumes an
+# IMU far better than the BMI270, which is what makes stationary Basalt drift
+# ~19 mm/45 s against RTABMapVIO's 0.45 mm. Defaults below reproduce the node's
+# own defaults exactly, so `--vio-backend basalt` alone is unchanged.
+parser.add_argument('--basalt-grid-size', type=int, default=50,
+                    help='BasaltVIO optical_flow_detection_grid_size in pixels. '
+                         'Lower packs more feature cells across the image: 50 gives '
+                         '~104 cells at 640x400, 30 gives ~273.')
+parser.add_argument('--basalt-points-per-cell', type=int, default=1,
+                    help='BasaltVIO optical_flow_detection_num_points_cell.')
+parser.add_argument('--basalt-max-kfs', type=int, default=7,
+                    help='BasaltVIO vio_max_kfs, the sliding-window keyframe count. '
+                         'More keyframes cost CPU and buy accuracy.')
+parser.add_argument('--basalt-max-states', type=int, default=3,
+                    help='BasaltVIO vio_max_states, the sliding-window frame count.')
+parser.add_argument('--basalt-obs-std-dev', type=float, default=0.5,
+                    help='BasaltVIO vio_obs_std_dev, assumed reprojection noise in '
+                         'pixels. LOWER trusts the cameras more relative to the IMU.')
+parser.add_argument('--basalt-init-bg-weight', type=float, default=1e2,
+                    help='BasaltVIO vio_init_bg_weight: prior strength holding the '
+                         'gyro bias at zero. This OAK-D measures a real stationary '
+                         'bias near 0.0035 rad/s (~0.2 deg/s), so a weaker prior lets '
+                         'the estimator reach it sooner.')
+parser.add_argument('--basalt-image-safe-radius', type=float, default=472.0,
+                    help='BasaltVIO optical_flow_image_safe_radius in pixels, masking '
+                         'dark lens corners. The 472 default exceeds the 377 px '
+                         'half-diagonal of a 640x400 frame, i.e. it masks nothing.')
+parser.add_argument('--basalt-accel-noise-var', type=float, nargs=3, default=None,
+                    metavar=('X', 'Y', 'Z'),
+                    help='BasaltVIO accelerometer noise VARIANCE per axis (m/s^2)^2. '
+                         'Despite the setter being named setAccelNoiseStd, depthai '
+                         'square-ROOTS what it is given, so pass variance. Measure it '
+                         'with scripts stationary; this OAK-D reads ~1.6e-4.')
+parser.add_argument('--basalt-gyro-noise-var', type=float, nargs=3, default=None,
+                    metavar=('X', 'Y', 'Z'),
+                    help='BasaltVIO gyroscope noise VARIANCE per axis (rad/s)^2. '
+                         'Same square-root caveat as the accelerometer. This OAK-D '
+                         'reads ~1.1e-6.')
+parser.add_argument('--basalt-config-path', default='',
+                    help='Optional Basalt JSON config file. It is loaded FIRST and '
+                         'then overridden by any --basalt-* flag above.')
 parser.add_argument('--num-features', type=int, default=400,
                     help='RTAB-Map VIO FeatureTracker target feature count. 400 is validated '
                          'on this OAK-D Lite; higher values have not initialized reliably.')
@@ -165,6 +209,16 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.config_pub.publish(String(data=json.dumps({
             'vio_backend': args.vio_backend,
             'num_features': args.num_features,
+            'basalt_grid_size': args.basalt_grid_size,
+            'basalt_points_per_cell': args.basalt_points_per_cell,
+            'basalt_max_kfs': args.basalt_max_kfs,
+            'basalt_max_states': args.basalt_max_states,
+            'basalt_obs_std_dev': args.basalt_obs_std_dev,
+            'basalt_init_bg_weight': args.basalt_init_bg_weight,
+            'basalt_image_safe_radius': args.basalt_image_safe_radius,
+            'basalt_accel_noise_var': args.basalt_accel_noise_var,
+            'basalt_gyro_noise_var': args.basalt_gyro_noise_var,
+            'basalt_config_path': args.basalt_config_path,
             'fps': args.fps,
             'width': args.width,
             'height': args.height,
@@ -872,6 +926,100 @@ with dai.Pipeline() as p:
     imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
     imu.setBatchReportThreshold(1)
     imu.setMaxBatchReports(10)
+
+    if args.vio_backend == 'basalt':
+        # State the IMU rate rather than relying on the node default matching the
+        # 200 Hz enabled above; the C++ reference example sets it explicitly too.
+        odom.setImuUpdateRate(200)
+        # A config file, when supplied, is the base; the flags then override it.
+        if args.basalt_config_path:
+            odom.setConfigPath(args.basalt_config_path)
+        vio_config = dai.VioConfig()
+        vio_config.optical_flow_type = 'frame_to_frame'
+        vio_config.optical_flow_detection_grid_size = args.basalt_grid_size
+        vio_config.optical_flow_detection_num_points_cell = args.basalt_points_per_cell
+        vio_config.optical_flow_detection_min_threshold = 5
+        vio_config.optical_flow_detection_max_threshold = 40
+        vio_config.optical_flow_detection_nonoverlap = True
+        vio_config.optical_flow_max_recovered_dist2 = 0.04
+        vio_config.optical_flow_pattern = 51
+        vio_config.optical_flow_max_iterations = 5
+        vio_config.optical_flow_epipolar_error = 0.005
+        vio_config.optical_flow_levels = 3
+        vio_config.optical_flow_skip_frames = 1
+        # optical_flow_matching_guess_type CANNOT be set from Python in depthai
+        # 3.5.0: MatchingGuessType, LinearizationType and KeyframeMargCriteria are
+        # unregistered pybind types, so touching those three fields raises
+        # TypeError. py::init<>() value-initialises the struct, so they arrive as
+        # 0 -- which is the node default for the other two but NOT for this one,
+        # silently demoting REPROJ_AVG_DEPTH (2) to SAME_PIXEL (0). At 20 Hz the
+        # inter-frame motion is small enough for SAME_PIXEL to track, but this is
+        # the one setting the C++ node can reach and this one cannot.
+        vio_config.optical_flow_matching_default_depth = 2.0
+        vio_config.optical_flow_image_safe_radius = args.basalt_image_safe_radius
+        vio_config.optical_flow_recall_enable = False
+        vio_config.optical_flow_recall_all_cams = False
+        vio_config.optical_flow_recall_num_points_cell = True
+        vio_config.optical_flow_recall_over_tracking = False
+        vio_config.optical_flow_recall_update_patch_viewpoint = False
+        vio_config.optical_flow_recall_max_patch_dist = 3
+        vio_config.optical_flow_recall_max_patch_norms = [1.74, 0.96, 0.99, 0.44]
+        # vio_linearization_type: unregistered enum, see above. Value-initialises
+        # to 0 == ABS_QR, which is the intended default anyway.
+        vio_config.vio_sqrt_marg = True
+        vio_config.vio_max_states = args.basalt_max_states
+        vio_config.vio_max_kfs = args.basalt_max_kfs
+        vio_config.vio_min_frames_after_kf = 5
+        vio_config.vio_new_kf_keypoints_thresh = 0.7
+        vio_config.vio_debug = False
+        vio_config.vio_extended_logging = False
+        vio_config.vio_obs_std_dev = args.basalt_obs_std_dev
+        vio_config.vio_obs_huber_thresh = 1.0
+        vio_config.vio_min_triangulation_dist = 0.05
+        vio_config.vio_max_iterations = 7
+        vio_config.vio_enforce_realtime = False
+        vio_config.vio_use_lm = True
+        vio_config.vio_lm_lambda_initial = 1e-4
+        vio_config.vio_lm_lambda_min = 1e-6
+        vio_config.vio_lm_lambda_max = 1e2
+        vio_config.vio_scale_jacobian = False
+        vio_config.vio_init_pose_weight = 1e8
+        vio_config.vio_init_ba_weight = 1e1
+        vio_config.vio_init_bg_weight = args.basalt_init_bg_weight
+        vio_config.vio_marg_lost_landmarks = True
+        vio_config.vio_fix_long_term_keyframes = False
+        vio_config.vio_kf_marg_feature_ratio = 0.1
+        # vio_kf_marg_criteria: unregistered enum; 0 == KF_MARG_DEFAULT, correct.
+        vio_config.mapper_obs_std_dev = 0.25
+        vio_config.mapper_obs_huber_thresh = 1.5
+        vio_config.mapper_detection_num_points = 800
+        vio_config.mapper_num_frames_to_match = 30
+        vio_config.mapper_frames_to_match_threshold = 0.04
+        vio_config.mapper_min_matches = 20
+        vio_config.mapper_ransac_threshold = 5e-5
+        vio_config.mapper_min_track_length = 5
+        vio_config.mapper_max_hamming_distance = 70
+        vio_config.mapper_second_best_test_ratio = 1.2
+        vio_config.mapper_bow_num_bits = 16
+        vio_config.mapper_min_triangulation_dist = 0.07
+        vio_config.mapper_no_factor_weights = False
+        vio_config.mapper_use_factors = True
+        vio_config.mapper_use_lm = True
+        vio_config.mapper_lm_lambda_min = 1e-32
+        vio_config.mapper_lm_lambda_max = 1e3
+        # setConfig() replaces the whole struct, so every field above has to be
+        # restated -- the values that carry no flag are setDefaultVIOConfig()'s
+        # own, copied from src/basalt/BasaltVIO.cpp.
+        odom.setConfig(vio_config)
+        # NOTE: these setters are named ...NoiseStd but depthai applies
+        # cwiseSqrt() to what it receives, so they take VARIANCE.
+        # setAccelBias/setGyroBias are deliberately not used: in depthai 3.5.0
+        # they comma-initialise a 12-element Eigen vector from 9 values, so let
+        # Basalt estimate the biases online instead (see --basalt-init-bg-weight).
+        if args.basalt_accel_noise_var is not None:
+            odom.setAccelNoiseStd(list(args.basalt_accel_noise_var))
+        if args.basalt_gyro_noise_var is not None:
+            odom.setGyroNoiseStd(list(args.basalt_gyro_noise_var))
 
     if featureTracker is not None:
         featureTracker.setHardwareResources(1, 2)

@@ -51,13 +51,23 @@ DEFAULT_TARGETS = {
     "slam": "basalt_rtabmap_slam_ros2",
     "xrce_agent": "MicroXRCEAgent",
     "vio_bridge": "vio_to_px4_odometry",
-    "planner": "offboard_global_planner",
+    # Node executables are matched by their INSTALL PATH, not by bare name.
+    # `ros2 launch px4_vio_bridge offboard_global_planner.launch.py` carries the
+    # launch file's name on its own command line, so a bare "offboard_global_
+    # planner" also matched the launch process and silently added ~1.5-3% of a
+    # core to the adapter's row (and to astar's). Bags before 2026-08-28 08:30
+    # carry that inflation. The lib/ prefix appears only on the node itself.
+    "planner": "lib/px4_vio_bridge/offboard_global_planner",
+    "planner_cpp": "lib/px4_vio_bridge/cpp_flight_adapter",
+    "planner_cpp_shadow": "lib/px4_vio_bridge/cpp_clearance_shadow",
     # The A* planner and the follower are the monitor-launch nodes, not the
     # grid_planner/path_follower modules they import — matching on the module
     # names finds no process at all.
-    "astar": "global_planner_monitor",
-    "follower": "route_follower_monitor",
-    "planner_sim": "global_planner_sim",
+    "astar": "lib/px4_vio_bridge/global_planner_monitor",
+    "astar_cpp": "lib/px4_vio_bridge/cpp_astar_planner",
+    "follower": "lib/px4_vio_bridge/route_follower_monitor",
+    "follower_cpp": "lib/px4_vio_bridge/cpp_route_follower",
+    "planner_sim": "lib/px4_vio_bridge/global_planner_sim",
     "bag_record": "ros2 bag record",
     "foxglove": "foxglove_bridge",
     "battery": "battery_to_ros",
