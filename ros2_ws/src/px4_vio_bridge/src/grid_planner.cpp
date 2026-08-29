@@ -681,4 +681,126 @@ bool should_replace_path(
   return candidate_length < projection->remaining * (1.0 - switch_improvement);
 }
 
+
+const char * to_string(GoalMode mode)
+{
+  switch (mode) {
+    case GoalMode::PathValid:
+      return "PATH_VALID";
+    case GoalMode::SafeApproach:
+      return "SAFE_APPROACH";
+    case GoalMode::Exploring:
+      break;
+  }
+  return "EXPLORING";
+}
+
+GoalMode goal_mode_from(bool exact, bool terminal)
+{
+  if (exact) {
+    return GoalMode::PathValid;
+  }
+  return terminal ? GoalMode::SafeApproach : GoalMode::Exploring;
+}
+
+bool goal_mode_terminal(GoalMode mode)
+{
+  return mode != GoalMode::Exploring;
+}
+
+GoalModeHysteresis::GoalModeHysteresis(int confirmation_maps)
+: confirmation_maps_(std::max(1, confirmation_maps))
+{
+}
+
+void GoalModeHysteresis::reset()
+{
+  initialized_ = false;
+  pending_.reset();
+  pending_count_ = 0;
+  last_counted_generation_.reset();
+}
+
+void GoalModeHysteresis::commit(GoalMode mode)
+{
+  stable_ = mode;
+  initialized_ = true;
+  pending_.reset();
+  pending_count_ = 0;
+  last_counted_generation_.reset();
+}
+
+ModeDecision GoalModeHysteresis::decision() const
+{
+  ModeDecision result;
+  result.stable = stable_;
+  result.confirmation_maps = confirmation_maps_;
+  result.has_pending = pending_.has_value();
+  result.pending = pending_.value_or(stable_);
+  result.pending_count = pending_count_;
+  return result;
+}
+
+ModeDecision GoalModeHysteresis::observe(GoalMode raw, std::int64_t map_generation)
+{
+  if (!initialized_) {
+    // Nothing is committed yet, so there is no old meaning to protect.
+    commit(raw);
+    auto result = decision();
+    result.committed = true;
+    return result;
+  }
+  if (raw == stable_) {
+    pending_.reset();
+    pending_count_ = 0;
+    last_counted_generation_.reset();
+    return decision();
+  }
+  if (!pending_.has_value() || *pending_ != raw) {
+    // A contradictory sample replaces the candidate rather than adding to it.
+    pending_ = raw;
+    pending_count_ = 1;
+    last_counted_generation_ = map_generation;
+  } else if (!last_counted_generation_.has_value() ||
+    *last_counted_generation_ != map_generation)
+  {
+    // Only a genuinely new occupancy grid is new evidence. Repeated planner
+    // ticks on one map must not confirm anything.
+    ++pending_count_;
+    last_counted_generation_ = map_generation;
+  }
+  if (pending_count_ >= confirmation_maps_) {
+    commit(raw);
+    auto result = decision();
+    result.committed = true;
+    return result;
+  }
+  return decision();
+}
+
+std::string GoalModeHysteresis::pending_suffix() const
+{
+  if (!pending_.has_value()) {
+    return {};
+  }
+  return std::string(" MODE_PENDING ") + to_string(stable_) + "->" + to_string(*pending_) +
+         " " + std::to_string(pending_count_) + "/" + std::to_string(confirmation_maps_);
+}
+
+
+PathReplacementDecision decide_path_replacement(const PathReplacementInputs & inputs)
+{
+  PathReplacementDecision decision;
+  decision.off_corridor = !inputs.projection.has_value() ||
+    inputs.projection->distance > inputs.retain_tolerance;
+  decision.transition_hold = inputs.mode_transition_pending && inputs.retained_safe &&
+    !decision.off_corridor && !inputs.goal_changed;
+  decision.replace = !decision.transition_hold &&
+    (inputs.goal_changed || inputs.effective_goal_changed ||
+    should_replace_path(
+      inputs.projection, inputs.candidate_length, inputs.retain_tolerance,
+      inputs.switch_improvement));
+  return decision;
+}
+
 }  // namespace px4_vio_bridge

@@ -73,7 +73,10 @@ FLIGHT_RECORD_TOPICS = (
     "/planner/expanded_cells",
     "/planner/goal_exact",
     "/planner/goal_terminal",
+    "/planner/map_generation",
     "/planner/path",
+    "/planner/path_map_generation",
+    "/planner/correction_epoch",
     "/planner/path_length",
     "/planner/planning_ms",
     "/planner/status",
@@ -194,7 +197,7 @@ def generate_launch_description():
         # pinned back to Python (`cpp_nodes:=true cpp_mode:=false`) to bisect a
         # regression. Spell it the same way on global_planner_monitor.launch.py
         # to move the whole flight stack together.
-        DeclareLaunchArgument("cpp_nodes", default_value="false"),
+        DeclareLaunchArgument("cpp_nodes", default_value="true"),
         # Selection contract: false starts the Python adapter; true replaces
         # that process with the C++ one. Both command PX4 and take the same
         # parameters. The C++ command math is parity-tested against the Python
@@ -205,7 +208,7 @@ def generate_launch_description():
         # process_monitor reports both processes' CPU. This is the only way to
         # get a C++ CPU number in flight until cpp_mode is airworthy.
         DeclareLaunchArgument("cpp_shadow", default_value="false"),
-        DeclareLaunchArgument("hover_height", default_value="0.40"),
+        DeclareLaunchArgument("hover_height", default_value="0.30"),
         DeclareLaunchArgument("climb_timeout", default_value="15.0"),
         # Altitude ramp + vz feedforward (see OffboardHover.ramp_z). climb_rate
         # 0 restores the pre-2026-08-28 position step that took 20.4 s to climb
@@ -216,9 +219,9 @@ def generate_launch_description():
         # Horizontal equivalent. Default since the 2026-08-28 03:5x runs;
         # false restores the position-only command.
         DeclareLaunchArgument("horizontal_feedforward", default_value="true"),
-        DeclareLaunchArgument("max_flight_time", default_value="45.0"),
+        DeclareLaunchArgument("max_flight_time", default_value="60.0"),
         DeclareLaunchArgument("perf_monitor", default_value="true"),
-        DeclareLaunchArgument("command_speed", default_value="0.10"),
+        DeclareLaunchArgument("command_speed", default_value="0.20"),
         DeclareLaunchArgument("command_acceleration", default_value="0.30"),
         DeclareLaunchArgument(
             "path_command_projection_tolerance", default_value="0.05"
@@ -230,20 +233,24 @@ def generate_launch_description():
             "path_command_connector_tolerance", default_value="0.20"
         ),
         DeclareLaunchArgument(
-            "path_command_suffix_tolerance", default_value="0.01"
+            # The fault-free tunnel flight republished the same physical path
+            # with 1.1-2.4 cm map-correction shifts. Three centimetres lets the
+            # shared-suffix path preserve speed across those coordinate updates
+            # while genuinely different routes still use the bounded rejoin.
+            "path_command_suffix_tolerance", default_value="0.03"
         ),
         DeclareLaunchArgument("path_corner_tolerance", default_value="0.05"),
         # Carry speed through bends instead of stopping at each one.
-        DeclareLaunchArgument("corner_blending", default_value="false"),
+        DeclareLaunchArgument("corner_blending", default_value="true"),
         DeclareLaunchArgument("junction_deviation", default_value="0.05"),
         DeclareLaunchArgument("climb_release", default_value="0.05"),
         DeclareLaunchArgument("route_command_grace", default_value="2.0"),
         DeclareLaunchArgument("replan_during_yaw_align", default_value="false"),
-        DeclareLaunchArgument("geofence_radius", default_value="1.0"),
-        DeclareLaunchArgument("planner_fault_land_time", default_value="3.0"),
+        DeclareLaunchArgument("geofence_radius", default_value="3.0"),
+        DeclareLaunchArgument("planner_fault_land_time", default_value="6.0"),
         DeclareLaunchArgument("goal_hold_time", default_value="3.0"),
-        DeclareLaunchArgument("max_correction_m", default_value="0.25"),
-        DeclareLaunchArgument("max_correction_yaw_deg", default_value="5.0"),
+        DeclareLaunchArgument("max_correction_m", default_value="1.0"),
+        DeclareLaunchArgument("max_correction_yaw_deg", default_value="10.0"),
         DeclareLaunchArgument("min_vio_features", default_value="80"),
         DeclareLaunchArgument("vio_feature_loss_time", default_value="0.25"),
         DeclareLaunchArgument("max_horizontal_error", default_value="0.35"),

@@ -1,5 +1,12 @@
 """Observation-only global costmap and repeated-A* monitor.
 
+LEGACY. src/global_planner_node.cpp (``cpp_astar_planner``) is the flown
+implementation. This module is kept for reference and for the parity tests that
+still cover it; it does NOT have the 2026-08-29 stability work -- correction-
+canonical accepted paths, goal-mode hysteresis, or the generation telemetry the
+follower pairs its correction episodes against. Run the planner with
+``cpp_astar:=true`` (implied by ``cpp_nodes:=true``).
+
 This node publishes no PX4 topics. It plans in the loop-corrected RTAB-Map
 ``world`` frame and exposes both the latest candidate and the stable accepted
 path for Foxglove inspection.

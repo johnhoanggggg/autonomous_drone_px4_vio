@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <optional>
 
 namespace px4_vio_bridge
 {
@@ -100,6 +101,98 @@ bool finite(const Point2 & point)
   return std::isfinite(point.first) && std::isfinite(point.second);
 }
 
+// Shared continuous-clearance implementation.
+//
+// `window` bounds how far from the segment occupied cells are looked for. Any
+// cell outside the segment's bounding box grown by `window` lies at least
+// `window` away, so a result at or below the window is already exact. With no
+// window supplied the search doubles until that holds, which makes the answer
+// exact; with one supplied the caller only wants a threshold decision and a
+// single bounded pass suffices.
+std::optional<double> clearance_impl(
+  const GridMap & grid, const Point2 & start, const Point2 & end,
+  int occupied_threshold, std::optional<double> window_limit)
+{
+  if (!grid.valid() || !finite(start) || !finite(end) ||
+    occupied_threshold < 0 || occupied_threshold > 100)
+  {
+    return std::nullopt;
+  }
+
+  const auto world_to_cell = [&grid](const Point2 & point) -> std::pair<int, int> {
+      return {
+        static_cast<int>(std::floor((point.first - grid.origin_x) / grid.resolution)),
+        static_cast<int>(std::floor((point.second - grid.origin_y) / grid.resolution))};
+    };
+  const auto length = std::hypot(end.first - start.first, end.second - start.second);
+  const auto known_steps = std::max(1, static_cast<int>(std::ceil(length * 2.0 / grid.resolution)));
+  for (int index = 0; index <= known_steps; ++index) {
+    const auto fraction = static_cast<double>(index) / known_steps;
+    const Point2 point{
+      start.first + fraction * (end.first - start.first),
+      start.second + fraction * (end.second - start.second)};
+    const auto [x, y] = world_to_cell(point);
+    // Unknown and outside-map space stay blocked: they have no clearance, they
+    // are not merely far from an obstacle.
+    if (!grid.in_bounds(x, y) || grid.value(x, y) < 0) {
+      return std::nullopt;
+    }
+  }
+
+  const auto scan = [&](double window) -> std::optional<double> {
+      auto x0 = static_cast<int>(std::floor(
+          (std::min(start.first, end.first) - window - grid.origin_x) / grid.resolution));
+      auto x1 = static_cast<int>(std::floor(
+          (std::max(start.first, end.first) + window - grid.origin_x) / grid.resolution));
+      auto y0 = static_cast<int>(std::floor(
+          (std::min(start.second, end.second) - window - grid.origin_y) / grid.resolution));
+      auto y1 = static_cast<int>(std::floor(
+          (std::max(start.second, end.second) + window - grid.origin_y) / grid.resolution));
+      x0 = std::max(0, x0);
+      y0 = std::max(0, y0);
+      x1 = std::min(static_cast<int>(grid.width) - 1, x1);
+      y1 = std::min(static_cast<int>(grid.height) - 1, y1);
+      if (x0 > x1 || y0 > y1) {
+        return std::nullopt;
+      }
+      auto best = std::numeric_limits<double>::infinity();
+      for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+          if (grid.value(x, y) < occupied_threshold) {
+            continue;
+          }
+          const auto cell_x0 = grid.origin_x + x * grid.resolution;
+          const auto cell_y0 = grid.origin_y + y * grid.resolution;
+          best = std::min(
+            best,
+            segment_box_distance(
+              start, end, cell_x0, cell_x0 + grid.resolution,
+              cell_y0, cell_y0 + grid.resolution));
+          if (best <= 0.0) {
+            return 0.0;
+          }
+        }
+      }
+      return best;
+    };
+
+  if (window_limit.has_value()) {
+    return scan(*window_limit);
+  }
+  const auto diagonal = std::hypot(
+    static_cast<double>(grid.width) * grid.resolution,
+    static_cast<double>(grid.height) * grid.resolution);
+  for (auto window = grid.resolution; ; window = std::min(window * 2.0, diagonal)) {
+    const auto best = scan(window);
+    if (!best.has_value()) {
+      return std::nullopt;
+    }
+    if (*best <= window || window >= diagonal) {
+      return best;
+    }
+  }
+}
+
 }  // namespace
 
 bool GridMap::valid() const
@@ -121,72 +214,31 @@ int GridMap::value(int x, int y) const
                                static_cast<std::size_t>(x)]);
 }
 
+std::optional<double> segment_minimum_clearance(
+  const GridMap & grid, const Point2 & start, const Point2 & end, int occupied_threshold)
+{
+  return clearance_impl(grid, start, end, occupied_threshold, std::nullopt);
+}
+
+std::optional<double> point_clearance(
+  const GridMap & grid, const Point2 & point, int occupied_threshold)
+{
+  return clearance_impl(grid, point, point, occupied_threshold, std::nullopt);
+}
+
 bool segment_has_clearance(
   const GridMap & grid, const Point2 & start, const Point2 & end,
   double required_clearance,
   int occupied_threshold)
 {
-  if (!grid.valid() || !finite(start) || !finite(end) ||
-    !std::isfinite(required_clearance) || required_clearance < 0.0 ||
-    occupied_threshold < 0 || occupied_threshold > 100)
-  {
+  if (!std::isfinite(required_clearance) || required_clearance < 0.0) {
     return false;
   }
-
-  const auto world_to_cell = [&grid](const Point2 & point) -> std::pair<int, int> {
-      return {
-        static_cast<int>(std::floor((point.first - grid.origin_x) / grid.resolution)),
-        static_cast<int>(std::floor((point.second - grid.origin_y) / grid.resolution))};
-    };
-  const auto length = std::hypot(end.first - start.first, end.second - start.second);
-  const auto known_steps = std::max(1, static_cast<int>(std::ceil(length * 2.0 / grid.resolution)));
-  for (int index = 0; index <= known_steps; ++index) {
-    const auto fraction = static_cast<double>(index) / known_steps;
-    const Point2 point{
-      start.first + fraction * (end.first - start.first),
-      start.second + fraction * (end.second - start.second)};
-    const auto [x, y] = world_to_cell(point);
-    if (!grid.in_bounds(x, y) || grid.value(x, y) < 0) {
-      return false;
-    }
-  }
-
-  auto x0 = static_cast<int>(std::floor(
-      (std::min(start.first, end.first) - required_clearance - grid.origin_x) /
-      grid.resolution));
-  auto x1 = static_cast<int>(std::floor(
-      (std::max(start.first, end.first) + required_clearance - grid.origin_x) /
-      grid.resolution));
-  auto y0 = static_cast<int>(std::floor(
-      (std::min(start.second, end.second) - required_clearance - grid.origin_y) /
-      grid.resolution));
-  auto y1 = static_cast<int>(std::floor(
-      (std::max(start.second, end.second) + required_clearance - grid.origin_y) /
-      grid.resolution));
-  x0 = std::max(0, x0);
-  y0 = std::max(0, y0);
-  x1 = std::min(static_cast<int>(grid.width) - 1, x1);
-  y1 = std::min(static_cast<int>(grid.height) - 1, y1);
-  if (x0 > x1 || y0 > y1) {
-    return false;
-  }
-
-  for (int y = y0; y <= y1; ++y) {
-    for (int x = x0; x <= x1; ++x) {
-      if (grid.value(x, y) < occupied_threshold) {
-        continue;
-      }
-      const auto cell_x0 = grid.origin_x + x * grid.resolution;
-      const auto cell_y0 = grid.origin_y + y * grid.resolution;
-      if (segment_box_distance(
-          start, end, cell_x0, cell_x0 + grid.resolution,
-          cell_y0, cell_y0 + grid.resolution) + 1.0e-9 < required_clearance)
-      {
-        return false;
-      }
-    }
-  }
-  return true;
+  // The window only has to reach `required_clearance`: any cell it excludes is
+  // at least that far away, so a bounded scan still decides the threshold.
+  const auto clearance =
+    clearance_impl(grid, start, end, occupied_threshold, required_clearance);
+  return clearance.has_value() && *clearance + 1.0e-9 >= required_clearance;
 }
 
 }  // namespace px4_vio_bridge

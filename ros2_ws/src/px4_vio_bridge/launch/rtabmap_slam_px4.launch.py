@@ -88,11 +88,11 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_publish_depth", default_value="false"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
-            DeclareLaunchArgument("slam_publish_grid", default_value="false"),
-            DeclareLaunchArgument("slam_grid_3d", default_value="true"),
-            DeclareLaunchArgument("slam_grid_cell_size", default_value="0.10"),
-            DeclareLaunchArgument("slam_grid_ray_tracing", default_value="false"),
-            DeclareLaunchArgument("slam_grid_footprint_radius", default_value="0.0"),
+            DeclareLaunchArgument("slam_publish_grid", default_value="true"),
+            DeclareLaunchArgument("slam_grid_3d", default_value="false"),
+            DeclareLaunchArgument("slam_grid_cell_size", default_value="0.03"),
+            DeclareLaunchArgument("slam_grid_ray_tracing", default_value="true"),
+            DeclareLaunchArgument("slam_grid_footprint_radius", default_value="0.25"),
             DeclareLaunchArgument("slam_num_features", default_value="500"),
             # Flattens PX4 battery telemetry into std_msgs so Foxglove Gauge and
             # Indicator panels can bind to it directly. Added 2026-07-27 after a

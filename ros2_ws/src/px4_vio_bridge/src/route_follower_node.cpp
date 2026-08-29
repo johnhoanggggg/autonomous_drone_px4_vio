@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -205,7 +206,20 @@ public:
     correction_material_yaw_deg_ =
       declare_parameter<double>("correction_material_yaw_deg", 0.75);
     correction_settle_time_ = declare_parameter<double>("correction_settle_time", 0.40);
-    correction_cooldown_ = declare_parameter<double>("correction_cooldown", 8.0);
+    // Replaces the old blind 8 s cooldown: long enough that one settling
+    // episode cannot immediately reopen on its own residual, short enough that
+    // a run of material steps a second apart is still seen.
+    correction_rearm_guard_ =
+      std::max(0.0, declare_parameter<double>("correction_rearm_guard", 0.20));
+    // Material clearance an escape must gain at its endpoint. Small on purpose:
+    // it exists to forbid indefinite lateral motion at the same clearance, not
+    // to demand a large step.
+    escape_minimum_improvement_ =
+      declare_parameter<double>("escape_minimum_improvement", 0.01);
+    map_generation_topic_ =
+      declare_parameter<std::string>("map_generation_topic", "/planner/map_generation");
+    path_map_generation_topic_ = declare_parameter<std::string>(
+      "path_map_generation_topic", "/planner/path_map_generation");
 
     required_clearance_ = robot_radius_ + safety_margin_;
     if (required_clearance_ <= 0.0) {
@@ -214,11 +228,16 @@ public:
     if (min_lookahead_ > lookahead_) {
       throw std::invalid_argument("min_lookahead must not exceed lookahead");
     }
+    if (!std::isfinite(escape_minimum_improvement_) || escape_minimum_improvement_ <= 0.0) {
+      throw std::invalid_argument("escape_minimum_improvement must be positive");
+    }
+    escape_limits_.required_clearance = required_clearance_;
+    escape_limits_.minimum_improvement = escape_minimum_improvement_;
     correction_gate_ = std::make_unique<CorrectionReplanGate>(
       correction_translation_trigger_, correction_yaw_trigger_deg_ * kPi / 180.0,
       correction_filter_time_constant_, correction_material_translation_,
       correction_material_yaw_deg_ * kPi / 180.0, correction_settle_time_,
-      correction_cooldown_);
+      correction_rearm_guard_);
     follower_ = std::make_unique<PositionRouteFollower>(
       lookahead_, max_carrot_speed_, max_carrot_acceleration_, max_cross_track_,
       cross_track_resume_, cross_track_recovery_time_, arrival_tolerance_,
@@ -246,6 +265,18 @@ public:
     correction_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       correction_topic_, 10,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {on_correction(*msg);});
+    // Generation pairing. A path receipt alone cannot clear a post-correction
+    // hold: the path may have been planned from the pre-correction grid.
+    map_generation_sub_ = create_subscription<std_msgs::msg::Int32>(
+      map_generation_topic_, map_qos,
+      [this](std_msgs::msg::Int32::ConstSharedPtr msg) {
+        correction_gate_->map_received(msg->data, monotonic_seconds());
+      });
+    path_map_generation_sub_ = create_subscription<std_msgs::msg::Int32>(
+      path_map_generation_topic_, map_qos,
+      [this](std_msgs::msg::Int32::ConstSharedPtr msg) {
+        correction_gate_->path_map_generation(msg->data, monotonic_seconds());
+      });
 
     carrot_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       "/planner/follower/carrot", 10);
@@ -269,6 +300,12 @@ public:
       create_publisher<std_msgs::msg::Int32>("/planner/follower/path_generation", 10);
     markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "/planner/follower/markers", 10);
+    correction_epoch_pub_ = create_publisher<std_msgs::msg::Int32>(
+      "/planner/correction_epoch", map_qos);
+    // Latch the starting epoch so a late recorder still sees the baseline.
+    std_msgs::msg::Int32 epoch;
+    epoch.data = 0;
+    correction_epoch_pub_->publish(epoch);
     config_pub_ = create_publisher<std_msgs::msg::String>(
       "/planner/follower/config", map_qos);
     publish_config();
@@ -309,7 +346,10 @@ private:
       {"correction_material_translation", correction_material_translation_},
       {"correction_material_yaw_deg", correction_material_yaw_deg_},
       {"correction_settle_time", correction_settle_time_},
-      {"correction_cooldown", correction_cooldown_}};
+      {"correction_rearm_guard", correction_rearm_guard_},
+      {"escape_minimum_improvement", escape_minimum_improvement_},
+      {"map_generation_topic", map_generation_topic_},
+      {"path_map_generation_topic", path_map_generation_topic_}};
     std_msgs::msg::String message;
     message.data = config.dump();
     config_pub_->publish(message);
@@ -375,24 +415,14 @@ private:
     map_received_ = monotonic_seconds();
   }
 
-  bool command_has_clearance(const Point2 & start, const Point2 & end) const
+  ClearanceProbe clearance_probe() const
   {
-    return grid_ && segment_has_clearance(
-      *grid_, start, end, required_clearance_, occupied_threshold_);
-  }
-
-  std::optional<double> safe_lookahead(const Point2 & pose) const
-  {
-    const auto projection = follower_->path()->project(pose);
-    for (double candidate = lookahead_;
-      candidate + 1.0e-12 >= min_lookahead_; candidate -= lookahead_step_)
-    {
-      const auto target = follower_->path()->point_at(projection.along + candidate);
-      if (command_has_clearance(pose, target)) {
-        return candidate;
-      }
-    }
-    return std::nullopt;
+    return [this](const Point2 & start, const Point2 & end) -> std::optional<double> {
+             if (!grid_) {
+               return std::nullopt;
+             }
+             return segment_minimum_clearance(*grid_, start, end, occupied_threshold_);
+           };
   }
 
   void on_raw_vio(const geometry_msgs::msg::PoseStamped & message)
@@ -416,7 +446,7 @@ private:
     }
     follower_->reset_route_progress();
     follower_->clear_path();
-    path_start_.reset();
+    follower_->set_escape(false);
     goal_terminal_ = false;
   }
 
@@ -432,7 +462,14 @@ private:
     path_received_ = now;
     if (message.poses.empty()) {
       follower_->clear_path();
-      path_start_.reset();
+      return;
+    }
+    if (!correction_ || !correction_valid_) {
+      // Map-frame points are meaningless without the transform they belong to:
+      // storing them against a guessed correction would corrupt the canonical
+      // route. The tick already reports the missing correction.
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000, "path deferred: no valid map correction yet");
       return;
     }
     std::vector<Point2> points;
@@ -440,11 +477,33 @@ private:
     for (const auto & pose : message.poses) {
       points.emplace_back(pose.pose.position.x, pose.pose.position.y);
     }
+    // Deferred while a correction episode is settling: this path may have been
+    // planned from the pre-correction grid, and installing it would be exactly
+    // the frame mismatch the episode exists to prevent. The accepted route is
+    // stored canonically in VIO and re-expressed into the newest correction on
+    // every tick, so continuing to fly it is safe -- what must wait is taking a
+    // NEW path on trust. Receipt is still recorded, so the gate can settle and
+    // path_timeout cannot fire on the deferral.
+    correction_gate_->path_received(now);
+    if (defer_path_for_correction(
+        correction_gate_->pending(), follower_->path() != nullptr))
+    {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "path deferred while the map correction settles (epoch %ld)",
+        static_cast<long>(correction_gate_->epoch()));
+      return;
+    }
     const Point2 anchor = pose_ ? Point2{(*pose_)[0], (*pose_)[1]} : points.front();
+    // The path is paired with this node's newest correction rather than with a
+    // snapshot travelling alongside the message, so at most the corrections in
+    // flight between the planner's publish and this receipt can slip. That
+    // window is sub-millimetre while the correction is quiet, and the material
+    // case -- a loop closure -- is exactly what the gate below holds through:
+    // the path that finally releases the hold is one received after the episode
+    // settled, when the two nodes' corrections agree.
     try {
-      const bool changed = follower_->set_path(points, anchor);
-      correction_gate_->path_received(now);
-      path_start_ = points.front();
+      const bool changed = follower_->set_path(points, anchor, *correction_);
       if (changed) {
         RCLCPP_INFO(
           get_logger(), "accepted follower route generation %d", follower_->generation());
@@ -452,7 +511,6 @@ private:
     } catch (const std::exception & error) {
       RCLCPP_ERROR(get_logger(), "path rejected: %s", error.what());
       follower_->clear_path();
-      path_start_.reset();
     }
   }
 
@@ -476,7 +534,14 @@ private:
       return;
     }
     correction_ = correction;
-    if (correction_gate_->observe(correction, now)) {
+    const bool opened = correction_gate_->observe(correction, now);
+    if (correction_epoch_published_ != correction_gate_->epoch()) {
+      correction_epoch_published_ = correction_gate_->epoch();
+      std_msgs::msg::Int32 epoch;
+      epoch.data = static_cast<std::int32_t>(correction_epoch_published_);
+      correction_epoch_pub_->publish(epoch);
+    }
+    if (opened) {
       const auto [translation, yaw] = correction_gate_->last_trigger_delta();
       RCLCPP_WARN(
         get_logger(),
@@ -573,6 +638,18 @@ private:
       interrupt_and_publish(
         "STALE_CORRECTION age=" + format(now - correction_received_, 2) + "s"); return;
     }
+    // Advance the correction episode here, ahead of every remaining early
+    // return. waiting() is the only thing that settles an episode, and it
+    // depends on receipts and time alone -- not on pose, map or path. Leaving
+    // it below the WAITING_FOR_PATH return meant a follower with no route
+    // could never clear an episode, which is half of the 20260829T102221Z
+    // abort; the other half was deferring the first path.
+    const bool was_waiting_for_correction = correction_gate_->pending();
+    const bool correction_settling = correction_gate_->waiting(now);
+    if (was_waiting_for_correction && !correction_settling) {
+      RCLCPP_INFO(
+        get_logger(), "map correction settled and fresh path received; follower resumed");
+    }
     if (!pose_) {interrupt_and_publish("WAITING_FOR_POSE"); return;}
     if (now - pose_received_ > pose_timeout_) {
       interrupt_and_publish("STALE_POSE age=" + format(now - pose_received_, 2) + "s"); return;
@@ -585,36 +662,73 @@ private:
     if (now - path_received_ > path_timeout_) {
       interrupt_and_publish("STALE_PATH age=" + format(now - path_received_, 2) + "s"); return;
     }
-    const bool was_waiting_for_correction = correction_gate_->pending();
-    if (correction_gate_->waiting(now)) {
-      interrupt_and_publish("WAITING_FOR_POST_CORRECTION_PATH"); return;
-    }
-    if (was_waiting_for_correction) {
-      RCLCPP_INFO(
-        get_logger(), "map correction settled and fresh path received; follower resumed");
-    }
+    // A settling correction episode does not stop the follower commanding: it
+    // gates path *acceptance* in on_path(). Holding validity low cost up to ~2s
+    // -- two thirds of the adapter's 3s planner-fault land timer (flight
+    // 20260829T085734Z) -- to guard against a frame mismatch that
+    // correction-canonical route storage already removes. The route still
+    // flown is re-expressed into the newest correction every tick and its
+    // command revalidated against the newest grid every tick.
     const Point2 pose_xy{(*pose_)[0], (*pose_)[1]};
-    const double start_error = distance(pose_xy, *path_start_);
+    // Re-express the accepted route in the newest map solution before anything
+    // is measured against it. Pose and route then move together, so a 5 cm
+    // loop closure cannot masquerade as cross-track or a path replacement.
+    follower_->rebase(*correction_);
+    const Point2 path_head = follower_->path()->points().front();
+    const double start_error = distance(pose_xy, path_head);
     if (start_error > path_start_tolerance_) {
       interrupt_and_publish("PATH_START_MISMATCH distance=" + format(start_error, 2) + "m");
       return;
     }
-    const auto selected_lookahead = safe_lookahead(pose_xy);
-    if (!selected_lookahead) {
+    const auto probe = clearance_probe();
+    const auto selection = select_safe_lookahead(
+      *follower_->path(), pose_xy, probe, escape_limits_,
+      lookahead_, lookahead_step_, min_lookahead_);
+    if (!selection) {
       follower_->hold_command();
-      const bool pose_safe = command_has_clearance(pose_xy, pose_xy);
-      publish_status(
-        std::string("CLEARANCE_BLOCKED reason=") +
-        (pose_safe ? "NO_SAFE_LOOKAHEAD" : "POSE_INSIDE_CLEARANCE") +
-        " required=" + format(required_clearance_, 2) + "m");
+      follower_->set_escape(false);
+      const auto pose_clearance = probe(pose_xy, pose_xy);
+      std::string status = "CLEARANCE_BLOCKED reason=";
+      if (!pose_clearance) {
+        // Unknown or outside-map space under the vehicle: not a clearance
+        // problem, and never something an escape may be attempted from.
+        status += "POSE_OUTSIDE_KNOWN_SPACE";
+      } else if (*pose_clearance + 1.0e-9 < required_clearance_) {
+        // Inside the envelope with no chord that both never worsens and
+        // materially improves. This is a genuine dead end, not the old
+        // by-construction deadlock.
+        status += "POSE_INSIDE_CLEARANCE_NO_ESCAPE clearance=" +
+          format(*pose_clearance, 3) + "m";
+      } else {
+        status += "NO_SAFE_LOOKAHEAD";
+      }
+      publish_status(status + " required=" + format(required_clearance_, 2) + "m");
       return;
     }
+    // The rising edge drops a stale displacement only when it no longer passes
+    // the escape predicate. A pose on the clearance threshold re-enters the
+    // escape every tick, and wiping unconditionally there starves the command.
+    const Point2 stale_carrot{
+      pose_xy.first + follower_->commanded_displacement().first,
+      pose_xy.second + follower_->commanded_displacement().second};
+    follower_->set_escape(
+      selection->escaping,
+      command_chord_admissible(
+        probe, pose_xy, stale_carrot, escape_limits_, selection->start_clearance,
+        ChordRole::IntermediateCarrot));
 
+    const auto start_clearance = selection->start_clearance;
     const auto result = follower_->update(
-      pose_xy, dt, selected_lookahead,
-      [this, &pose_xy](const Point2 & carrot) {
-        return command_has_clearance(pose_xy, carrot);
-      });
+      pose_xy, dt, selection->lookahead,
+      [this, &probe, &pose_xy, start_clearance](const Point2 & carrot) {
+        // The acceleration-limited carrot is validated with the same predicate
+        // as the desired lookahead: an intermediate carrot may not worsen
+        // clearance either.
+        return command_chord_admissible(
+          probe, pose_xy, carrot, escape_limits_, start_clearance,
+          ChordRole::IntermediateCarrot);
+      },
+      *correction_);
     const builtin_interfaces::msg::Time stamp = get_clock()->now();
     lookahead_pub_->publish(pose_message(result.desired_carrot, (*pose_)[2], stamp));
     carrot_pub_->publish(pose_message(result.commanded_carrot, (*pose_)[2], stamp));
@@ -624,12 +738,11 @@ private:
     displacement.vector.x = result.commanded_displacement.first;
     displacement.vector.y = result.commanded_displacement.second;
     displacement_pub_->publish(displacement);
-    const auto vio = map_displacement_to_vio(result.commanded_displacement, (*correction_)[3]);
     geometry_msgs::msg::Vector3Stamped vio_displacement;
     vio_displacement.header.stamp = stamp;
     vio_displacement.header.frame_id = "vio";
-    vio_displacement.vector.x = vio.first;
-    vio_displacement.vector.y = vio.second;
+    vio_displacement.vector.x = result.vio_displacement.first;
+    vio_displacement.vector.y = result.vio_displacement.second;
     vio_displacement_pub_->publish(vio_displacement);
     std_msgs::msg::Float32 scalar;
     scalar.data = static_cast<float>(result.progress); progress_pub_->publish(scalar);
@@ -639,13 +752,22 @@ private:
     std_msgs::msg::Int32 generation;
     generation.data = result.generation;
     generation_pub_->publish(generation);
-    publish_status(
-      result.status + " generation=" + std::to_string(result.generation) +
+    std::string status;
+    if (selection->escaping) {
+      status = "CLEARANCE_ESCAPING start=" + format(selection->start_clearance, 3) +
+        "m end=" + format(selection->end_clearance, 3) + "m required=" +
+        format(required_clearance_, 3) + "m status=";
+    }
+    if (correction_settling) {
+      status += "CORRECTION_SETTLING " + correction_gate_->pending_detail(now) + " ";
+    }
+    status += result.status + " generation=" + std::to_string(result.generation) +
       " progress=" + format(result.progress, 2) + "m path_progress=" +
       format(result.path_progress, 2) + "m remaining=" + format(result.remaining, 2) +
       "m cross_track=" + format(result.cross_track, 2) + "m lookahead=" +
-      format(*selected_lookahead, 2) + "/" + format(lookahead_, 2) + "m",
-      result.valid, requested_goal_reached(result.status, goal_terminal_));
+      format(selection->lookahead, 2) + "/" + format(lookahead_, 2) + "m";
+    publish_status(
+      status, result.valid, requested_goal_reached(result.status, goal_terminal_));
     publish_markers(result, stamp);
   }
 
@@ -661,7 +783,10 @@ private:
   double arrival_tolerance_{}, arrival_release_tolerance_{};
   double correction_translation_trigger_{}, correction_yaw_trigger_deg_{};
   double correction_filter_time_constant_{}, correction_material_translation_{};
-  double correction_material_yaw_deg_{}, correction_settle_time_{}, correction_cooldown_{};
+  double correction_material_yaw_deg_{}, correction_settle_time_{};
+  double correction_rearm_guard_{}, escape_minimum_improvement_{};
+  std::string map_generation_topic_, path_map_generation_topic_;
+  ClearanceEscapeLimits escape_limits_{};
   std::unique_ptr<CorrectionReplanGate> correction_gate_;
   std::unique_ptr<PositionRouteFollower> follower_;
 
@@ -676,7 +801,7 @@ private:
   std::optional<Correction4> correction_;
   bool goal_terminal_{false};
   double path_received_{};
-  std::optional<Point2> path_start_;
+  std::int64_t correction_epoch_published_{0};
   std::optional<GridMap> grid_;
   double map_received_{};
   double last_tick_{};
@@ -687,6 +812,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr goal_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr goal_terminal_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr correction_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr
+    map_generation_sub_, path_map_generation_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr carrot_pub_, lookahead_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr
     displacement_pub_, vio_displacement_pub_;
@@ -694,7 +821,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr valid_pub_, goal_reached_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr
     progress_pub_, path_progress_pub_, remaining_pub_, cross_track_pub_;
-  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr generation_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr generation_pub_, correction_epoch_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

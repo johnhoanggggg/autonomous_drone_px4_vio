@@ -36,11 +36,14 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "px4_vio_bridge/grid_planner.hpp"
+#include "px4_vio_bridge/path_geometry.hpp"
 
 namespace px4_vio_bridge
 {
 namespace
 {
+
+constexpr double kPi = 3.14159265358979323846;
 
 double monotonic_seconds()
 {
@@ -146,6 +149,17 @@ public:
     // Must stay under the follower's path_start_tolerance, which rejects a path
     // that starts too far away.
     path_head_margin_ = std::max(0.0, declare_parameter<double>("path_head_margin", 0.50));
+    correction_topic_ =
+      declare_parameter<std::string>("correction_topic", "/rtabmap/odom_correction");
+    correction_timeout_ = declare_parameter<double>("correction_timeout", 1.0);
+    max_correction_m_ = declare_parameter<double>("max_correction_m", 0.50);
+    max_correction_yaw_deg_ = declare_parameter<double>("max_correction_yaw_deg", 15.0);
+    // Distinct occupancy grids -- never planner ticks -- that must agree before
+    // a semantic mode change is committed. At ~1 Hz maps, 2 commits inside the
+    // flight adapter's 3 s planner-fault land timer.
+    mode_confirmation_maps_ = static_cast<int>(
+      std::max<int64_t>(1, declare_parameter<int64_t>("mode_confirmation_maps", 2)));
+    mode_ = GoalModeHysteresis(mode_confirmation_maps_);
     lethal_radius_ = robot_radius + safety_margin;
     inflation_radius_ = lethal_radius_ + inflation_extra;
 
@@ -161,6 +175,11 @@ public:
     goal_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
       goal_topic_, 10,
       [this](geometry_msgs::msg::PointStamped::SharedPtr msg) {on_goal(*msg);});
+    // The accepted route is stored in continuous VIO coordinates, so the
+    // planner needs the same map<-vio transform the follower validates.
+    correction_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      correction_topic_, 10,
+      [this](geometry_msgs::msg::PoseStamped::SharedPtr msg) {on_correction(*msg);});
 
     path_pub_ = create_publisher<nav_msgs::msg::Path>("/planner/path", 10);
     candidate_pub_ = create_publisher<nav_msgs::msg::Path>("/planner/candidate_path", 10);
@@ -175,6 +194,13 @@ public:
     goal_terminal_pub_ = create_publisher<std_msgs::msg::Bool>("/planner/goal_terminal", 10);
     effective_goal_pub_ = create_publisher<geometry_msgs::msg::PointStamped>(
       "/planner/effective_goal", 10);
+    // Latched generation telemetry. The follower pairs these with its own
+    // correction episodes so a path planned from the pre-correction grid can
+    // never release a post-correction hold.
+    map_generation_pub_ = create_publisher<std_msgs::msg::Int32>(
+      "/planner/map_generation", map_qos);
+    path_map_generation_pub_ = create_publisher<std_msgs::msg::Int32>(
+      "/planner/path_map_generation", map_qos);
     // TRANSIENT_LOCAL so a recorder started after this long-running node still
     // captures the effective launch overrides -- every bag stays self-describing.
     config_pub_ = create_publisher<std_msgs::msg::String>("/planner/config", map_qos);
@@ -192,6 +218,8 @@ private:
   void publish_config()
   {
     nlohmann::ordered_json config;
+    config["correction_timeout"] = correction_timeout_;
+    config["correction_topic"] = correction_topic_;
     config["cost_weight"] = cost_weight_;
     config["frame_id"] = frame_id_;
     config["goal_topic"] = goal_topic_;
@@ -203,6 +231,9 @@ private:
     config["lethal_radius"] = lethal_radius_;
     config["map_timeout"] = map_timeout_;
     config["map_topic"] = map_topic_;
+    config["max_correction_m"] = max_correction_m_;
+    config["max_correction_yaw_deg"] = max_correction_yaw_deg_;
+    config["mode_confirmation_maps"] = mode_confirmation_maps_;
     config["occupied_threshold"] = occupied_threshold_;
     config["path_head_margin"] = path_head_margin_;
     config["path_retain_tolerance"] = path_retain_tolerance_;
@@ -262,6 +293,9 @@ private:
     grid_info_ = msg.info;
     ++grid_generation_;
     map_received_ = monotonic_seconds();
+    std_msgs::msg::Int32 generation;
+    generation.data = static_cast<std::int32_t>(grid_generation_);
+    map_generation_pub_->publish(generation);
   }
 
   void on_pose(const geometry_msgs::msg::PoseStamped & msg)
@@ -287,7 +321,74 @@ private:
     }
     goal_ = Point2{msg.point.x, msg.point.y};
     ++goal_generation_;
+    // A new requested goal carries no old semantic commitment.
+    mode_.reset();
     RCLCPP_WARN(get_logger(), "planner goal=(%.2f, %.2f)", goal_->first, goal_->second);
+  }
+
+  void on_correction(const geometry_msgs::msg::PoseStamped & msg)
+  {
+    const auto & p = msg.pose.position;
+    const auto & q = msg.pose.orientation;
+    const Correction4 correction{
+      p.x, p.y, p.z, yaw_from_quaternion(q.w, q.x, q.y, q.z)};
+    const auto reason = correction_rejection_reason(
+      correction, max_correction_m_, max_correction_yaw_deg_ * kPi / 180.0);
+    correction_seen_ = true;
+    correction_received_ = monotonic_seconds();
+    correction_valid_ = !reason.has_value();
+    correction_reason_ = reason.value_or("");
+    if (reason) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000, "native correction rejected: %s", reason->c_str());
+      return;
+    }
+    correction_ = correction;
+  }
+
+  // The accepted route lives in continuous VIO coordinates. Rendering it into
+  // the map solution paired with the current grid is what stops a 5 cm loop
+  // closure from looking like a path-replacement or off-path error.
+  [[nodiscard]] std::vector<Point2> accepted_in_map() const
+  {
+    std::vector<Point2> points;
+    if (!correction_) {
+      return points;
+    }
+    points.reserve(accepted_vio_points_.size());
+    for (const auto & point : accepted_vio_points_) {
+      points.push_back(vio_point_to_map(point, *correction_));
+    }
+    return points;
+  }
+
+  void store_accepted(const std::vector<Point2> & points)
+  {
+    accepted_vio_points_.clear();
+    accepted_vio_points_.reserve(points.size());
+    for (const auto & point : points) {
+      accepted_vio_points_.push_back(map_point_to_vio(point, *correction_));
+    }
+  }
+
+  void publish_path_map_generation()
+  {
+    std_msgs::msg::Int32 message;
+    message.data = static_cast<std::int32_t>(path_map_generation_);
+    path_map_generation_pub_->publish(message);
+  }
+
+  void publish_goal_flags(bool raw_exact, bool raw_terminal)
+  {
+    std_msgs::msg::Bool flag;
+    // Committed exact state. An exploration endpoint is never labelled exact
+    // just because PATH_VALID is still the committed mode.
+    flag.data = raw_exact && mode_.initialized() && mode_.stable() == GoalMode::PathValid;
+    goal_exact_pub_->publish(flag);
+    // Conservative completion permission: false the instant a raw result is
+    // nonterminal, true only once the terminal mode is committed.
+    flag.data = raw_terminal && mode_.initialized() && goal_mode_terminal(mode_.stable());
+    goal_terminal_pub_->publish(flag);
   }
 
   void ensure_inflated()
@@ -358,11 +459,13 @@ private:
 
   void clear_path(const std::string & status, const std::optional<Point2> & effective_goal)
   {
-    accepted_points_.clear();
-    accepted_effective_goal_.reset();
+    accepted_vio_points_.clear();
+    accepted_effective_goal_vio_.reset();
+    path_map_generation_ = grid_generation_;
     const auto empty = make_path({}, pose_.has_value() ? (*pose_)[2] : 0.0);
     candidate_pub_->publish(empty);
     path_pub_->publish(empty);
+    publish_path_map_generation();
     std_msgs::msg::Bool flag;
     flag.data = false;
     goal_exact_pub_->publish(flag);
@@ -462,6 +565,21 @@ private:
       publish_status("WAITING_FOR_POSE");
       return;
     }
+    // Fail closed: without a valid, fresh correction the accepted route cannot
+    // be expressed in the current map solution at all. Publishing nothing lets
+    // the follower go stale and the flight adapter hold, then land.
+    if (!correction_seen_) {
+      publish_status("WAITING_FOR_CORRECTION");
+      return;
+    }
+    if (!correction_valid_) {
+      publish_status("CORRECTION_REJECTED reason=" + correction_reason_);
+      return;
+    }
+    if (now_s - correction_received_ > correction_timeout_) {
+      publish_status("STALE_CORRECTION age=" + format(now_s - correction_received_, 2) + "s");
+      return;
+    }
     if (!goal_.has_value()) {
       publish_status("WAITING_FOR_GOAL");
       return;
@@ -495,19 +613,15 @@ private:
     }
     const auto goal_cell = selection->cell;
     const auto [exact, terminal] = classify_goal(*grid_, *inflated_, *goal_, goal_cell);
-    std_msgs::msg::Bool flag;
-    flag.data = exact;
-    goal_exact_pub_->publish(flag);
-    flag.data = terminal;
-    goal_terminal_pub_->publish(flag);
+    const auto raw_mode = goal_mode_from(exact, terminal);
+    // Counted against distinct occupancy grids, so repeated planner ticks on
+    // one map confirm nothing.
+    auto decision = mode_.observe(raw_mode, grid_generation_);
+    publish_goal_flags(exact, terminal);
+    // The candidate's endpoint. /planner/effective_goal is published further
+    // down with the endpoint of the route actually accepted, which during a
+    // pending mode transition is deliberately not this one.
     const auto effective_goal = inflated_->cell_center(goal_cell);
-    geometry_msgs::msg::PointStamped effective_message;
-    effective_message.header.stamp = now();
-    effective_message.header.frame_id = frame_id_;
-    effective_message.point.x = effective_goal.first;
-    effective_message.point.y = effective_goal.second;
-    effective_message.point.z = (*pose_)[2];
-    effective_goal_pub_->publish(effective_message);
 
     const PlanKey key{grid_generation_, goal_generation_, *start_cell, goal_cell};
     if (last_planned_key_.has_value() && *last_planned_key_ == key) {
@@ -537,8 +651,11 @@ private:
     expanded_message.data = result.expanded;
     expanded_pub_->publish(expanded_message);
     if (!result.found()) {
-      accepted_points_.clear();
+      accepted_vio_points_.clear();
+      accepted_effective_goal_vio_.reset();
+      path_map_generation_ = grid_generation_;
       path_pub_->publish(make_path({}, (*pose_)[2]));
+      publish_path_map_generation();
       const auto status = result.reason + " expanded=" + std::to_string(result.expanded) +
         " plan=" + format(total_ms, 1) + "ms";
       publish_status(status);
@@ -560,36 +677,84 @@ private:
     const auto candidate_length = path_length(candidate_points);
     candidate_pub_->publish(make_path(candidate_points, (*pose_)[2]));
 
-    const auto projection = path_valid(accepted_points_)
-      ? path_projection(accepted_points_, pose_xy)
+    // Everything below compares the retained route and the fresh candidate in
+    // one frame: the map solution this grid belongs to.
+    auto accepted_points = accepted_in_map();
+    // Mode debounce is not collision debounce. The retained route is
+    // revalidated against every new raw grid before it is allowed to survive.
+    const bool had_retained_route = !accepted_points.empty();
+    const bool retained_safe = path_valid(accepted_points);
+    const auto projection = retained_safe
+      ? path_projection(accepted_points, pose_xy)
       : std::nullopt;
     const auto goal_changed = accepted_goal_generation_ != goal_generation_;
-    const auto effective_goal_changed =
-      !accepted_effective_goal_.has_value() || *accepted_effective_goal_ != goal_cell;
-    const auto replace = goal_changed || effective_goal_changed ||
-      should_replace_path(
-      projection, candidate_length, path_retain_tolerance_, switch_improvement_);
-    if (replace) {
-      accepted_points_ = candidate_points;
-      accepted_goal_generation_ = goal_generation_;
-      accepted_effective_goal_ = goal_cell;
-      ++accepted_generation_;
-    } else {
-      accepted_points_ = trim_path_to(accepted_points_, pose_xy, path_head_margin_);
+    // Re-derive the accepted endpoint's cell in *this* grid. Comparing stored
+    // indices across grids with different origins or dimensions is meaningless.
+    std::optional<Cell> accepted_goal_cell;
+    if (accepted_effective_goal_vio_.has_value()) {
+      accepted_goal_cell = inflated_->world_to_cell(
+        vio_point_to_map(*accepted_effective_goal_vio_, *correction_));
     }
-    path_pub_->publish(make_path(accepted_points_, (*pose_)[2]));
-    const auto accepted_length = path_length(accepted_points_);
+    const auto effective_goal_changed =
+      !accepted_goal_cell.has_value() || *accepted_goal_cell != goal_cell;
+    PathReplacementInputs inputs;
+    inputs.mode_transition_pending = decision.has_pending;
+    inputs.retained_safe = retained_safe;
+    inputs.goal_changed = goal_changed;
+    inputs.effective_goal_changed = effective_goal_changed;
+    inputs.projection = projection;
+    inputs.candidate_length = candidate_length;
+    inputs.retain_tolerance = path_retain_tolerance_;
+    inputs.switch_improvement = switch_improvement_;
+    const auto replacement = decide_path_replacement(inputs);
+    Point2 accepted_effective_goal = effective_goal;
+    if (replacement.replace) {
+      accepted_points = candidate_points;
+      accepted_goal_generation_ = goal_generation_;
+      ++accepted_generation_;
+      // The old route is gone, so there is no older meaning left to protect.
+      mode_.commit(raw_mode);
+      decision = mode_.decision();
+      publish_goal_flags(exact, terminal);
+    } else {
+      accepted_points = trim_path_to(accepted_points, pose_xy, path_head_margin_);
+      if (accepted_goal_cell.has_value()) {
+        accepted_effective_goal = inflated_->cell_center(*accepted_goal_cell);
+      }
+    }
+    store_accepted(accepted_points);
+    accepted_effective_goal_vio_ = map_point_to_vio(accepted_effective_goal, *correction_);
+    path_map_generation_ = grid_generation_;
+    path_pub_->publish(make_path(accepted_points, (*pose_)[2]));
+    publish_path_map_generation();
+    // The endpoint of the route actually published, not of the newest candidate.
+    geometry_msgs::msg::PointStamped accepted_goal_message;
+    accepted_goal_message.header.stamp = now();
+    accepted_goal_message.header.frame_id = frame_id_;
+    accepted_goal_message.point.x = accepted_effective_goal.first;
+    accepted_goal_message.point.y = accepted_effective_goal.second;
+    accepted_goal_message.point.z = (*pose_)[2];
+    effective_goal_pub_->publish(accepted_goal_message);
+    const auto accepted_length = path_length(accepted_points);
     publish_float(path_length_pub_, accepted_length);
 
-    const std::string mode = exact ? "PATH_VALID" : (terminal ? "SAFE_APPROACH" : "EXPLORING");
-    auto status = mode + " length=" + format(accepted_length, 2) +
+    const std::string mode = to_string(decision.stable);
+    auto status = mode + mode_.pending_suffix() + " length=" + format(accepted_length, 2) +
       "m candidate=" + format(candidate_length, 2) +
       "m goal_distance=" + format(selection->distance, 2) +
       "m reachable=" + std::to_string(selection->reachable_cells) +
       " expanded=" + std::to_string(result.expanded) +
       " plan=" + format(total_ms, 1) +
       "ms map_age=" + format(now_s - map_received_, 2) +
-      "s path_gen=" + std::to_string(accepted_generation_);
+      "s path_gen=" + std::to_string(accepted_generation_) +
+      " map_gen=" + std::to_string(grid_generation_) +
+      " raw_mode=" + to_string(raw_mode);
+    if (had_retained_route && !retained_safe) {
+      status += " retained_unsafe=1";
+    }
+    if (replacement.transition_hold) {
+      status += " retained_through_pending_mode=1";
+    }
     if (projection.has_value()) {
       status += " off_path=" + format(projection->distance, 2) + "m";
     }
@@ -597,7 +762,7 @@ private:
       status += " start_recovered=" + format(start_offset, 2) + "m";
     }
     publish_status(status);
-    publish_markers(status, effective_goal);
+    publish_markers(status, accepted_effective_goal);
   }
 
   struct PlanKey
@@ -619,7 +784,11 @@ private:
   double inflation_cost_scaling_{}, start_recovery_radius_{}, heuristic_weight_{};
   double cost_weight_{}, planning_timeout_ms_{}, switch_improvement_{};
   double path_retain_tolerance_{}, path_head_margin_{};
+  std::string correction_topic_;
+  double correction_timeout_{}, max_correction_m_{}, max_correction_yaw_deg_{};
   int occupied_threshold_{65};
+  int mode_confirmation_maps_{2};
+  GoalModeHysteresis mode_{2};
 
   std::optional<GridMap> grid_;
   nav_msgs::msg::MapMetaData grid_info_;
@@ -631,21 +800,31 @@ private:
   long goal_generation_{0};
   double map_received_{0.0};
   double pose_received_{0.0};
-  std::vector<Point2> accepted_points_;
+  // Canonical continuous-VIO storage: a pure coordinate re-expression is not a
+  // new path and never resets progress.
+  std::vector<Point2> accepted_vio_points_;
   long accepted_goal_generation_{-1};
-  std::optional<Cell> accepted_effective_goal_;
+  std::optional<Point2> accepted_effective_goal_vio_;
   long accepted_generation_{0};
+  long path_map_generation_{0};
+  bool correction_seen_{false}, correction_valid_{false};
+  std::string correction_reason_;
+  double correction_received_{0.0};
+  std::optional<Correction4> correction_;
   std::optional<PlanKey> last_planned_key_;
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr goal_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr correction_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_, candidate_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr inflated_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_, config_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr planning_ms_pub_, path_length_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr expanded_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr
+    map_generation_pub_, path_map_generation_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr goal_exact_pub_, goal_terminal_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr effective_goal_pub_;
   rclcpp::TimerBase::SharedPtr timer_;

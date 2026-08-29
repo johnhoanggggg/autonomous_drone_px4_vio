@@ -1,4 +1,12 @@
-"""Observation-only position route follower for the accepted global path."""
+"""Observation-only position route follower for the accepted global path.
+
+LEGACY. src/route_follower_node.cpp (``cpp_route_follower``) is the flown
+implementation. This module is kept for reference and for the parity tests that
+still cover it; it does NOT have the 2026-08-29 stability work -- the monotonic
+clearance escape out of POSE_INSIDE_CLEARANCE, correction-canonical route
+storage, or map/path generation pairing on the correction hold. Run the follower
+with ``cpp_follower:=true`` (implied by ``cpp_nodes:=true``).
+"""
 
 import json
 import math

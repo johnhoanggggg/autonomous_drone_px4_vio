@@ -55,7 +55,7 @@ def generate_launch_description():
         # pinned back to Python (`cpp_nodes:=true cpp_astar:=false`) to bisect a
         # regression. Spell it the same way on offboard_global_planner.launch.py
         # to move the whole flight stack together.
-        DeclareLaunchArgument("cpp_nodes", default_value="false"),
+        DeclareLaunchArgument("cpp_nodes", default_value="true"),
         # The A* planner. The C++ port is parity-tested against grid_planner.py
         # over randomized maps (costmap, start recovery, goal selection, A*
         # cells, expansions and the simplified path all compared exactly) and
@@ -72,28 +72,37 @@ def generate_launch_description():
         DeclareLaunchArgument("pose_timeout", default_value="1.0"),
         DeclareLaunchArgument("occupied_threshold", default_value="65"),
         DeclareLaunchArgument("robot_radius", default_value="0.25"),
-        DeclareLaunchArgument("safety_margin", default_value="0.05"),
-        DeclareLaunchArgument("inflation_extra", default_value="0.20"),
+        DeclareLaunchArgument("safety_margin", default_value="0.00"),
+        DeclareLaunchArgument("inflation_extra", default_value="0.25"),
         DeclareLaunchArgument("start_recovery_radius", default_value="0.30"),
         DeclareLaunchArgument("heuristic_weight", default_value="1.0"),
         DeclareLaunchArgument("planning_timeout_ms", default_value="100.0"),
         DeclareLaunchArgument("route_follower", default_value="true"),
         DeclareLaunchArgument("follower_rate_hz", default_value="10.0"),
-        DeclareLaunchArgument("lookahead", default_value="0.60"),
-        DeclareLaunchArgument("lookahead_step", default_value="0.05"),
+        DeclareLaunchArgument("lookahead", default_value="0.25"),
+        DeclareLaunchArgument("lookahead_step", default_value="0.03"),
         DeclareLaunchArgument("min_lookahead", default_value="0.05"),
-        DeclareLaunchArgument("max_carrot_speed", default_value="0.10"),
+        DeclareLaunchArgument("max_carrot_speed", default_value="0.20"),
         DeclareLaunchArgument("max_carrot_acceleration", default_value="0.30"),
-        DeclareLaunchArgument("max_cross_track", default_value="0.60"),
-        DeclareLaunchArgument("cross_track_resume", default_value="0.05"),
+        DeclareLaunchArgument("max_cross_track", default_value="0.15"),
+        DeclareLaunchArgument("cross_track_resume", default_value="0.06"),
         DeclareLaunchArgument("cross_track_recovery_time", default_value="1.0"),
         DeclareLaunchArgument("vio_timeout", default_value="0.5"),
         DeclareLaunchArgument("correction_timeout", default_value="1.0"),
-        DeclareLaunchArgument("max_correction_m", default_value="0.50"),
-        DeclareLaunchArgument("max_correction_yaw_deg", default_value="15.0"),
+        DeclareLaunchArgument("max_correction_m", default_value="1.0"),
+        DeclareLaunchArgument("max_correction_yaw_deg", default_value="10.0"),
         DeclareLaunchArgument("switch_improvement", default_value="0.10"),
-        DeclareLaunchArgument("path_retain_tolerance", default_value="0.35"),
+        DeclareLaunchArgument("path_retain_tolerance", default_value="0.12"),
         DeclareLaunchArgument("path_head_margin", default_value="0.50"),
+        # Distinct occupancy grids that must agree before a semantic mode change
+        # (PATH_VALID / SAFE_APPROACH / EXPLORING) is committed. Counted on map
+        # generations, not planner ticks.
+        DeclareLaunchArgument("mode_confirmation_maps", default_value="2"),
+        # Clearance an escape must gain at its endpoint before it counts as
+        # recovery rather than sliding along the same unsafe contour.
+        DeclareLaunchArgument("escape_minimum_improvement", default_value="0.01"),
+        # Replaces the old blind 8 s correction cooldown.
+        DeclareLaunchArgument("correction_rearm_guard", default_value="0.20"),
         DeclareLaunchArgument("record_bag", default_value="false"),
         DeclareLaunchArgument("bag_output", default_value=timestamped_bag("global_planner_monitor")),
     ]
@@ -106,19 +115,23 @@ def generate_launch_description():
         parameters=[{"dynamic_obstacle": typed("dynamic_obstacle", bool)}],
     )
     planner_parameters = [{
-            "rate_hz": typed("rate_hz", float),
-            "map_timeout": typed("map_timeout", float),
-            "pose_timeout": typed("pose_timeout", float),
-            "occupied_threshold": typed("occupied_threshold", int),
-            "robot_radius": typed("robot_radius", float),
-            "safety_margin": typed("safety_margin", float),
-            "inflation_extra": typed("inflation_extra", float),
-            "start_recovery_radius": typed("start_recovery_radius", float),
-            "heuristic_weight": typed("heuristic_weight", float),
-            "planning_timeout_ms": typed("planning_timeout_ms", float),
-            "switch_improvement": typed("switch_improvement", float),
-            "path_retain_tolerance": typed("path_retain_tolerance", float),
-            "path_head_margin": typed("path_head_margin", float),
+        "rate_hz": typed("rate_hz", float),
+        "map_timeout": typed("map_timeout", float),
+        "pose_timeout": typed("pose_timeout", float),
+        "occupied_threshold": typed("occupied_threshold", int),
+        "robot_radius": typed("robot_radius", float),
+        "safety_margin": typed("safety_margin", float),
+        "inflation_extra": typed("inflation_extra", float),
+        "start_recovery_radius": typed("start_recovery_radius", float),
+        "heuristic_weight": typed("heuristic_weight", float),
+        "planning_timeout_ms": typed("planning_timeout_ms", float),
+        "switch_improvement": typed("switch_improvement", float),
+        "path_retain_tolerance": typed("path_retain_tolerance", float),
+        "path_head_margin": typed("path_head_margin", float),
+        "mode_confirmation_maps": typed("mode_confirmation_maps", int),
+        "correction_timeout": typed("correction_timeout", float),
+        "max_correction_m": typed("max_correction_m", float),
+        "max_correction_yaw_deg": typed("max_correction_yaw_deg", float),
     }]
     monitor = Node(
         package="px4_vio_bridge",
@@ -156,6 +169,8 @@ def generate_launch_description():
         "correction_timeout": typed("correction_timeout", float),
         "max_correction_m": typed("max_correction_m", float),
         "max_correction_yaw_deg": typed("max_correction_yaw_deg", float),
+        "escape_minimum_improvement": typed("escape_minimum_improvement", float),
+        "correction_rearm_guard": typed("correction_rearm_guard", float),
     }]
     follower = Node(
         package="px4_vio_bridge",
@@ -190,6 +205,10 @@ def generate_launch_description():
             "/planner/path_length", "/planner/expanded_cells",
             "/planner/goal_exact", "/planner/goal_terminal",
             "/planner/effective_goal",
+            # Generation pairing and correction episodes: without these a bag
+            # cannot show why a post-correction hold was or was not released.
+            "/planner/map_generation", "/planner/path_map_generation",
+            "/planner/correction_epoch",
             "/planner/follower/carrot", "/planner/follower/lookahead",
             "/planner/follower/displacement", "/planner/follower/status",
             "/planner/follower/config",

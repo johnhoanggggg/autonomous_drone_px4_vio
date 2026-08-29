@@ -1,4 +1,10 @@
-"""ROS-free 2-D costmap inflation, A* search, and path simplification."""
+"""ROS-free 2-D costmap inflation, A* search, and path simplification.
+
+LEGACY for anything added after 2026-08-29. The A* pipeline here is still
+parity-tested against grid_planner.cpp, but the exact clearance-distance
+primitives (point_clearance, segment_minimum_clearance) and the
+GoalModeHysteresis tracker exist only on the C++ side, which is what flies.
+"""
 
 from collections import deque
 from dataclasses import dataclass

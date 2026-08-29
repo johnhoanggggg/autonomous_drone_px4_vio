@@ -152,6 +152,30 @@ TEST(PathCommandLimiter, SharedSuffixKeepsTheCommandPointExactly)
   EXPECT_NEAR(limiter.position()->second, before.second, 1e-9);
 }
 
+TEST(PathCommandLimiter, SharedSuffixKeepsSpeedAcrossSmallMapCorrectionShift)
+{
+  // Tunnel flight 20260829T114405Z moved retained map-frame paths by
+  // 1.1-2.4 cm while the correction filter converged. With the operational
+  // 3 cm suffix tolerance that is a coordinate update, not a reason to stop
+  // and start a connector rejoin.
+  PathCommandLimiter limiter(0.20, 0.30, 0.05, 0.05, 0.30, 0.20, 0.03, true, 0.05);
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.0}, {2.0, 0.0}}, {0.0, 0.0}));
+  for (int step = 0; step < 10; ++step) {
+    limiter.update({2.0, 0.0}, 0.05, true, Point2{0.0, 0.0});
+  }
+  const auto before = limiter.snapshot();
+  ASSERT_GT(before.speed, 0.0);
+
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.02}, {2.0, 0.02}}, {0.0, 0.02}));
+  const auto after = limiter.snapshot();
+  EXPECT_DOUBLE_EQ(after.speed, before.speed);
+  EXPECT_EQ(after.velocity, before.velocity);
+  EXPECT_FALSE(after.join_target.has_value());
+  ASSERT_TRUE(after.position.has_value());
+  EXPECT_NEAR(after.position->first, before.position->first, 1e-12);
+  EXPECT_NEAR(after.position->second, before.position->second + 0.02, 1e-12);
+}
+
 TEST(PathCommandLimiter, SnapshotRestoreUndoesARejectedTick)
 {
   PathCommandLimiter limiter(0.20, 0.30, 0.05, 0.05, 0.30, 0.20, 0.01, false, 0.05);

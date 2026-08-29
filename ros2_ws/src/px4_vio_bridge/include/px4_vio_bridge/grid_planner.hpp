@@ -1,10 +1,11 @@
 #pragma once
 
-// Exact C++ counterpart of px4_vio_bridge/grid_planner.py.
-//
-// Every function here is a line-for-line port of the Python original and is
-// held to it by test/test_grid_planner_parity.py, which drives both through
-// randomized maps and compares costs, expansions and cells. Where Python's
+// The A* planner core. Everything down to should_replace_path() is a
+// line-for-line port of the legacy px4_vio_bridge/grid_planner.py and is held
+// to it by test/test_grid_planner_parity.py, which drives both through
+// randomized maps and compares costs, expansions and cells. GoalModeHysteresis
+// below has no Python counterpart: it was added on 2026-08-29, after the C++
+// nodes became the flown implementation. Where Python's
 // semantics are load-bearing -- tuple ordering in the A* heap, round-half-to-
 // even in the inflation kernel -- the port reproduces them deliberately rather
 // than substituting the C++ idiom. Read the Python docstrings for the *why*;
@@ -139,6 +140,110 @@ struct InflationOffset
 
 [[nodiscard]] std::vector<Point2> trim_path_to(
   const std::vector<Point2> & points, const Point2 & point, double margin);
+
+// ---------------------------------------------------------------------------
+// Goal-mode hysteresis
+//
+// One occupancy grid deciding the semantic mode outright let a single frame of
+// connectivity change replace the endpoint, the path, the follower's heading
+// and the goal-completion semantics. A mode change is therefore confirmed over
+// `confirmation_maps` *distinct occupancy-grid generations* -- planner ticks
+// are not independent evidence, and at ~1 Hz maps the default of 2 still
+// commits well inside the flight adapter's 3 s planner-fault land timer.
+//
+// This debounces the *meaning* of a route, never its safety: the caller must
+// still revalidate the retained route against every new map and drop it
+// immediately when it is unsafe.
+enum class GoalMode
+{
+  PathValid,
+  SafeApproach,
+  Exploring,
+};
+
+[[nodiscard]] const char * to_string(GoalMode mode);
+
+// classify_goal()'s (exact, terminal) pair as a mode.
+[[nodiscard]] GoalMode goal_mode_from(bool exact, bool terminal);
+
+// Only PathValid and SafeApproach end at the requested goal; an exploration
+// frontier is a temporary endpoint and must never report completion.
+[[nodiscard]] bool goal_mode_terminal(GoalMode mode);
+
+struct ModeDecision
+{
+  GoalMode stable{GoalMode::Exploring};
+  bool has_pending{false};
+  GoalMode pending{GoalMode::Exploring};
+  int pending_count{};
+  int confirmation_maps{};
+  // This observation moved the stable mode.
+  bool committed{false};
+};
+
+class GoalModeHysteresis
+{
+public:
+  explicit GoalModeHysteresis(int confirmation_maps = 2);
+
+  // A new requested goal carries no old semantic commitment.
+  void reset();
+  ModeDecision observe(GoalMode raw, std::int64_t map_generation);
+  // Adopt `mode` at once. The caller uses this when it has just replaced the
+  // accepted path, because no older commitment survives that.
+  void commit(GoalMode mode);
+
+  [[nodiscard]] bool initialized() const {return initialized_;}
+  [[nodiscard]] GoalMode stable() const {return stable_;}
+  [[nodiscard]] ModeDecision decision() const;
+  // "" when settled, else " MODE_PENDING PATH_VALID->EXPLORING 1/2".
+  [[nodiscard]] std::string pending_suffix() const;
+
+private:
+  int confirmation_maps_;
+  bool initialized_{false};
+  GoalMode stable_{GoalMode::Exploring};
+  std::optional<GoalMode> pending_;
+  int pending_count_{};
+  std::optional<std::int64_t> last_counted_generation_;
+};
+
+// Inputs to the accepted-path decision, gathered in one frame: the map
+// solution the current occupancy grid belongs to.
+struct PathReplacementInputs
+{
+  // A semantic mode change is proposed but not yet confirmed.
+  bool mode_transition_pending{};
+  // The retained route revalidated against the newest raw grid.
+  bool retained_safe{};
+  bool goal_changed{};
+  bool effective_goal_changed{};
+  std::optional<PathProjection> projection;
+  double candidate_length{};
+  double retain_tolerance{};
+  double switch_improvement{};
+};
+
+struct PathReplacementDecision
+{
+  bool replace{};
+  // The retained route survived a pending transition unchanged.
+  bool transition_hold{};
+  // The vehicle has genuinely left the retained corridor.
+  bool off_corridor{};
+};
+
+// Whether a fresh candidate should displace the accepted route.
+//
+// This is should_replace_path() plus the mode-transition rule. While a semantic
+// transition is unconfirmed, the endpoint change and the length comparison both
+// describe the *other* mode, so acting on them would defeat the debounce and
+// re-create the PATH_VALID/EXPLORING oscillation. Two things still replace at
+// once and are deliberately outside the hold: a route the newest grid proves
+// unsafe, and a genuine physical deviation out of the corridor. Mode debounce
+// is never collision debounce.
+[[nodiscard]] PathReplacementDecision decide_path_replacement(
+  const PathReplacementInputs & inputs);
 
 [[nodiscard]] bool should_replace_path(
   const std::optional<PathProjection> & projection, double candidate_length,

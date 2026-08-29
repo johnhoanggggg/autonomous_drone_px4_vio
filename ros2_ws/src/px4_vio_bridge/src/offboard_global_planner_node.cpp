@@ -30,6 +30,7 @@
 #include "offboard_hover_node.hpp"
 #include "px4_vio_bridge/command_limiter.hpp"
 #include "px4_vio_bridge/grid_clearance.hpp"
+#include "px4_vio_bridge/route_follower.hpp"
 
 namespace px4_vio_bridge
 {
@@ -80,6 +81,10 @@ public:
     map_timeout_ = declare_parameter<double>("map_timeout", 3.0);
     map_pose_timeout_ = declare_parameter<double>("map_pose_timeout", 1.0);
     planner_fault_land_time_ = declare_parameter<double>("planner_fault_land_time", 3.0);
+    // Must match the follower's value: the two nodes have to agree on what
+    // counts as an escape, or one proposes a chord the other vetoes.
+    escape_minimum_improvement_ =
+      declare_parameter<double>("escape_minimum_improvement", 0.01);
     goal_hold_time_ = declare_parameter<double>("goal_hold_time", 3.0);
     max_follower_displacement_ =
       declare_parameter<double>("max_follower_displacement", 1.0);
@@ -410,9 +415,25 @@ private:
       follower_required_clearance_ = radius + margin;
       follower_occupied_threshold_ = threshold;
       follower_command_speed_ = speed;
+      // Take the escape rule's tolerance from the follower alongside the
+      // clearance it belongs to. The two nodes have to agree on what counts as
+      // an escape -- disagreeing means one proposes a chord the other vetoes --
+      // and making it one more launch argument to keep in sync by hand is how
+      // that goes wrong. Absent from the legacy Python follower's config, which
+      // proposes no escapes at all, so fall back to this node's parameter.
+      if (config.contains("escape_minimum_improvement")) {
+        const auto improvement = config.at("escape_minimum_improvement").get<double>();
+        if (!std::isfinite(improvement) || improvement <= 0.0) {
+          throw std::invalid_argument("escape_minimum_improvement must be positive");
+        }
+        follower_escape_improvement_ = improvement;
+      } else {
+        follower_escape_improvement_.reset();
+      }
       follower_config_reason_.clear();
     } catch (const std::exception & error) {
       follower_required_clearance_.reset();
+      follower_escape_improvement_.reset();
       follower_occupied_threshold_.reset();
       follower_command_speed_.reset();
       follower_config_reason_ = error.what();
@@ -775,10 +796,63 @@ private:
     }
   }
 
-  bool map_segment_has_clearance(const Point2 & start, const Point2 & end) const
+  ClearanceProbe clearance_probe() const
   {
-    return segment_has_clearance(
-      *grid_, start, end, *follower_required_clearance_, *follower_occupied_threshold_);
+    return [this](const Point2 & start, const Point2 & end) -> std::optional<double> {
+             if (!grid_ || !follower_occupied_threshold_) {
+               return std::nullopt;
+             }
+             return segment_minimum_clearance(
+               *grid_, start, end, *follower_occupied_threshold_);
+           };
+  }
+
+  [[nodiscard]] ClearanceEscapeLimits escape_limits() const
+  {
+    ClearanceEscapeLimits limits;
+    limits.required_clearance = *follower_required_clearance_;
+    limits.minimum_improvement =
+      follower_escape_improvement_.value_or(escape_minimum_improvement_);
+    return limits;
+  }
+
+  /// Whether the chord this node is about to put on the wire may be commanded.
+  ///
+  /// At or above the hard clearance this is exactly the old
+  /// segment_has_clearance() test -- the normal envelope is not relaxed here
+  /// any more than it is in the follower. Below it, the same escape rule
+  /// applies: no point of the chord may be closer to an occupied cell than the
+  /// pose already is. Without this the adapter vetoed every escape the follower
+  /// proposed (flight 20260829T085734Z, COMMAND_HOLD at 31.33s against
+  /// CLEARANCE_ESCAPING start=0.227m), and the POSE_INSIDE_CLEARANCE deadlock
+  /// simply moved one layer up. The endpoint-improvement half of the rule stays
+  /// with the follower's target selection: this is the acceleration-limited
+  /// command, and demanding a centimetre of gain from one 20 Hz step would
+  /// reject every escape again.
+  bool command_chord_permitted(const Point2 & start, const Point2 & end) const
+  {
+    if (!grid_ || !follower_required_clearance_ || !follower_occupied_threshold_) {
+      return false;
+    }
+    const auto probe = clearance_probe();
+    const auto start_clearance = probe(start, start);
+    if (!start_clearance) {
+      // Unknown or outside-map space under the vehicle stays blocked. It is
+      // never something an escape may be attempted from.
+      return false;
+    }
+    return command_chord_admissible(
+      probe, start, end, escape_limits(), *start_clearance,
+      ChordRole::IntermediateCarrot);
+  }
+
+  /// The pose's own clearance, for telemetry. No value when it is not known.
+  [[nodiscard]] std::optional<double> pose_clearance() const
+  {
+    if (!grid_ || !map_pose_ || !follower_occupied_threshold_) {
+      return std::nullopt;
+    }
+    return clearance_probe()(*map_pose_, *map_pose_);
   }
 
   // --- the route command ---------------------------------------------------
@@ -792,7 +866,7 @@ private:
     std::optional<std::string> deferral;
 
     const auto clearance_check = [this](const Point2 & start, const Point2 & end) {
-        return map_segment_has_clearance(start, end);
+        return command_chord_permitted(start, end);
       };
 
     // Replanning mid-slew is what generates unjoinable paths: translation is
@@ -840,10 +914,13 @@ private:
     // This is deliberately after every limiting/projection operation: the exact
     // point and swept segment that PX4 will receive must be safe. Rewinding
     // leaves last tick's cleared command on the wire.
-    if (!map_segment_has_clearance(*map_pose_, final_map)) {
+    if (!command_chord_permitted(*map_pose_, final_map)) {
       route_limiter_->restore(restore_point);
+      const auto clearance = pose_clearance();
       return {
-        std::nullopt, std::string("post-limiter command has insufficient clearance")};
+        std::nullopt,
+        std::string("post-limiter command has insufficient clearance") +
+        (clearance ? format(" (pose clearance %.3fm)", *clearance) : std::string())};
     }
 
     const Point2 final_map_displacement{
@@ -920,11 +997,21 @@ private:
     if (route_limiter_->path() && route_limiter_->position()) {
       path_offset = route_limiter_->path()->project(*route_limiter_->position()).cross_track;
     }
-    return format(
+    auto text = format(
       "ROUTE valid displacement=%.2fm command_speed=%.2fm/s path_offset=%.3fm",
       std::hypot(vio_displacement_->first, vio_displacement_->second),
       std::hypot(limiter_->velocity().first, limiter_->velocity().second),
-      path_offset) + yaw_status_text();
+      path_offset);
+    // Make it visible in the bag when the command on the wire was permitted by
+    // the escape rule rather than by the full hard envelope.
+    const auto clearance = pose_clearance();
+    if (clearance && follower_required_clearance_ &&
+      *clearance + 1.0e-9 < *follower_required_clearance_)
+    {
+      text += format(
+        " escaping clearance=%.3f/%.3fm", *clearance, *follower_required_clearance_);
+    }
+    return text + yaw_status_text();
   }
 
   // --- configuration -------------------------------------------------------
@@ -934,6 +1021,7 @@ private:
   double follower_timeout_{}, correction_timeout_{}, path_timeout_{};
   double map_timeout_{}, map_pose_timeout_{};
   double planner_fault_land_time_{}, goal_hold_time_{};
+  double escape_minimum_improvement_{};
   double max_follower_displacement_{}, max_correction_m_{}, max_correction_yaw_{};
   bool horizontal_feedforward_{};
   double route_command_grace_{};
@@ -967,6 +1055,7 @@ private:
   std::optional<double> map_pose_received_;
   std::optional<double> follower_config_received_;
   std::optional<double> follower_required_clearance_;
+  std::optional<double> follower_escape_improvement_;
   std::optional<int> follower_occupied_threshold_;
   std::optional<double> follower_command_speed_;
   std::string follower_config_reason_{"not received"};

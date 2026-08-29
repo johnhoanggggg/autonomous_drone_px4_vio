@@ -90,7 +90,7 @@ ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py \
   slam_publish_grid:=true \
   slam_grid_3d:=false \
   slam_grid_ray_tracing:=true \
-  slam_grid_cell_size:=0.05 \
+  slam_grid_cell_size:=0.03 \
   slam_grid_footprint_radius:=0.25
 ```
 
@@ -99,24 +99,34 @@ cannot move the drone.
 
 ```bash
 ros2 launch px4_vio_bridge global_planner_monitor.launch.py \
+  cpp_nodes:=true \
   robot_radius:=0.25 \
-  safety_margin:=0.05 \
-  inflation_extra:=0.20 \
+  safety_margin:=0.00 \
+  inflation_extra:=0.25 \
+  lookahead:=0.25 \
+  lookahead_step:=0.03 \
   max_carrot_speed:=0.20 \
   max_carrot_acceleration:=0.30 \
-  max_cross_track:=0.20 \
-  cross_track_resume:=0.05 \
+  max_cross_track:=0.15 \
+  cross_track_resume:=0.06 \
   cross_track_recovery_time:=1.0 \
-  path_retain_tolerance:=0.15 \
+  path_retain_tolerance:=0.12 \
   max_correction_m:=1 \
   max_correction_yaw_deg:=10.0
 ```
 
 `path_retain_tolerance` **must stay below `max_cross_track`**, or the follower
 faults on cross-track before the planner will rebuild the path and the vehicle
-stalls in the gap between them with no new route coming. The node default is
-0.35, which is wrong for any `max_cross_track` below that — see
-[Known issues](#known-issues).
+stalls in the gap between them with no new route coming. The launch defaults
+keep a 0.03 m replan-before-fault band; see [Known issues](#known-issues).
+
+This is the narrow-hallway profile. It deliberately has no extra collision
+margin: the planner requires 0.25 m from the vehicle centre to an obstacle, the
+physical radius of this airframe. The 0.12 m retained-path band and 0.15 m
+cross-track limit are the configuration that completed tunnel flight
+`20260829T114405Z`; they leave a 0.03 m replan-before-fault band. This trades
+wall-contact margin for route continuity; it is not a collision-free
+configuration.
 
 Click a `world` goal with the Foxglove 3D panel's Publish tool on
 `/waypoint/clicked`, and confirm `/planner/follower/valid: true` before terminal 3.
@@ -125,21 +135,25 @@ Click a `world` goal with the Foxglove 3D panel's Publish tool on
 
 ```bash
 ros2 launch px4_vio_bridge offboard_global_planner.launch.py \
+  cpp_nodes:=true \
   auto_arm:=true \
   hover_height:=0.30 \
   command_speed:=0.20 \
   command_acceleration:=0.30 \
   path_command_projection_tolerance:=0.05 \
+  path_command_suffix_tolerance:=0.03 \
   path_corner_tolerance:=0.05 \
   geofence_radius:=3.0 \
   max_flight_time:=60.0 \
   max_correction_m:=1 \
-  max_correction_yaw_deg:=10.0
+  max_correction_yaw_deg:=10.0 \
+  corner_blending:=true \
+  planner_fault_land_time:=6.0
 ```
 
-Add `cpp_mode:=true` to fly the C++ adapter instead of the Python one; see
-[Which flight adapter](#which-flight-adapter). Set `auto_arm:=false` for a
-props-off dry run — the whole state machine runs and
+`cpp_nodes:=true` selects the C++ adapter as well as the C++ planner and
+follower; see [Which flight adapter](#which-flight-adapter). Set
+`auto_arm:=false` for a props-off dry run — the whole state machine runs and
 records, and no arm command is ever sent. Terminal 3 records the flight bag and
 starts the process monitor; **do not pass `bag_output`**, every launch names its
 own bag `<mode>_<UTC>` through `px4_vio_bridge.log_paths`. Set
@@ -209,7 +223,7 @@ corner — so every existing projection and clearance check applies unchanged.
 
 | parameter | default | meaning |
 |---|---|---|
-| `corner_blending` | `false` | carry speed through bends instead of stopping |
+| `corner_blending` | `true` | carry speed through bends instead of stopping |
 | `junction_deviation` | 0.05 m | how far the airframe may cut a corner |
 
 At 0.20 m/s cruise and `d=0.05`, the worst observed corner (70 deg) allows
@@ -218,8 +232,16 @@ stop-and-wait disappears outright. The cap starts to bite if `command_speed` ris
 or routes get sharper. `junction_deviation` must stay well inside the follower's
 `max_cross_track`, because it is what the vehicle is permitted to cut.
 
-**Off by default**: it removes a stop the route has always had, so give it one
-deliberate flight before trusting it.
+Blending is now the launch default after repeated armed flights, including the
+completed `20260829T114405Z` tunnel run. Set it false to restore a full stop at
+every vertex.
+
+`path_command_suffix_tolerance` defaults to 0.03 m. In that tunnel run, seven
+republications of the same retained physical route moved 1.1-2.4 cm in map
+coordinates as the SLAM correction filter converged. The former 0.01 m match
+treated them as new paths and restarted the command rejoin from zero speed;
+0.03 m preserves speed across those coordinate-only updates. Genuinely changed
+routes still use the bounded rejoin.
 
 ### Which flight adapter
 
@@ -229,8 +251,8 @@ parameter set (the launch file builds one dict and hands it to whichever runs).
 
 | `cpp_mode` | executable | node |
 |---|---|---|
-| `false` (default) | `offboard_global_planner` | Python, the flown implementation |
-| `true` | `cpp_flight_adapter` | C++, flown armed 6x on 2026-08-28 |
+| `false` | `offboard_global_planner` | legacy Python implementation |
+| `true` (default) | `cpp_flight_adapter` | flown C++ implementation |
 
 **`cpp_nodes` is the master switch.** Both launch files accept it under the same
 name, and every per-node C++ flag defaults to it, so one argument moves the whole
@@ -243,7 +265,7 @@ ros2 launch px4_vio_bridge offboard_global_planner.launch.py cpp_nodes:=true ...
 
 | flag | defaults to | selects |
 |---|---|---|
-| `cpp_nodes` | `false` | every node below |
+| `cpp_nodes` | `true` | every node below |
 | `cpp_astar` | `cpp_nodes` | `cpp_astar_planner` instead of `global_planner_monitor` |
 | `cpp_follower` | `cpp_nodes` | `cpp_route_follower` instead of `route_follower_monitor` |
 | `cpp_mode` | `cpp_nodes` | `cpp_flight_adapter` instead of `offboard_global_planner` |
@@ -252,6 +274,13 @@ A single node can still be pinned back to Python to bisect a regression:
 `cpp_nodes:=true cpp_astar:=false`. Because the two launch files are separate
 commands there is no shared process to carry the toggle — spelling the same
 argument on both is the whole mechanism.
+
+**The Python planner and follower are legacy.** They are kept for reference and
+for the parity tests that still cover the shared surface, but the 2026-08-29
+stability work — the monotonic clearance escape, correction-canonical accepted
+paths, generation-paired correction holds and goal-mode hysteresis — exists only
+in `cpp_astar_planner` and `cpp_route_follower`. Pinning either back to Python
+now reverts real fixes, not just an implementation language.
 
 `cpp_shadow:=true` runs a third, **non-commanding** node (`cpp_clearance_shadow`)
 alongside the Python adapter. It publishes no `/fmu/in/*` topics — it re-derives
@@ -350,6 +379,44 @@ Check `/perf/throttled` first when reading a bag. Non-zero means the board
 browned out or overheated and the clock was cut, which makes any timing analysis
 meaningless. Bits 0-3 are under-voltage / frequency-capped / throttled / soft
 temperature limit *now*; bits 16-19 are the same four latched since boot.
+
+### Seeing a flight: `scripts/render_flight_map.py`
+
+Clearance failures are statements about geometry, and reading them one status
+line at a time is how a whole flight goes by before the shape of the problem is
+obvious. This renders the occupancy grid with the trajectory on it:
+
+```bash
+python3 scripts/render_flight_map.py \
+  ros2_ws/flight_logs/offboard_global_<stamp> --clearance 0.25 --events
+```
+
+Offline only — it reads an MCAP bag and writes PNGs into `<bag>/render/`. Black
+is occupied, dark slate is unknown (which is *blocked*, not free), light grey is
+known free, and the peach band is everything within `--clearance` of an
+obstacle: the space the vehicle may not normally command into. The track is
+coloured by follower state (green `FOLLOWING`, amber `CLEARANCE_ESCAPING`, red
+`CLEARANCE_BLOCKED`, magenta cross-track, blue correction settling), the blue
+line is the accepted path as it stood at that instant, white is the requested
+goal and orange the effective one.
+
+It also prints a fault table with the pose's exact clearance at each event:
+
+```text
+   time  source   pose clearance  status
+  31.33  adapter         0.243 m  COMMAND_HOLD post-limiter command has insufficient clearance
+  31.42  follower        0.227 m  CLEARANCE_ESCAPING start=0.227m end=0.336m required=0.250m
+```
+
+Two properties matter for trusting it. Every clearance question is answered
+against **the grid current at the time asked** — scoring a mid-flight event
+against the final map is a different and more flattering question, worth about
+7 cm in the example above. And the printed figures are *exact*: distance from
+the pose to the full axis-aligned square of each occupied cell, the same measure
+`segment_minimum_clearance()` uses in flight, which is why the tool independently
+reproduces the follower's own `start=0.227m`. The shaded band is a distance
+transform accurate to about `resolution / supersample` and is there to show
+shape, not to be read off.
 
 ### Configuration snapshots
 
@@ -517,11 +584,11 @@ occupancy grid before publishing. Invalid planner data latches a stationary HOLD
 persistent faults request AUTO.LAND. See [Flight parameters](#flight-parameters)
 and `HANDOFF_GLOBAL_PLANNER.md`.
 
-Key launch defaults: `hover_height` 0.40, `command_speed` 0.10,
-`geofence_radius` 1.0, `max_flight_time` 45, `yaw_rate_deg` 20,
-`min_vio_features` 80, `planner_fault_land_time` 3.0, `goal_hold_time` 3.0,
-`rate_hz` 20.0, `cpp_mode` false, `cpp_shadow` false. The quick start overrides
-several of these.
+Key launch defaults: `hover_height` 0.30, `command_speed` 0.20,
+`geofence_radius` 3.0, `max_flight_time` 60, `yaw_rate_deg` 20,
+`min_vio_features` 80, `planner_fault_land_time` 6.0, `goal_hold_time` 3.0,
+`rate_hz` 20.0, `cpp_mode` true, `cpp_shadow` false. `auto_arm` remains false and
+must always be opted into explicitly.
 
 `cpp_mode:=true` replaces the Python adapter process with the C++ one;
 `cpp_shadow:=true` co-runs the non-commanding clearance shadow alongside Python.
@@ -529,7 +596,7 @@ See [Which flight adapter](#which-flight-adapter).
 
 A cross-track violation is **latched**: the follower freezes its relative carrot
 and stays invalid until it receives a newer path *and* cross-track stays below
-`cross_track_resume` (0.05 m) continuously for `cross_track_recovery_time` (1.0 s).
+`cross_track_resume` (0.06 m) continuously for `cross_track_recovery_time` (1.0 s).
 Samples merely dipping below `max_cross_track` cannot restart flight or reset the
 adapter's LAND timer.
 
@@ -562,6 +629,78 @@ known-safe frontier, updating as the map expands. For obstacle clicks it reports
 `/planner/effective_goal` marker shows where the route actually ends; white is
 the requested goal. A temporary exploration frontier is not reported as arrival,
 so the adapter holds rather than landing there.
+
+#### Stability parameters (C++ nodes)
+
+The three parameters below exist because flight
+`offboard_global_planner_20260829T071555Z` spent 28 of its 57 route seconds
+oscillating between `PATH_VALID` and `EXPLORING`, produced 124 plans for 2.51 m
+of net progress, and froze three times with the pose inside its own clearance.
+
+| argument | default | effect |
+|---|---|---|
+| `mode_confirmation_maps` | 2 | distinct **occupancy grids** — never planner ticks — that must agree before a semantic mode change is committed |
+| `escape_minimum_improvement` | 0.01 m | clearance a sub-clearance escape chord must gain at its endpoint before it counts as recovery. Set it on the follower only: the adapter reads it from `/planner/follower/config` alongside the clearance it belongs to, so the two cannot disagree |
+| `correction_rearm_guard` | 0.20 s | replaces the old blind 8 s correction cooldown; long enough that a settling episode cannot reopen on its own residual |
+
+Three things follow from them.
+
+**A pose already inside the clearance can move again.** `safe_lookahead` used to
+test the whole chord *including the pose*, so a pose 0.24 m from an obstacle
+failed every candidate by construction. The follower now measures the exact
+clearance of the pose and, only when it is already below the envelope, accepts a
+chord whose every point is at least as far from the obstacle as the pose already
+is and whose endpoint gains at least `escape_minimum_improvement`. Status reads
+`CLEARANCE_ESCAPING start=0.238m end=0.252m required=0.250m status=FOLLOWING`,
+and `CLEARANCE_BLOCKED reason=POSE_INSIDE_CLEARANCE_NO_ESCAPE` when no such
+chord exists. Normal chords still require the full hard clearance, unchanged.
+
+The flight adapter enforces the same rule on the chord it actually puts on the
+wire. It has to: its post-limiter gate was a plain `segment_has_clearance`
+threshold, so it vetoed every escape the follower proposed and the deadlock
+simply moved one layer up, from `POSE_INSIDE_CLEARANCE` to
+`COMMAND_HOLD post-limiter command has insufficient clearance` (flight
+`20260829T085734Z`, adapter veto at 31.33 s against `CLEARANCE_ESCAPING
+start=0.227m`). The adapter validates the acceleration-limited command, so it
+applies the non-worsening half of the rule only — demanding a centimetre of gain
+from one 20 Hz step would reject every escape again. The endpoint-improvement
+half stays with the follower's target selection. When a command is on the wire
+under the escape rule the adapter says so: `ROUTE valid ... escaping
+clearance=0.227/0.250m`.
+
+**A loop closure is not cross-track.** The accepted route, the commanded
+displacement and the command velocity are stored in continuous VIO coordinates
+and rendered into whichever map solution the current correction describes, so a
+4-6 cm correction moves pose and route together. Re-publishing the same physical
+route under a new correction is a coordinate change, not a new path generation,
+and does not reset route progress.
+
+**A post-correction episode defers new paths, it does not stop the aircraft.**
+The planner publishes `/planner/map_generation` and
+`/planner/path_map_generation`; the follower accepts no new path until the
+correction has been quiet for `correction_settle_time` *and* a path planned from
+a grid received after the last material correction step has arrived.
+`/planner/correction_epoch` counts the episodes. A path built from the
+pre-correction grid can no longer be installed, and a run of material steps a
+second apart can no longer hide inside one cooldown.
+
+What the episode does **not** do any more is stop the follower commanding.
+Holding validity low cost up to ~2 s — two thirds of the adapter's 3 s
+`planner_fault_land_time` — in flight `20260829T085734Z`, and the wait is
+structural: quiet time, plus the next map at ~1 Hz, plus the next plan at 2 Hz.
+It was guarding against a frame mismatch that correction-canonical route storage
+already removes: the route still being flown is re-expressed into the newest
+correction every tick and its command is revalidated against the newest grid
+every tick. So the follower keeps flying the route it has and only refuses to
+take a new one on trust; the status carries `CORRECTION_SETTLING epoch=...`
+while it does.
+
+Mode debounce is deliberately **not** collision debounce: the retained route is
+revalidated against every new raw grid and replaced immediately when it is
+unsafe, whatever the pending transition says. While a transition is pending,
+`/planner/goal_terminal` goes false on the first raw nonterminal result and is
+promoted back only on confirmation, so a temporary exploration frontier can
+never be reported as reaching the requested goal.
 
 ### `offboard_hover` — the base flight node
 
@@ -975,16 +1114,15 @@ Flown 2026-08-28 with `corner_blending:=true`.
 
 ## Known issues
 
-### `POSE_INSIDE_CLEARANCE` is a deadlock, not a safety stop
+### `POSE_INSIDE_CLEARANCE` was a deadlock — fixed in the C++ follower
 
-`RouteFollowerMonitor.safe_lookahead` tests
-`segment_has_clearance(pose -> target)` and **the segment starts at the pose**.
-Once the vehicle's own position violates `required_clearance`, every candidate
-lookahead fails at its first point — including the shortest — so the search
-cannot succeed by construction. The follower then calls `hold_command()`, the
-carrot collapses onto the vehicle, and commanded motion goes to zero. Because the
-stack is position-controlled, that is an active instruction to stay in the
-offending spot.
+`safe_lookahead` tested `segment_has_clearance(pose -> target)` and **the segment
+starts at the pose**. Once the vehicle's own position violated
+`required_clearance`, every candidate lookahead failed at its first point —
+including the shortest — so the search could not succeed by construction. The
+follower then called `hold_command()`, the carrot collapsed onto the vehicle, and
+commanded motion went to zero. Because the stack is position-controlled, that was
+an active instruction to stay in the offending spot.
 
 Observed 2026-08-28: flight 091228Z spent its final **8 s** frozen 0.27 m from an
 obstacle (airframe radius 0.25 m) and never reached its goal; flight 091006Z
@@ -992,9 +1130,25 @@ chattered BLOCKED/FOLLOWING three times in 5 s while sitting on the threshold.
 Both escaped only via position-hold error — the vehicle sagging ~0.12 m off its
 own latched setpoint — i.e. by luck of which way the airframe drifts.
 
-The fix is to relax the requirement, when the pose is already inside clearance,
-to "the swept segment never gets closer than the pose already is". Not yet
-implemented.
+`cpp_route_follower` now measures the exact continuous clearance of the pose
+(`point_clearance`) instead of only threshold-testing it. Above the envelope
+nothing changed: a normal chord must still clear `robot_radius +
+safety_margin` in full. Below it, and only there, the follower searches the same
+lookahead candidates for an *escape*: every point of the chord must be at least
+as far from an occupied cell as the pose already is, and the endpoint must gain
+at least `escape_minimum_improvement` (0.01 m). The acceleration-limited carrot
+is checked with the same predicate, not just the desired lookahead, and entering
+the escape drops any stale displacement that still pointed at the obstacle.
+Recovery is therefore monotonic and deterministic rather than a matter of which
+way the airframe happens to drift. Lateral motion at constant clearance is
+rejected, so a route that merely follows the same unsafe contour cannot pass as
+recovery; when no chord qualifies the follower publishes
+`CLEARANCE_BLOCKED reason=POSE_INSIDE_CLEARANCE_NO_ESCAPE`, `valid=false`, and
+the adapter holds and lands as before.
+
+The Python `route_follower_monitor` is legacy and still has the original
+deadlock; run the follower with `cpp_follower:=true` (implied by
+`cpp_nodes:=true`, which is what is flown).
 
 ### Clearance budget: `safety_margin` must cover `max_cross_track`
 
@@ -1024,10 +1178,10 @@ contact becomes impossible but the minimum gap is 0.90 m.
 ### `path_retain_tolerance` inverts the replan/fault ordering
 
 `should_replace_path` rebuilds the accepted path only when cross-track exceeds
-`path_retain_tolerance` (node default **0.35**), while the follower faults at
-`max_cross_track`. With `max_cross_track` below 0.35 the vehicle stalls in the
-band between them: faulted, but with no new path coming. Keep
-`path_retain_tolerance` below `max_cross_track`.
+`path_retain_tolerance`, while the follower faults at `max_cross_track`. If the
+retain tolerance is not lower, the vehicle can stall in the band between them:
+faulted, but with no new path coming. The operational launch defaults are 0.12 m
+and 0.15 m respectively.
 
 In four flights on 2026-08-28, cross-track never once exceeded 0.35 m — so a
 cross-track excursion has never actually triggered a replan on this vehicle.

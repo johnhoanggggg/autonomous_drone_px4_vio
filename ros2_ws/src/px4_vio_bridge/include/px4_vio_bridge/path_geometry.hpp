@@ -18,6 +18,12 @@ namespace px4_vio_bridge
 
 using Point2 = std::pair<double, double>;
 
+/// A native RTAB-Map map<-vio correction as (x, y, z, yaw).
+using Correction4 = std::array<double, 4>;
+
+/// The correction that makes the map and VIO frames coincide.
+inline constexpr Correction4 kIdentityCorrection{0.0, 0.0, 0.0, 0.0};
+
 /// path_follower._wrap_pi: Python's modulo, whose result takes the sign of the
 /// divisor. std::fmod takes the sign of the dividend, so it cannot be used raw.
 double wrap_pi_mod(double angle);
@@ -70,6 +76,25 @@ PathFingerprint path_fingerprint(const std::vector<Point2> & points, int precisi
 /// correction is (x, y, z, yaw); mirrors path_follower.correction_rejection_reason.
 std::optional<std::string> correction_rejection_reason(
   const std::array<double, 4> & correction, double max_translation, double max_yaw);
+
+/// Whether every component of a correction is finite.
+bool finite(const Correction4 & correction);
+
+/// Map a point from the continuous VIO frame into the SLAM map solution the
+/// correction describes: p_map = R(yaw) * p_vio + t.
+Point2 vio_point_to_map(const Point2 & point, const Correction4 & correction);
+
+/// The inverse: p_vio = R(-yaw) * (p_map - t).
+Point2 map_point_to_vio(const Point2 & point, const Correction4 & correction);
+
+/// Re-express a map-frame point recorded under `from` in the solution `to`.
+/// Equivalent to vio_point_to_map(map_point_to_vio(point, from), to), and to
+/// p_new = R(yaw_to - yaw_from) * (p_old - t_from) + t_to.
+Point2 reexpress_point(const Point2 & point, const Correction4 & from, const Correction4 & to);
+
+/// Re-express a map-frame *vector* -- a displacement or a velocity. Only the
+/// yaw difference applies; the translation cancels.
+Point2 reexpress_vector(const Point2 & vector, const Correction4 & from, const Correction4 & to);
 
 /// Rotate a map-frame vector into the continuous VIO/odometry frame: R(-yaw).
 Point2 map_displacement_to_vio(const Point2 & displacement, double correction_yaw);

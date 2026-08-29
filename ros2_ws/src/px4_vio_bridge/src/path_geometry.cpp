@@ -176,6 +176,45 @@ std::optional<std::string> correction_rejection_reason(
   return std::nullopt;
 }
 
+bool finite(const Correction4 & correction)
+{
+  return std::all_of(
+    correction.begin(), correction.end(), [](double value) {return std::isfinite(value);});
+}
+
+Point2 vio_point_to_map(const Point2 & point, const Correction4 & correction)
+{
+  const auto cosine = std::cos(correction[3]);
+  const auto sine = std::sin(correction[3]);
+  return {
+    cosine * point.first - sine * point.second + correction[0],
+    sine * point.first + cosine * point.second + correction[1]};
+}
+
+Point2 map_point_to_vio(const Point2 & point, const Correction4 & correction)
+{
+  const auto cosine = std::cos(correction[3]);
+  const auto sine = std::sin(correction[3]);
+  const auto dx = point.first - correction[0];
+  const auto dy = point.second - correction[1];
+  return {cosine * dx + sine * dy, -sine * dx + cosine * dy};
+}
+
+Point2 reexpress_point(const Point2 & point, const Correction4 & from, const Correction4 & to)
+{
+  return vio_point_to_map(map_point_to_vio(point, from), to);
+}
+
+Point2 reexpress_vector(const Point2 & vector, const Correction4 & from, const Correction4 & to)
+{
+  const auto delta = wrap_pi_mod(to[3] - from[3]);
+  const auto cosine = std::cos(delta);
+  const auto sine = std::sin(delta);
+  return {
+    cosine * vector.first - sine * vector.second,
+    sine * vector.first + cosine * vector.second};
+}
+
 Point2 map_displacement_to_vio(const Point2 & displacement, double correction_yaw)
 {
   if (!finite(displacement) || !std::isfinite(correction_yaw)) {

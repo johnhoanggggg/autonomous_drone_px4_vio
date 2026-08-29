@@ -1,4 +1,12 @@
-"""ROS-free geometry and state for a position-only polyline follower."""
+"""ROS-free geometry and state for a position-only polyline follower.
+
+LEGACY. include/px4_vio_bridge/route_follower.hpp is the flown
+implementation and has since gained the clearance-escape selector,
+correction-canonical route storage and generation-paired correction
+episodes. test_route_follower_parity.py still holds the two together over
+the pre-existing surface, which the C++ side kept byte-compatible by
+defaulting to an identity correction.
+"""
 
 import math
 from dataclasses import dataclass
