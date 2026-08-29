@@ -6,8 +6,13 @@ find_package(ament_cmake_python REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(octomap REQUIRED)
+find_package(octomap_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(RTABMap REQUIRED COMPONENTS core)
+find_package(rtabmap_conversions REQUIRED)
+find_package(rtabmap_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
@@ -27,6 +32,65 @@ target_compile_features(planner_flight_cpp PUBLIC cxx_std_17)
 target_include_directories(planner_flight_cpp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+)
+
+# ROS-free 3D occupancy and planning geometry. Kept parallel to the flown 2D
+# library so the new observation mode cannot change existing semantics.
+add_library(planner_3d_cpp
+  src/voxel_grid.cpp
+  src/grid_planner_3d.cpp
+  src/path_geometry_3d.cpp
+  src/route_follower_3d.cpp
+)
+target_compile_features(planner_3d_cpp PUBLIC cxx_std_17)
+target_include_directories(planner_3d_cpp PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+add_library(rtabmap_octomap_cpp src/rtabmap_octomap.cpp)
+target_compile_features(rtabmap_octomap_cpp PUBLIC cxx_std_17)
+target_include_directories(rtabmap_octomap_cpp PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(rtabmap_octomap_cpp PUBLIC rtabmap::core ${OCTOMAP_LIBRARIES})
+
+add_executable(rtabmap_octomap_node src/rtabmap_octomap_node.cpp)
+target_compile_features(rtabmap_octomap_node PUBLIC cxx_std_17)
+target_link_libraries(
+  rtabmap_octomap_node rtabmap_octomap_cpp nlohmann_json::nlohmann_json
+  rtabmap_conversions::rtabmap_conversions ${OCTOMAP_LIBRARIES})
+ament_target_dependencies(rtabmap_octomap_node
+  octomap_msgs rclcpp rtabmap_conversions rtabmap_msgs std_msgs
+)
+
+add_executable(rtabmap_3d_fixture src/rtabmap_3d_fixture_node.cpp)
+target_compile_features(rtabmap_3d_fixture PUBLIC cxx_std_17)
+target_link_libraries(
+  rtabmap_3d_fixture rtabmap::core rtabmap_conversions::rtabmap_conversions)
+ament_target_dependencies(rtabmap_3d_fixture
+  geometry_msgs rclcpp rtabmap_conversions rtabmap_msgs
+)
+
+# Observation-only OctoMap adapter and 3D A* monitor. It deliberately has no
+# px4_msgs dependency and no commanding publisher.
+add_executable(cpp_astar_planner_3d src/global_planner_3d_node.cpp)
+target_compile_features(cpp_astar_planner_3d PUBLIC cxx_std_17)
+target_include_directories(cpp_astar_planner_3d PRIVATE ${OCTOMAP_INCLUDE_DIRS})
+target_link_libraries(
+  cpp_astar_planner_3d planner_3d_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
+ament_target_dependencies(cpp_astar_planner_3d
+  geometry_msgs nav_msgs octomap_msgs rclcpp std_msgs visualization_msgs
+)
+
+add_executable(cpp_route_follower_3d src/route_follower_3d_node.cpp)
+target_compile_features(cpp_route_follower_3d PUBLIC cxx_std_17)
+target_include_directories(cpp_route_follower_3d PRIVATE ${OCTOMAP_INCLUDE_DIRS})
+target_link_libraries(
+  cpp_route_follower_3d planner_3d_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
+ament_target_dependencies(cpp_route_follower_3d
+  geometry_msgs nav_msgs octomap_msgs rclcpp std_msgs
 )
 
 add_executable(cpp_clearance_shadow
@@ -51,6 +115,10 @@ target_link_libraries(grid_planner_replay planner_flight_cpp nlohmann_json::nloh
 add_executable(route_follower_replay src/route_follower_replay.cpp)
 target_compile_features(route_follower_replay PUBLIC cxx_std_17)
 target_link_libraries(route_follower_replay planner_flight_cpp nlohmann_json::nlohmann_json)
+
+add_executable(planner_3d_replay src/planner_3d_replay.cpp)
+target_compile_features(planner_3d_replay PUBLIC cxx_std_17)
+target_link_libraries(planner_3d_replay planner_3d_cpp nlohmann_json::nlohmann_json)
 
 # The observation-only C++ A* planner: the counterpart of
 # global_planner_monitor.py, sharing its singleton lock so only one can run.
@@ -86,11 +154,18 @@ ament_target_dependencies(cpp_flight_adapter
 
 install(TARGETS
   planner_flight_cpp
+  planner_3d_cpp
+  rtabmap_octomap_cpp
   cpp_astar_planner
+  cpp_astar_planner_3d
+  cpp_route_follower_3d
   cpp_clearance_shadow
   cpp_flight_adapter
   cpp_route_follower
+  rtabmap_octomap_node
+  rtabmap_3d_fixture
   grid_planner_replay
+  planner_3d_replay
   planner_flight_replay
   route_follower_replay
   ARCHIVE DESTINATION lib
@@ -134,9 +209,16 @@ if(BUILD_TESTING)
   target_link_libraries(test_route_follower_cpp planner_flight_cpp)
   ament_add_gtest(test_grid_planner_cpp test/test_grid_planner_cpp.cpp)
   target_link_libraries(test_grid_planner_cpp planner_flight_cpp)
+  ament_add_gtest(test_grid_planner_3d_cpp test/test_grid_planner_3d.cpp)
+  target_link_libraries(test_grid_planner_3d_cpp planner_3d_cpp)
+  ament_add_gtest(test_rtabmap_octomap_cpp test/test_rtabmap_octomap.cpp)
+  target_link_libraries(test_rtabmap_octomap_cpp rtabmap_octomap_cpp planner_3d_cpp)
+  ament_add_gtest(test_route_follower_3d_cpp test/test_route_follower_3d.cpp)
+  target_link_libraries(test_route_follower_3d_cpp planner_3d_cpp)
   ament_add_pytest_test(test_planner_flight_parity test/test_planner_flight_parity.py)
   ament_add_pytest_test(test_route_follower_parity test/test_route_follower_parity.py)
   ament_add_pytest_test(test_grid_planner_parity test/test_grid_planner_parity.py)
+  ament_add_pytest_test(test_planner_3d_replay test/test_planner_3d_replay.py)
   ament_add_pytest_test(test_battery_to_ros test/test_battery_to_ros.py)
   ament_add_pytest_test(test_grid_planner test/test_grid_planner.py)
   ament_add_pytest_test(test_rtabmap_grid test/test_rtabmap_grid.py)

@@ -1,7 +1,8 @@
 # Autonomous Drone PX4 VIO
 
 ROS 2 Jazzy workspace flying a Raspberry Pi 5 + Pixhawk 4 quadrotor on OAK-D Lite
-visual odometry, with a 2D global planner over an RTAB-Map occupancy grid.
+visual odometry, with a flown 2D global planner over an RTAB-Map occupancy grid
+and an observation-only 3D OctoMap planner under development.
 
 RTAB-Map VIO/SLAM on the OAK-D Lite publishes its continuous VIO pose on
 `/rtabmap/vio_pose`; `px4_vio_bridge` converts that into PX4 `VehicleOdometry` on
@@ -12,18 +13,20 @@ experimental, every armed flight needs an RC kill switch in someone's hand, and
 `auto_arm` defaults to false everywhere so the full state machine can be
 rehearsed props-off first.
 
-- Deep design notes: `HANDOFF.md`, `HANDOFF_GLOBAL_PLANNER.md`
+- Deep design notes: `HANDOFF.md`, `HANDOFF_GLOBAL_PLANNER.md`,
+  `HANDOFF_3D_NAVIGATION.md`
 - Parked work: `HANDOFF_VFH.md`, `HANDOFF_LOOP_CLOSURE.md`, `HANDOFF_ARCHIVE.md`
 
 ## Contents
 
 1. [Install and pinned versions](#install-and-pinned-versions)
 2. [Quick start — the three terminals](#quick-start--the-three-terminals)
-3. [Flight parameters](#flight-parameters)
-4. [Observability](#observability)
-5. [Launch reference](#launch-reference)
-6. [Measured facts](#measured-facts)
-7. [Known issues](#known-issues)
+3. [3D planner monitor](#3d-planner-monitor)
+4. [Flight parameters](#flight-parameters)
+5. [Observability](#observability)
+6. [Launch reference](#launch-reference)
+7. [Measured facts](#measured-facts)
+8. [Known issues](#known-issues)
 
 ## Install and pinned versions
 
@@ -158,6 +161,74 @@ records, and no arm command is ever sent. Terminal 3 records the flight bag and
 starts the process monitor; **do not pass `bag_output`**, every launch names its
 own bag `<mode>_<UTC>` through `px4_vio_bridge.log_paths`. Set
 `PX4_VIO_FLIGHT_LOGS` to record somewhere other than `ros2_ws/flight_logs`.
+
+## 3D planner monitor
+
+The 3D implementation is deliberately a separate, observation-only C++ mode.
+The launch starts a keyframe-grid-to-OctoMap producer, 26-connected A* planner,
+and swept-sphere XYZ follower. The producer consumes `rtabmap_msgs/msg/MapData`
+on `/rtabmap/mapData`, rebuilds from the raw ground/obstacle/empty cells at the
+latest optimized poses, and publishes a paired `/rtabmap/octomap` plus
+`/rtabmap/octomap_metadata` generation. Ground is occupied, ray tracing is
+enabled, and a loop correction rebuilds the tree rather than leaving voxels at
+old poses.
+
+The planner also consumes corrected `PoseStamped` on `/rtabmap/pose` and a
+`PointStamped` goal on `/waypoint/clicked`. It publishes `/planner3d/path`,
+candidate paths, structured status, map/path generations, and markers. The
+follower pairs the path with that exact map generation, checks both its
+lookahead and rate-limited carrot chords, and publishes displacement, velocity,
+acceleration, validity, and status under `/planner3d/follower/*`. Neither node
+has a PX4 publisher; this mode cannot arm or move the vehicle.
+
+```bash
+cd /home/john/autonomous_drone_px4_vio/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+
+ros2 launch px4_vio_bridge global_planner_3d_monitor.launch.py \
+  voxel_size:=0.05 \
+  robot_radius:=0.25 \
+  safety_margin:=0.10 \
+  max_cross_track:=0.05 \
+  planning_radius_xy:=3.0 \
+  min_z:=0.20 \
+  max_z:=2.00 \
+  record_bag:=true
+```
+
+Run the deterministic two-generation fixture without a camera using matching
+fixture/planner resolution:
+
+```bash
+ros2 launch px4_vio_bridge global_planner_3d_monitor.launch.py \
+  simulate:=true fixture_resolution:=0.10 voxel_size:=0.10 \
+  fixture_loop_correction_after:=3.0 record_bag:=true
+```
+
+That fixture publishes one observed room with a floor and obstacle, then shifts
+its optimized keyframe pose by 0.20 m. A successful run reaches `PATH_VALID` and
+`FOLLOWING`, keeps the follower at 20 Hz, and exposes no `/fmu/in/*` topic.
+Recorded generations can be extracted to the line-oriented JSON accepted by
+`planner_3d_replay`; the verifier reruns planning and rejects any accepted path
+or follower chord whose generation differs or whose swept sphere intersects
+occupied, unknown, or outside-map volume.
+
+`min_z` and `max_z` are hard planning boundaries and must be replaced with
+independently measured site values. The launch refuses configurations where
+`safety_margin < 0.10` or `safety_margin < max_cross_track`. Goals must use the
+`world` frame; unlike the 2D mode, clicked Z is retained.
+
+The installed DepthAI 3.5.0 bridge still publishes only the height-collapsed
+`/rtabmap/grid`; setting `slam_grid_3d:=true` does **not** make it publish
+`/rtabmap/mapData`. Live use therefore still needs an RTAB-Map ROS host that
+publishes `MapData` with raw keyframe grids. The new producer deliberately does
+not reconstruct occupancy from point clouds, because that would lose observed
+free space and its original viewpoint. The perception, ROS-free geometry,
+observation nodes, and deterministic replay pieces are implemented; SITL,
+props-off, physical-course measurement, and constrained-flight gates remain.
+There is intentionally no `offboard_global_planner_3d.launch.py` yet.
 
 ## Flight parameters
 
@@ -536,10 +607,10 @@ Starts OAK-D RTAB-Map VIO/SLAM, `vio_to_px4_odometry`, the PX4
 local-position-to-ROS converter, `battery_to_ros`, and one Foxglove bridge on
 8765. Defaults: depth publishing off, compressed image on, clouds off, grid off.
 
-The current planner consumes only the projected 2D grid. A separate, fail-closed
-3D occupancy navigation architecture is specified in
-[`HANDOFF_3D_NAVIGATION.md`](HANDOFF_3D_NAVIGATION.md); it is a design, not a
-flight-ready launch mode.
+The flown planner consumes only the projected 2D grid. The separate fail-closed
+3D architecture in [`HANDOFF_3D_NAVIGATION.md`](HANDOFF_3D_NAVIGATION.md) now has
+an observation-only producer/planner/follower/replay implementation, but is not
+a flight-ready launch mode.
 
 | argument | default | notes |
 |---|---|---|

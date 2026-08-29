@@ -12,9 +12,14 @@
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <build_depend>nlohmann-json3-dev</build_depend>
+  <depend>octomap</depend>
+  <depend>octomap_msgs</depend>
   <depend>px4_msgs</depend>
   <depend>rclcpp</depend>
   <depend>rclpy</depend>
+  <depend>rtabmap</depend>
+  <depend>rtabmap_conversions</depend>
+  <depend>rtabmap_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>tf2_ros</depend>
