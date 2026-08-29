@@ -469,6 +469,11 @@ Starts OAK-D RTAB-Map VIO/SLAM, `vio_to_px4_odometry`, the PX4
 local-position-to-ROS converter, `battery_to_ros`, and one Foxglove bridge on
 8765. Defaults: depth publishing off, compressed image on, clouds off, grid off.
 
+The current planner consumes only the projected 2D grid. A separate, fail-closed
+3D occupancy navigation architecture is specified in
+[`HANDOFF_3D_NAVIGATION.md`](HANDOFF_3D_NAVIGATION.md); it is a design, not a
+flight-ready launch mode.
+
 | argument | default | notes |
 |---|---|---|
 | `slam_fps` | 20 | stereo camera, VIO and SLAM processing rate |
