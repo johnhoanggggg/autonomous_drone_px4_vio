@@ -181,6 +181,38 @@ lookahead and rate-limited carrot chords, and publishes displacement, velocity,
 acceleration, validity, and status under `/planner3d/follower/*`. Neither node
 has a PX4 publisher; this mode cannot arm or move the vehicle.
 
+### Live OctoMap from the OAK SLAM stack
+
+Use the dedicated launch in place of `rtabmap_slam_px4.launch.py` to run the
+normal continuous-VIO/PX4 stack plus a namespaced ROS RTAB-Map 3D mapper and
+OctoMap visualizer:
+
+```bash
+ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py
+```
+
+The extra mapper samples the actual rectified OAK image, registered metric
+depth and raw RTAB-Map VIO odometry at 3 Hz. It creates keyframe-local ground,
+obstacle and observed-empty grids at 1 Hz with `Grid/3D=true`, ground occupied,
+and ray tracing enabled. The OctoMap is rebuilt from those cached grids at the
+latest optimized poses, so loop corrections move old voxels instead of leaving
+duplicates. Its topics are deliberately isolated under `/rtabmap3d/*`; they are
+not consumed by the flown 2D planner or sent to PX4.
+
+Connect Foxglove to `ws://<pi-ip>:8765`, add a **3D** panel, select fixed frame
+`rtabmap3d_map`, then add `/rtabmap3d/octomap_markers`. Brown cubes are ground
+and red cubes are obstacles. Useful checks are:
+
+```bash
+ros2 topic hz /rtabmap3d/mapData
+ros2 topic echo /rtabmap3d/octomap_metadata --once
+ros2 topic hz /rtabmap3d/octomap_markers
+```
+
+This launch is a live mapping/visualization gate, not flight authorization. It
+runs a second host-side RTAB-Map process and therefore needs CPU measurement on
+the Pi before its output is connected to the 3D planner.
+
 ```bash
 cd /home/john/autonomous_drone_px4_vio/ros2_ws
 source /opt/ros/jazzy/setup.bash
@@ -234,15 +266,14 @@ independently measured site values. The launch refuses configurations where
 `safety_margin < 0.10` or `safety_margin < max_cross_track`. Goals must use the
 `world` frame; unlike the 2D mode, clicked Z is retained.
 
-The installed DepthAI 3.5.0 bridge still publishes only the height-collapsed
-`/rtabmap/grid`; setting `slam_grid_3d:=true` does **not** make it publish
-`/rtabmap/mapData`. Live use therefore still needs an RTAB-Map ROS host that
-publishes `MapData` with raw keyframe grids. The new producer deliberately does
-not reconstruct occupancy from point clouds, because that would lose observed
-free space and its original viewpoint. The perception, ROS-free geometry,
-observation nodes, and deterministic replay pieces are implemented; SITL,
-props-off, physical-course measurement, and constrained-flight gates remain.
-There is intentionally no `offboard_global_planner_3d.launch.py` yet.
+The installed DepthAI 3.5.0 node still publishes only the height-collapsed
+`/rtabmap/grid`; setting its `slam_grid_3d:=true` does **not** make it publish
+keyframe grids. `rtabmap_slam_px4_3d.launch.py` closes that interface gap with a
+separate ROS RTAB-Map host instead of reconstructing occupancy from point
+clouds, which would lose observed free space and its original viewpoint. Live
+planner pose/correction integration, CPU acceptance, SITL, props-off,
+physical-course measurement, and constrained-flight gates remain. There is
+intentionally no `offboard_global_planner_3d.launch.py` yet.
 
 ## Flight parameters
 

@@ -225,7 +225,7 @@ def generate_launch_description():
         launch_arguments={
             "port": LaunchConfiguration("foxglove_port"),
             "topic_whitelist": (
-                "['^/tf$', "
+                "['^/tf(_static)?$', "
                 "'^/rtabmap/(octomap_markers|octomap_metadata|pose|vio_pose|odom_correction)$', "
                 "'^/planner3d/.*$', '^/waypoint/clicked$']"
             ),

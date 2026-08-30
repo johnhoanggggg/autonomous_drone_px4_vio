@@ -22,11 +22,28 @@ cv::Mat canonical_cells(const cv::Mat & cells)
   if (cells.empty()) {
     return {};
   }
-  if (cells.type() != CV_32FC3) {
-    throw std::invalid_argument("3D local grid cells must use CV_32FC3");
+  if (cells.type() != CV_32FC3 && cells.type() != CV_32FC4) {
+    throw std::invalid_argument(
+            "3D local grid cells must use CV_32FC3 or CV_32FC4 (type=" +
+            std::to_string(cells.type()) + ", channels=" +
+            std::to_string(cells.channels()) + ", rows=" +
+            std::to_string(cells.rows) + ", cols=" +
+            std::to_string(cells.cols) + ")");
   }
   const auto continuous = cells.isContinuous() ? cells : cells.clone();
-  return continuous.reshape(3, 1);
+  if (continuous.type() == CV_32FC3) {
+    return continuous.reshape(3, 1);
+  }
+  // ROS RTAB-Map retains a packed color/intensity channel in local grids
+  // created from RGB-D data. RTAB-Map's OctoMap input contract is XYZ; discard
+  // only that fourth visualization channel and preserve every observed cell.
+  const auto colored = continuous.reshape(4, 1);
+  cv::Mat xyz(1, static_cast<int>(colored.total()), CV_32FC3);
+  for (int column = 0; column < colored.cols; ++column) {
+    const auto point = colored.at<cv::Vec4f>(0, column);
+    xyz.at<cv::Vec3f>(0, column) = {point[0], point[1], point[2]};
+  }
+  return xyz;
 }
 
 void fnv_bytes(std::uint64_t & hash, const void * data, std::size_t size)

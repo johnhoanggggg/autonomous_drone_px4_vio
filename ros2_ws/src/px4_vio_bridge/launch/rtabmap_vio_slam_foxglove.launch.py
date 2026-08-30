@@ -17,6 +17,8 @@ def generate_launch_description():
     slam_image_jpeg_quality = LaunchConfiguration("slam_image_jpeg_quality")
     slam_publish_depth = LaunchConfiguration("slam_publish_depth")
     slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
+    slam_publish_ros_rgbd = LaunchConfiguration("slam_publish_ros_rgbd")
+    slam_ros_rgbd_publish_hz = LaunchConfiguration("slam_ros_rgbd_publish_hz")
     slam_num_features = LaunchConfiguration("slam_num_features")
     slam_path_publish_stride = LaunchConfiguration("slam_path_publish_stride")
     slam_path_size = LaunchConfiguration("slam_path_size")
@@ -41,6 +43,8 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_image_jpeg_quality", default_value="60"),
             DeclareLaunchArgument("slam_publish_depth", default_value="true"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
+            DeclareLaunchArgument("slam_publish_ros_rgbd", default_value="false"),
+            DeclareLaunchArgument("slam_ros_rgbd_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_num_features", default_value="400"),
             DeclareLaunchArgument("slam_path_publish_stride", default_value="10"),
             DeclareLaunchArgument("slam_path_size", default_value="1000"),
@@ -68,6 +72,8 @@ def generate_launch_description():
                     "--image-jpeg-quality", slam_image_jpeg_quality,
                     "--publish-depth", slam_publish_depth,
                     "--depth-publish-hz", slam_depth_publish_hz,
+                    "--publish-ros-rgbd", slam_publish_ros_rgbd,
+                    "--ros-rgbd-publish-hz", slam_ros_rgbd_publish_hz,
                     "--num-features", slam_num_features,
                     "--path-publish-stride", slam_path_publish_stride,
                     "--path-size", slam_path_size,
@@ -91,7 +97,7 @@ def generate_launch_description():
                 condition=IfCondition(foxglove),
                 launch_arguments={
                     "port": foxglove_port,
-                    "topic_whitelist": "['^/tf$', '^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|depth|camera_info|vio_feature_count|grid)$', '^/rtabmap/image/compressed$', '^/rtabmap/image$', '^/rtabmap/(obstacle_cloud|ground_cloud)$']",
+                    "topic_whitelist": "['^/tf(_static)?$', '^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|depth|camera_info|vio_feature_count|grid)$', '^/rtabmap/image/compressed$', '^/rtabmap/image$', '^/rtabmap/(obstacle_cloud|ground_cloud)$']",
                     "service_whitelist": "['^$']",
                     "param_whitelist": "['^$']",
                     "client_topic_whitelist": "['^$']",

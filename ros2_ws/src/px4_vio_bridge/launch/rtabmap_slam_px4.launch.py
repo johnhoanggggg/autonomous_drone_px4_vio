@@ -33,6 +33,8 @@ def generate_launch_description():
     slam_publish_image = LaunchConfiguration("slam_publish_image")
     slam_publish_depth = LaunchConfiguration("slam_publish_depth")
     slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
+    slam_publish_ros_rgbd = LaunchConfiguration("slam_publish_ros_rgbd")
+    slam_ros_rgbd_publish_hz = LaunchConfiguration("slam_ros_rgbd_publish_hz")
     slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
     slam_publish_grid = LaunchConfiguration("slam_publish_grid")
     slam_grid_3d = LaunchConfiguration("slam_grid_3d")
@@ -87,6 +89,8 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_publish_image", default_value="true"),
             DeclareLaunchArgument("slam_publish_depth", default_value="false"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
+            DeclareLaunchArgument("slam_publish_ros_rgbd", default_value="false"),
+            DeclareLaunchArgument("slam_ros_rgbd_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
             DeclareLaunchArgument("slam_publish_grid", default_value="true"),
             DeclareLaunchArgument("slam_grid_3d", default_value="false"),
@@ -106,11 +110,12 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "foxglove_topic_whitelist",
                 default_value=(
-                    "['^/tf$', "
+                    "['^/tf(_static)?$', "
                     "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count|grid|octomap_markers|octomap_metadata)$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
+                    "'^/rtabmap3d/(octomap_markers|octomap_metadata)$', "
                     "'^/vio/yaw_offset/(pose|odometry|path)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
                     "'^/waypoint/(clicked|clicked_pose|target|commanded|status)$', "
@@ -184,6 +189,8 @@ def generate_launch_description():
                                     "slam_publish_image": slam_publish_image,
                                     "slam_publish_depth": slam_publish_depth,
                                     "slam_depth_publish_hz": slam_depth_publish_hz,
+                                    "slam_publish_ros_rgbd": slam_publish_ros_rgbd,
+                                    "slam_ros_rgbd_publish_hz": slam_ros_rgbd_publish_hz,
                                     "slam_publish_clouds": slam_publish_clouds,
                                     "slam_publish_grid": slam_publish_grid,
                                     "slam_grid_3d": slam_grid_3d,

@@ -17,7 +17,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import CameraInfo, PointCloud2, PointField, Image, CompressedImage
 from std_msgs.msg import Int32, String
-from tf2_ros import TransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from px4_vio_bridge.rtabmap_grid import make_occupancy_grid
 
@@ -42,6 +42,11 @@ parser.add_argument('--publish-depth', type=parse_bool, default=False,
                     help='Publish RAW16 metric depth for Foxglove.')
 parser.add_argument('--depth-publish-hz', type=float, default=3.0,
                     help='Maximum depth publish rate in Hz.')
+parser.add_argument('--publish-ros-rgbd', type=parse_bool, default=False,
+                    help='Publish synchronized raw RGB-D and VIO odometry for a '
+                         'separate ROS RTAB-Map 3D mapper.')
+parser.add_argument('--ros-rgbd-publish-hz', type=float, default=3.0,
+                    help='Maximum /rtabmap3d/input RGB-D publish rate in Hz.')
 # BasaltVIO tuning. The node otherwise runs entirely on setDefaultVIOConfig(),
 # whose optical-flow and IMU settings come from Basalt's EuRoC reference rig
 # (1 point per 50 px cell on a larger image, and an industrial IMU). On this
@@ -230,9 +235,12 @@ class Ros2Node(dai.node.ThreadedHostNode):
             'publish_clouds': args.publish_clouds,
             'publish_image': args.publish_image,
             'publish_depth': args.publish_depth,
+            'publish_ros_rgbd': args.publish_ros_rgbd,
+            'ros_rgbd_publish_hz': args.ros_rgbd_publish_hz,
         }, sort_keys=True)))
         self.last_feature_report = 0.0
         self.tf_broadcaster = TransformBroadcaster(self.ros_node)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self.ros_node)
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -315,6 +323,30 @@ class Ros2Node(dai.node.ThreadedHostNode):
                 Image, '/rtabmap/depth', sensor_qos)
             self.camera_info_pub = self.ros_node.create_publisher(
                 CameraInfo, '/rtabmap/camera_info', sensor_qos)
+
+        # A namespaced sensor/odometry feed for the planner-grade ROS RTAB-Map
+        # process.  It is disabled in every existing flight launch.  The image,
+        # depth, CameraInfo and Odometry messages below receive one identical ROS
+        # timestamp, allowing exact synchronization without changing the native
+        # DepthAI VIO-to-PX4 path.
+        self.publish_ros_rgbd = args.publish_ros_rgbd
+        self.ros_rgbd_publish_period = 1.0 / max(0.1, args.ros_rgbd_publish_hz)
+        self.last_ros_rgbd_publish = 0.0
+        self.ros_rgbd_image_pub = None
+        self.ros_rgbd_depth_pub = None
+        self.ros_rgbd_camera_info_pub = None
+        self.ros_rgbd_odom_pub = None
+        self.ros_rgbd_camera_info = None
+        if self.publish_ros_rgbd:
+            self.ros_rgbd_image_pub = self.ros_node.create_publisher(
+                Image, '/rtabmap3d/input/image', sensor_qos)
+            self.ros_rgbd_depth_pub = self.ros_node.create_publisher(
+                Image, '/rtabmap3d/input/depth', sensor_qos)
+            self.ros_rgbd_camera_info_pub = self.ros_node.create_publisher(
+                CameraInfo, '/rtabmap3d/input/camera_info', sensor_qos)
+            self.ros_rgbd_odom_pub = self.ros_node.create_publisher(
+                Odometry, '/rtabmap3d/input/odom', sensor_qos)
+            self._publish_ros_rgbd_static_transform()
 
         self.path_publish_stride = max(1, args.path_publish_stride)
         self.path_size = max(1, args.path_size)
@@ -599,9 +631,10 @@ class Ros2Node(dai.node.ThreadedHostNode):
             # creating a motion-dependent fake map correction in ROS.
             odomCorrectionData = self.inputOdomCorrection.get()
             basaltTransData = self.inputBasaltTrans.get()
-            imgFrame = self.inputImg.tryGet() if self.publish_image else None
+            imgFrame = self.inputImg.tryGet() if (
+                self.publish_image or self.publish_ros_rgbd) else None
             depthFrame = self.inputDepth.tryGet() if (
-                self.publish_depth or self.detect_people) else None
+                self.publish_depth or self.detect_people or self.publish_ros_rgbd) else None
             pclObstData = self.inputObstaclePCL.tryGet() if self.publish_clouds else None
             pclGrndData = self.inputGroundPCL.tryGet() if self.publish_clouds else None
             featuresData = self.inputFeatures.tryGet()
@@ -659,6 +692,8 @@ class Ros2Node(dai.node.ThreadedHostNode):
                     depthFrame if depthFrame is not None else basaltTransData)
                 self.raw_pose_history.append((raw_time, raw_pose))
                 self.vio_pose_pub.publish(self._make_pose(basaltTransData, now))
+                if self.publish_ros_rgbd:
+                    self._publish_ros_rgbd_odometry_transform(basaltTransData, now)
 
             if transData is not None:
                 pose = self._make_pose(transData, now)
@@ -683,6 +718,18 @@ class Ros2Node(dai.node.ThreadedHostNode):
                 self.image_count += 1
                 if self.image_count % self.image_publish_stride == 0:
                     self.publish_frame(imgFrame, now)
+
+            if (
+                self.publish_ros_rgbd
+                and imgFrame is not None
+                and depthFrame is not None
+                and basaltTransData is not None
+            ):
+                monotonic_now = time.monotonic()
+                if monotonic_now - self.last_ros_rgbd_publish >= self.ros_rgbd_publish_period:
+                    self.last_ros_rgbd_publish = monotonic_now
+                    self.publish_ros_rgbd_sample(
+                        imgFrame, depthFrame, basaltTransData, now)
 
             if depthFrame is not None:
                 if self.detect_people:
@@ -752,6 +799,98 @@ class Ros2Node(dai.node.ThreadedHostNode):
         transform.transform.rotation = pose.pose.orientation
         self.tf_broadcaster.sendTransform(transform)
 
+    def _publish_ros_rgbd_static_transform(self):
+        """Publish body<-optical using the REP-103 camera-axis convention."""
+        transform = TransformStamped()
+        transform.header.stamp = self.ros_node.get_clock().now().to_msg()
+        transform.header.frame_id = 'rtabmap3d_camera_link'
+        transform.child_frame_id = 'rtabmap3d_camera_optical'
+        # Rotation matrix [optical coordinates -> FLU body coordinates]:
+        # body x=optical z, body y=-optical x, body z=-optical y.
+        transform.transform.rotation.x = -0.5
+        transform.transform.rotation.y = 0.5
+        transform.transform.rotation.z = -0.5
+        transform.transform.rotation.w = 0.5
+        self.static_tf_broadcaster.sendTransform(transform)
+
+    def _publish_ros_rgbd_odometry_transform(self, trans_data, now):
+        pose = self._make_pose(trans_data, now)
+        transform = TransformStamped()
+        transform.header.stamp = now
+        transform.header.frame_id = 'rtabmap3d_odom'
+        transform.child_frame_id = 'rtabmap3d_camera_link'
+        transform.transform.translation.x = pose.pose.position.x
+        transform.transform.translation.y = pose.pose.position.y
+        transform.transform.translation.z = pose.pose.position.z
+        transform.transform.rotation = pose.pose.orientation
+        self.tf_broadcaster.sendTransform(transform)
+
+    def _camera_info_for(self, width, height, frame_id):
+        calibration = self.getParentPipeline().getDefaultDevice().readCalibration()
+        intrinsics = calibration.getCameraIntrinsics(
+            dai.CameraBoardSocket.CAM_B, width, height)
+        fx, fy = float(intrinsics[0][0]), float(intrinsics[1][1])
+        cx, cy = float(intrinsics[0][2]), float(intrinsics[1][2])
+        info = CameraInfo()
+        info.header.frame_id = frame_id
+        info.height = height
+        info.width = width
+        info.distortion_model = 'plumb_bob'
+        info.d = [0.0] * 5
+        info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        info.p = [fx, 0.0, cx, 0.0,
+                  0.0, fy, cy, 0.0,
+                  0.0, 0.0, 1.0, 0.0]
+        return info
+
+    def publish_ros_rgbd_sample(self, img_frame, depth_frame, trans_data, now):
+        width = depth_frame.getWidth()
+        height = depth_frame.getHeight()
+        image_data = bytes(img_frame.getData())
+        depth_data = bytes(depth_frame.getData())
+        if len(image_data) != width * height or len(depth_data) != width * height * 2:
+            self.ros_node.get_logger().warning(
+                'RTAB-Map 3D RGB-D sample rejected: unexpected image/depth size',
+                throttle_duration_sec=5.0)
+            return
+
+        header_frame = 'rtabmap3d_camera_optical'
+        image = Image()
+        image.header.stamp = now
+        image.header.frame_id = header_frame
+        image.height = height
+        image.width = width
+        image.encoding = 'mono8'
+        image.step = width
+        image.data = image_data
+
+        depth = Image()
+        depth.header = image.header
+        depth.height = height
+        depth.width = width
+        depth.encoding = '16UC1'
+        depth.is_bigendian = 0
+        depth.step = width * 2
+        depth.data = depth_data
+
+        if self.ros_rgbd_camera_info is None:
+            self.ros_rgbd_camera_info = self._camera_info_for(
+                width, height, header_frame)
+        self.ros_rgbd_camera_info.header.stamp = now
+
+        pose = self._make_pose(trans_data, now)
+        odom = Odometry()
+        odom.header.stamp = now
+        odom.header.frame_id = 'rtabmap3d_odom'
+        odom.child_frame_id = 'rtabmap3d_camera_link'
+        odom.pose.pose = pose.pose
+
+        self.ros_rgbd_image_pub.publish(image)
+        self.ros_rgbd_depth_pub.publish(depth)
+        self.ros_rgbd_camera_info_pub.publish(self.ros_rgbd_camera_info)
+        self.ros_rgbd_odom_pub.publish(odom)
+
     def publish_frame(self, imgFrame, now):
         width = imgFrame.getWidth()
         height = imgFrame.getHeight()
@@ -805,22 +944,7 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.depth_pub.publish(msg)
 
         if self.camera_info is None:
-            calibration = self.getParentPipeline().getDefaultDevice().readCalibration()
-            intrinsics = calibration.getCameraIntrinsics(
-                dai.CameraBoardSocket.CAM_B, width, height)
-            fx, fy = float(intrinsics[0][0]), float(intrinsics[1][1])
-            cx, cy = float(intrinsics[0][2]), float(intrinsics[1][2])
-
-            self.camera_info = CameraInfo()
-            self.camera_info.height = height
-            self.camera_info.width = width
-            self.camera_info.distortion_model = 'plumb_bob'
-            self.camera_info.d = [0.0] * 5
-            self.camera_info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
-            self.camera_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-            self.camera_info.p = [fx, 0.0, cx, 0.0,
-                                  0.0, fy, cy, 0.0,
-                                  0.0, 0.0, 1.0, 0.0]
+            self.camera_info = self._camera_info_for(width, height, 'camera')
 
         self.camera_info.header = msg.header
         self.camera_info_pub.publish(self.camera_info)
@@ -1061,9 +1185,9 @@ with dai.Pipeline() as p:
     slam.passthroughOdom.link(ros2Viewer.inputBasaltTrans)
     slam.transform.link(ros2Viewer.inputTrans)
     slam.odomCorrection.link(ros2Viewer.inputOdomCorrection)
-    if args.publish_image:
+    if args.publish_image or args.publish_ros_rgbd:
         slam.passthroughRect.link(ros2Viewer.inputImg)
-    if args.publish_depth or args.detect_people:
+    if args.publish_depth or args.detect_people or args.publish_ros_rgbd:
         slam.passthroughDepth.link(ros2Viewer.inputDepth)
     if args.publish_grid:
         slam.occupancyGridMap.link(ros2Viewer.inputGrid)

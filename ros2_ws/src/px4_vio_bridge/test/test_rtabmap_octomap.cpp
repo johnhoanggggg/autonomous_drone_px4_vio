@@ -33,6 +33,16 @@ cv::Mat points(const std::vector<cv::Point3f> & values)
   return result;
 }
 
+cv::Mat colored_points(std::initializer_list<cv::Vec4f> values)
+{
+  cv::Mat result(1, static_cast<int>(values.size()), CV_32FC4);
+  int column = 0;
+  for (const auto & value : values) {
+    result.at<cv::Vec4f>(0, column++) = value;
+  }
+  return result;
+}
+
 bool occupied(const rtabmap::RtabmapColorOcTree & tree, float x, float y, float z)
 {
   const auto * node = tree.search(x, y, z);
@@ -64,6 +74,42 @@ TEST(RtabmapOctomap, PreservesObservedFreeAndTreatsGroundAsOccupied)
   EXPECT_EQ(assembler.metadata().ground_cells, 2U);
   EXPECT_EQ(assembler.metadata().obstacle_cells, 1U);
   EXPECT_EQ(assembler.metadata().empty_cells, 1U);
+}
+
+TEST(RtabmapOctomap, AcceptsColoredRosRtabmapCellsAndUsesOnlyXyz)
+{
+  p::RtabmapOctomapAssembler assembler;
+  p::LocalGridObservation observation;
+  observation.node_id = 1;
+  observation.cell_size = 0.1F;
+  observation.view_point = {0.0F, 0.0F, 0.5F};
+  observation.obstacles = colored_points({
+    {0.4F, 0.0F, 0.5F, 12345.0F},
+    {0.5F, 0.0F, 0.5F, -9876.0F}});
+  observation.empty = colored_points({{0.2F, 0.0F, 0.5F, 42.0F}});
+  std::string error;
+  ASSERT_TRUE(assembler.rebuild(
+      {observation}, {{1, rtabmap::Transform::getIdentity()}}, &error)) << error;
+  EXPECT_TRUE(occupied(*assembler.tree(), 0.4F, 0.0F, 0.5F));
+  EXPECT_TRUE(occupied(*assembler.tree(), 0.5F, 0.0F, 0.5F));
+  const auto * empty = assembler.tree()->search(0.2F, 0.0F, 0.5F);
+  ASSERT_NE(empty, nullptr);
+  EXPECT_FALSE(assembler.tree()->isNodeOccupied(empty));
+  EXPECT_EQ(assembler.metadata().obstacle_cells, 2U);
+  EXPECT_EQ(assembler.metadata().empty_cells, 1U);
+}
+
+TEST(RtabmapOctomap, RejectsHeightCollapsedCells)
+{
+  p::RtabmapOctomapAssembler assembler;
+  p::LocalGridObservation observation;
+  observation.node_id = 1;
+  observation.cell_size = 0.1F;
+  observation.obstacles = cv::Mat(1, 1, CV_32FC2, cv::Scalar(0.4F, 0.0F));
+  std::string error;
+  EXPECT_FALSE(assembler.rebuild(
+      {observation}, {{1, rtabmap::Transform::getIdentity()}}, &error));
+  EXPECT_NE(error.find("CV_32FC3 or CV_32FC4"), std::string::npos);
 }
 
 TEST(RtabmapOctomap, LoopCorrectionRebuildRemovesOldVoxelLocation)

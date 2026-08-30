@@ -28,18 +28,28 @@ public:
   {
     map_data_topic_ = declare_parameter<std::string>("map_data_topic", "/rtabmap/mapData");
     frame_id_ = declare_parameter<std::string>("frame_id", "world");
+    const auto octomap_topic = declare_parameter<std::string>(
+      "octomap_topic", "/rtabmap/octomap");
+    const auto metadata_topic = declare_parameter<std::string>(
+      "metadata_topic", "/rtabmap/octomap_metadata");
+    const auto markers_topic = declare_parameter<std::string>(
+      "markers_topic", "/rtabmap/octomap_markers");
     const auto max_marker_voxels = declare_parameter<int>("max_marker_voxels", 50000);
     if (max_marker_voxels < 0) {
       throw std::invalid_argument("max_marker_voxels cannot be negative");
     }
     max_marker_voxels_ = static_cast<std::size_t>(max_marker_voxels);
-    const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
-    octomap_pub_ = create_publisher<octomap_msgs::msg::Octomap>("/rtabmap/octomap", qos);
-    metadata_pub_ = create_publisher<std_msgs::msg::String>("/rtabmap/octomap_metadata", qos);
+    const auto output_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    // ROS RTAB-Map's live MapData publisher is volatile, while the deterministic
+    // fixture is transient-local. A volatile reliable subscription is compatible
+    // with both offered durability policies.
+    const auto input_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
+    octomap_pub_ = create_publisher<octomap_msgs::msg::Octomap>(octomap_topic, output_qos);
+    metadata_pub_ = create_publisher<std_msgs::msg::String>(metadata_topic, output_qos);
     markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-      "/rtabmap/octomap_markers", qos);
+      markers_topic, output_qos);
     map_data_sub_ = create_subscription<rtabmap_msgs::msg::MapData>(
-      map_data_topic_, qos,
+      map_data_topic_, input_qos,
       [this](rtabmap_msgs::msg::MapData::ConstSharedPtr message) {on_map_data(*message);});
     RCLCPP_INFO(
       get_logger(), "waiting for RTAB-Map keyframe grids on %s", map_data_topic_.c_str());
@@ -53,8 +63,10 @@ private:
     std::map<int, rtabmap::Signature> signatures;
     rtabmap::Transform map_to_odom;
     rtabmap_conversions::mapDataFromROS(message, poses, links, signatures, map_to_odom);
-    std::vector<LocalGridObservation> observations;
-    observations.reserve(signatures.size());
+    // CoreWrapper publishes the complete optimized pose graph but may attach
+    // only newly added/retrieved node data to each MapData update. Cache just
+    // the uncompressed local grids (not RGB-D descriptors) so every rebuild can
+    // reapply all observations at the latest loop-corrected poses.
     for (const auto & item : signatures) {
       const auto & data = item.second.sensorData();
       cv::Mat ground;
@@ -64,11 +76,29 @@ private:
       if (ground.empty() && obstacles.empty() && empty.empty()) {
         continue;
       }
-      observations.push_back({
-        item.first, ground, obstacles, empty, data.gridCellSize(), data.gridViewPoint()});
+      RCLCPP_DEBUG(
+        get_logger(),
+        "node %d local grids: ground type=%d %dx%d, obstacles type=%d %dx%d, empty type=%d %dx%d",
+        item.first, ground.type(), ground.rows, ground.cols,
+        obstacles.type(), obstacles.rows, obstacles.cols,
+        empty.type(), empty.rows, empty.cols);
+      observations_[item.first] = {
+        item.first, ground.clone(), obstacles.clone(), empty.clone(),
+        data.gridCellSize(), data.gridViewPoint()};
+    }
+    if (!poses.empty()) {
+      optimized_poses_ = std::move(poses);
+    }
+    std::vector<LocalGridObservation> observations;
+    observations.reserve(optimized_poses_.size());
+    for (const auto & pose : optimized_poses_) {
+      const auto observation = observations_.find(pose.first);
+      if (observation != observations_.end()) {
+        observations.push_back(observation->second);
+      }
     }
     std::string error;
-    if (!assembler_.rebuild(observations, poses, &error)) {
+    if (!assembler_.rebuild(observations, optimized_poses_, &error)) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 5000, "OctoMap generation rejected: %s", error.c_str());
       return;
@@ -176,6 +206,8 @@ private:
   std::string frame_id_;
   std::size_t max_marker_voxels_{};
   std::int64_t generation_{};
+  std::map<int, LocalGridObservation> observations_;
+  std::map<int, rtabmap::Transform> optimized_poses_;
   RtabmapOctomapAssembler assembler_;
   rclcpp::Subscription<rtabmap_msgs::msg::MapData>::SharedPtr map_data_sub_;
   rclcpp::Publisher<octomap_msgs::msg::Octomap>::SharedPtr octomap_pub_;
