@@ -38,6 +38,7 @@ def generate_launch_description():
     slam_publish_depth = LaunchConfiguration("slam_publish_depth")
     slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
     slam_publish_ros_rgbd = LaunchConfiguration("slam_publish_ros_rgbd")
+    slam_enable_slam = LaunchConfiguration("slam_enable_slam")
     slam_ros_rgbd_publish_hz = LaunchConfiguration("slam_ros_rgbd_publish_hz")
     slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
     slam_publish_grid = LaunchConfiguration("slam_publish_grid")
@@ -101,6 +102,10 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_publish_depth", default_value="false"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_ros_rgbd", default_value="false"),
+            # On-device RTABMapSLAM costs ~122% CPU. PX4 is fed from the raw
+            # /rtabmap/vio_pose, which does not come from it, so it can be
+            # turned off when a ROS rtabmap_slam owns the map instead.
+            DeclareLaunchArgument("slam_enable_slam", default_value="true"),
             DeclareLaunchArgument("slam_ros_rgbd_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
             DeclareLaunchArgument("slam_publish_grid", default_value="true"),
@@ -201,6 +206,7 @@ def generate_launch_description():
                                     "slam_publish_depth": slam_publish_depth,
                                     "slam_depth_publish_hz": slam_depth_publish_hz,
                                     "slam_publish_ros_rgbd": slam_publish_ros_rgbd,
+                                    "slam_enable_slam": slam_enable_slam,
                                     "slam_ros_rgbd_publish_hz": slam_ros_rgbd_publish_hz,
                                     "slam_publish_clouds": slam_publish_clouds,
                                     "slam_publish_grid": slam_publish_grid,

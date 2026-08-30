@@ -18,6 +18,7 @@ def generate_launch_description():
     slam_publish_depth = LaunchConfiguration("slam_publish_depth")
     slam_depth_publish_hz = LaunchConfiguration("slam_depth_publish_hz")
     slam_publish_ros_rgbd = LaunchConfiguration("slam_publish_ros_rgbd")
+    slam_enable_slam = LaunchConfiguration("slam_enable_slam")
     slam_ros_rgbd_publish_hz = LaunchConfiguration("slam_ros_rgbd_publish_hz")
     slam_num_features = LaunchConfiguration("slam_num_features")
     slam_path_publish_stride = LaunchConfiguration("slam_path_publish_stride")
@@ -44,6 +45,7 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_publish_depth", default_value="true"),
             DeclareLaunchArgument("slam_depth_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_ros_rgbd", default_value="false"),
+            DeclareLaunchArgument("slam_enable_slam", default_value="true"),
             DeclareLaunchArgument("slam_ros_rgbd_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_num_features", default_value="400"),
             DeclareLaunchArgument("slam_path_publish_stride", default_value="10"),
@@ -73,6 +75,7 @@ def generate_launch_description():
                     "--publish-depth", slam_publish_depth,
                     "--depth-publish-hz", slam_depth_publish_hz,
                     "--publish-ros-rgbd", slam_publish_ros_rgbd,
+                    "--enable-slam", slam_enable_slam,
                     "--ros-rgbd-publish-hz", slam_ros_rgbd_publish_hz,
                     "--num-features", slam_num_features,
                     "--path-publish-stride", slam_path_publish_stride,

@@ -338,6 +338,39 @@ visual-only with the IMU used just for gravity. A ROS-native flight pose
 therefore needs either a v3 driver plus a real VIO node, or the on-device
 DepthAI VIO retained for pose while ROS keeps only mapping.
 
+##### Hybrid: on-device VIO, ROS mapping (`slam_enable_slam:=false`)
+
+Because the ROS driver's IMU cannot be fused, the inertial estimator stays on
+the device, where depthai-core 3.5.0 fuses the same BMI270 correctly. What is
+removed is the *duplicate* map: `basalt_rtabmap_slam_ros2 --enable-slam false`
+drops the on-device `RTABMapSLAM` node and lets a single ROS `rtabmap_slam`
+own the map.
+
+PX4 is unaffected. `vio_to_px4_odometry` is fed from `/rtabmap/vio_pose`, the
+raw continuous VIO pose, deliberately not the loop-corrected `/rtabmap/pose`.
+Without SLAM that publisher is driven straight from `odom.transform`, which is
+the same data `slam.passthroughOdom` used to forward.
+
+Measured on the Pi with identical flags, only `--enable-slam` differing:
+
+| | DepthAI process CPU | `/basalt/pose` |
+| --- | --- | --- |
+| `--enable-slam true` | 187.5% | 23.97 Hz |
+| `--enable-slam false` | 64.9% | 24.49 Hz |
+
+That is 122.6 points, about 1.2 of the four cores, at an unchanged pose rate.
+
+`rtabmap_slam_px4_3d.launch.py` now defaults to `slam_enable_slam:=false`.
+Verified end to end: `/rtabmap/vio_pose` at 20.5 Hz, `/rtabmap3d/input/odom` at
+2.8 Hz, the ROS mapper publishing an OctoMap, and no on-device grid. Pass
+`slam_enable_slam:=true` to restore the previous two-map behaviour. Note that
+run measured 119% for the DepthAI process because the launch leaves
+`slam_publish_image:=true`; host JPEG encoding is roughly the difference from
+64.9%, so it is worth turning off when Foxglove does not need the feed.
+
+This has not flown. It still needs props-off and flight gates, and the map
+frame is `rtabmap3d_map` rather than `world`.
+
 ##### Topologies that do not work on this driver
 
 `i_pipeline_type: depth` publishes the device-rectified mono pair and depth but

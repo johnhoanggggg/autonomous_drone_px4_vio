@@ -42,6 +42,10 @@ parser.add_argument('--publish-depth', type=parse_bool, default=False,
                     help='Publish RAW16 metric depth for Foxglove.')
 parser.add_argument('--depth-publish-hz', type=float, default=3.0,
                     help='Maximum depth publish rate in Hz.')
+parser.add_argument('--enable-slam', type=parse_bool, default=True,
+                    help='Run the on-device RTABMapSLAM node. Set false to publish '
+                         'raw VIO pose and RGB-D only and let a ROS rtabmap_slam own '
+                         'the map, which frees the core RTABMapSLAM pins.')
 parser.add_argument('--publish-ros-rgbd', type=parse_bool, default=False,
                     help='Publish synchronized raw RGB-D and VIO odometry for a '
                          'separate ROS RTAB-Map 3D mapper.')
@@ -128,6 +132,19 @@ parser.add_argument('--person-depth-band-m', type=float, default=0.45,
 parser.add_argument('--person-point-stride', type=int, default=2,
                     help='Use every Nth RGB-D pixel inside a person box.')
 args, ros_args = parser.parse_known_args()
+
+if not args.enable_slam:
+    # The grid and the obstacle/ground clouds are RTABMapSLAM outputs. With the
+    # node gone they have no producer, and --publish-ros-rgbd is the point of
+    # this mode: a ROS rtabmap_slam builds the one map instead.
+    for disabled in ('publish_grid', 'publish_clouds'):
+        if getattr(args, disabled):
+            setattr(args, disabled, False)
+            print(f'--enable-slam false: ignoring --{disabled.replace("_", "-")}, '
+                  'that output comes from the on-device SLAM node')
+    if not args.publish_ros_rgbd:
+        print('--enable-slam false: no map is produced unless a ROS rtabmap_slam '
+              'consumes /rtabmap3d/input/*; consider --publish-ros-rgbd true')
 
 if dai.__version__ == '3.7.1':
     parser.error(
@@ -329,6 +346,7 @@ class Ros2Node(dai.node.ThreadedHostNode):
         # depth, CameraInfo and Odometry messages below receive one identical ROS
         # timestamp, allowing exact synchronization without changing the native
         # DepthAI VIO-to-PX4 path.
+        self.enable_slam = args.enable_slam
         self.publish_ros_rgbd = args.publish_ros_rgbd
         self.ros_rgbd_publish_period = 1.0 / max(0.1, args.ros_rgbd_publish_hz)
         self.last_ros_rgbd_publish = 0.0
@@ -624,13 +642,20 @@ class Ros2Node(dai.node.ThreadedHostNode):
 
     def run(self):
         while self.mainLoop():
-            transData = self.inputTrans.get()
-            # RTABMapSLAM::odomPoseCB sends transform, odomCorrection, then
-            # passthroughOdom for one input sample. Blocking for the latter two
-            # is intentional: tryGet() often returned the previous raw pose,
-            # creating a motion-dependent fake map correction in ROS.
-            odomCorrectionData = self.inputOdomCorrection.get()
-            basaltTransData = self.inputBasaltTrans.get()
+            if self.enable_slam:
+                transData = self.inputTrans.get()
+                # RTABMapSLAM::odomPoseCB sends transform, odomCorrection, then
+                # passthroughOdom for one input sample. Blocking for the latter
+                # two is intentional: tryGet() often returned the previous raw
+                # pose, creating a motion-dependent fake map correction in ROS.
+                odomCorrectionData = self.inputOdomCorrection.get()
+                basaltTransData = self.inputBasaltTrans.get()
+            else:
+                # No SLAM node: nothing ever drives inputTrans or
+                # inputOdomCorrection, so blocking on them would deadlock.
+                transData = None
+                odomCorrectionData = None
+                basaltTransData = self.inputBasaltTrans.get()
             imgFrame = self.inputImg.tryGet() if (
                 self.publish_image or self.publish_ros_rgbd) else None
             depthFrame = self.inputDepth.tryGet() if (
@@ -977,7 +1002,7 @@ with dai.Pipeline() as p:
     else:
         featureTracker = p.create(dai.node.FeatureTracker)
         odom = p.create(dai.node.RTABMapVIO)
-    slam = p.create(dai.node.RTABMapSLAM)
+    slam = p.create(dai.node.RTABMapSLAM) if args.enable_slam else None
     stereo = p.create(dai.node.StereoDepth)
     personDetector = None
     personSync = None
@@ -1040,10 +1065,11 @@ with dai.Pipeline() as p:
         "GridGlobal/FootprintRadius": str(args.grid_footprint_radius),
         "Rtabmap/SaveWMState": "true",
     }
-    slam.setParams(params)
-    slam.setPublishObstacleCloud(args.publish_clouds)
-    slam.setPublishGroundCloud(args.publish_clouds)
-    slam.setPublishGrid(args.publish_grid)
+    if slam is not None:
+        slam.setParams(params)
+        slam.setPublishObstacleCloud(args.publish_clouds)
+        slam.setPublishGroundCloud(args.publish_clouds)
+        slam.setPublishGrid(args.publish_grid)
 
     ros2Viewer = p.create(Ros2Node)
 
@@ -1169,30 +1195,43 @@ with dai.Pipeline() as p:
     if args.vio_backend == 'basalt':
         stereo.syncedLeft.link(odom.left)
         stereo.syncedRight.link(odom.right)
-        stereo.depth.link(slam.depth)
-        stereo.rectifiedLeft.link(slam.rect)
+        # Without SLAM these are the RGB-D pair the ROS mapper consumes; depth
+        # is aligned to CAM_B, so rectifiedLeft is its matching image.
+        rect_source = stereo.rectifiedLeft
+        depth_source = stereo.depth
     else:
         stereo.rectifiedLeft.link(featureTracker.inputImage)
         featureTracker.passthroughInputImage.link(odom.rect)
         stereo.depth.link(odom.depth)
         featureTracker.outputFeatures.link(odom.features)
         featureTracker.outputFeatures.link(ros2Viewer.inputFeatures)
-        odom.passthroughRect.link(slam.rect)
-        odom.passthroughDepth.link(slam.depth)
+        rect_source = odom.passthroughRect
+        depth_source = odom.passthroughDepth
     imu.out.link(odom.imu)
 
-    odom.transform.link(slam.odom)
-    slam.passthroughOdom.link(ros2Viewer.inputBasaltTrans)
-    slam.transform.link(ros2Viewer.inputTrans)
-    slam.odomCorrection.link(ros2Viewer.inputOdomCorrection)
-    if args.publish_image or args.publish_ros_rgbd:
-        slam.passthroughRect.link(ros2Viewer.inputImg)
-    if args.publish_depth or args.detect_people or args.publish_ros_rgbd:
-        slam.passthroughDepth.link(ros2Viewer.inputDepth)
-    if args.publish_grid:
-        slam.occupancyGridMap.link(ros2Viewer.inputGrid)
-    slam.obstaclePCL.link(ros2Viewer.inputObstaclePCL)
-    slam.groundPCL.link(ros2Viewer.inputGroundPCL)
+    if slam is not None:
+        rect_source.link(slam.rect)
+        depth_source.link(slam.depth)
+        odom.transform.link(slam.odom)
+        slam.passthroughOdom.link(ros2Viewer.inputBasaltTrans)
+        slam.transform.link(ros2Viewer.inputTrans)
+        slam.odomCorrection.link(ros2Viewer.inputOdomCorrection)
+        if args.publish_image or args.publish_ros_rgbd:
+            slam.passthroughRect.link(ros2Viewer.inputImg)
+        if args.publish_depth or args.detect_people or args.publish_ros_rgbd:
+            slam.passthroughDepth.link(ros2Viewer.inputDepth)
+        if args.publish_grid:
+            slam.occupancyGridMap.link(ros2Viewer.inputGrid)
+        slam.obstaclePCL.link(ros2Viewer.inputObstaclePCL)
+        slam.groundPCL.link(ros2Viewer.inputGroundPCL)
+    else:
+        # Raw VIO pose becomes the published pose; the grid and clouds have no
+        # producer, so the ROS mapper is the only source of a map.
+        odom.transform.link(ros2Viewer.inputBasaltTrans)
+        if args.publish_image or args.publish_ros_rgbd:
+            rect_source.link(ros2Viewer.inputImg)
+        if args.publish_depth or args.detect_people or args.publish_ros_rgbd:
+            depth_source.link(ros2Viewer.inputDepth)
     if personDetector is not None:
         personDetector.passthrough.link(personSync.inputs['rgb'])
         personDetector.out.link(personSync.inputs['detections'])

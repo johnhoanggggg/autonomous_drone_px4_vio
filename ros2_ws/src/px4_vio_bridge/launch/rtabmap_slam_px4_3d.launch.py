@@ -1,10 +1,17 @@
 """Run the flown OAK/PX4 stack plus a live, observation-only 3D mapper.
 
-The existing DepthAI RTAB-Map process remains responsible for continuous VIO
-and the PX4 feed. A namespaced ROS RTAB-Map instance consumes sampled RGB-D and
-raw VIO, publishes keyframe ground/obstacle/empty grids, and the existing C++
-adapter rebuilds those grids into a loop-corrected OctoMap for Foxglove.
-Nothing added here publishes to /fmu/in/*.
+The DepthAI process remains responsible for continuous VIO and the PX4 feed. A
+namespaced ROS RTAB-Map instance consumes sampled RGB-D and raw VIO, publishes
+keyframe ground/obstacle/empty grids, and the existing C++ adapter rebuilds
+those grids into a loop-corrected OctoMap for Foxglove. Nothing added here
+publishes to /fmu/in/*.
+
+By default the on-device RTABMapSLAM node is switched off here, so only one
+RTAB-Map builds a map instead of two. Measured on the Pi, that takes the
+DepthAI process from 187.5% to 64.9% CPU, about 1.2 cores, while /basalt/pose
+holds ~24 Hz. PX4 is unaffected: it is fed from the raw /rtabmap/vio_pose,
+which comes from the VIO node and never passed through SLAM. Set
+slam_enable_slam:=true to restore the previous two-map behaviour.
 """
 
 from launch import LaunchDescription
@@ -31,6 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument("foxglove_port", default_value="8765"),
         DeclareLaunchArgument("oak_startup_delay", default_value="5.0"),
         DeclareLaunchArgument("rgbd_publish_hz", default_value="3.0"),
+        DeclareLaunchArgument("slam_enable_slam", default_value="false"),
         DeclareLaunchArgument("mapping_rate_hz", default_value="1.0"),
         DeclareLaunchArgument("voxel_size", default_value="0.05"),
         DeclareLaunchArgument("range_min", default_value="0.30"),
@@ -52,6 +60,7 @@ def generate_launch_description():
             "foxglove_port": LaunchConfiguration("foxglove_port"),
             "oak_startup_delay": LaunchConfiguration("oak_startup_delay"),
             "slam_publish_ros_rgbd": "true",
+            "slam_enable_slam": LaunchConfiguration("slam_enable_slam"),
             "slam_ros_rgbd_publish_hz": LaunchConfiguration("rgbd_publish_hz"),
         }.items(),
     )
