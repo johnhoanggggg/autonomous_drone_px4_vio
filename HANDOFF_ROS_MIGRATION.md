@@ -97,6 +97,16 @@ scene; require a carried loop with no resets before changing the default or
 connecting it to PX4. The JSON is `/tmp/rtabmap_mono_startup_10.json` for this
 boot; reproduce it with `scripts/ros_rtabmap_startup_sweep.py`.
 
+For the carried ROS-native run, the raw estimator is `nav_msgs/Odometry`, not
+the hybrid's `PoseStamped`. The loop harness now accepts either message type:
+
+```bash
+python3 scripts/loop_closure_test.py --label ros-native-mono --seconds 180 \
+  --raw-odom-topic /rtabmap/vio_odometry \
+  --info-topic /rtabmap/info \
+  --out /tmp/loop_ros_native_mono.json
+```
+
 ## Measured CPU
 
 Per-process, sampled from `/proc` deltas over 20 s.

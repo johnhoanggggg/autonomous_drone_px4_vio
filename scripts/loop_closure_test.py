@@ -38,6 +38,7 @@ import time
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rtabmap_msgs.msg import Info, OdomInfo
@@ -69,6 +70,9 @@ class LoopClosureTest(Node):
         for qos in (best, rel):
             self.create_subscription(PoseStamped, args.raw_pose_topic,
                                      self._raw_cb, qos)
+            if args.raw_odom_topic:
+                self.create_subscription(Odometry, args.raw_odom_topic,
+                                         self._raw_odom_cb, qos)
             self.create_subscription(PoseStamped, args.pose_topic,
                                      self._corrected_cb, qos)
             self.create_subscription(PoseStamped, args.correction_topic,
@@ -83,6 +87,10 @@ class LoopClosureTest(Node):
 
     def _raw_cb(self, msg):
         self.raw.append(self._pt(msg))
+
+    def _raw_odom_cb(self, msg):
+        p = msg.pose.pose.position
+        self.raw.append((time.monotonic(), p.x, p.y, p.z))
 
     def _corrected_cb(self, msg):
         self.corrected.append(self._pt(msg))
@@ -246,6 +254,13 @@ def main():
                     help="Stationary window at each end used for the "
                          "return-to-origin comparison.")
     ap.add_argument("--raw-pose-topic", default="/rtabmap/vio_pose")
+    ap.add_argument(
+        "--raw-odom-topic", default="",
+        help=("nav_msgs/Odometry alternative for the raw estimator. Use "
+              "'/rtabmap/vio_odometry' with ros_rtabmap_oak_v3.launch.py. "
+              "Leave empty on the hybrid so the same pose is not counted "
+              "twice."),
+    )
     ap.add_argument("--pose-topic", default="/rtabmap/pose")
     ap.add_argument("--correction-topic", default="/rtabmap/odom_correction")
     ap.add_argument("--info-topic", default="/rtabmap3d/info")

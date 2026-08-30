@@ -249,6 +249,10 @@ corrections in it matter for reading anything older in this file:
   startup gate, but still needs the moving-trajectory gate. It is not
   flight-eligible. The hybrid is.
 
+For the ROS-native carried run, pass `--raw-odom-topic
+/rtabmap/vio_odometry --info-topic /rtabmap/info` to
+`scripts/loop_closure_test.py`; the defaults target the hybrid's topics.
+
 #### Hand-carried loop-closure test
 
 Loop closure has never fired in any bench test — stationary, the SLAM correction
