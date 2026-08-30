@@ -15,7 +15,12 @@ slam_enable_slam:=true to restore the previous two-map behaviour.
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    LogInfo,
+    OpaqueFunction,
+)
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -44,6 +49,16 @@ def generate_launch_description():
         DeclareLaunchArgument("range_min", default_value="0.30"),
         DeclareLaunchArgument("range_max", default_value="4.0"),
         DeclareLaunchArgument("max_marker_voxels", default_value="50000"),
+        # Parity with the on-device RTABMapSLAM as the flight stack configures
+        # it (rtabmap_slam_px4.launch.py slam_grid_footprint_radius). Clears
+        # obstacles under the graph; RTAB-Map's own default is 0.0, so leaving
+        # it unset made the ROS map keep clutter the on-device map removed.
+        DeclareLaunchArgument("grid_footprint_radius", default_value="0.25"),
+        # When the on-device SLAM is off, publish the mapper's products under
+        # the /rtabmap names the VFH and planner nodes already subscribe to.
+        # "auto" means legacy names exactly when slam_enable_slam is false, so
+        # the two mappers can never publish the same topic.
+        DeclareLaunchArgument("legacy_topics", default_value="auto"),
     ]
 
     base_stack = IncludeLaunchDescription(
@@ -65,62 +80,93 @@ def generate_launch_description():
         }.items(),
     )
 
-    mapper = Node(
-        package="rtabmap_slam",
-        executable="rtabmap",
-        namespace="rtabmap3d",
-        name="rtabmap",
-        output="screen",
-        emulate_tty=True,
-        parameters=[{
-            "subscribe_depth": True,
-            "subscribe_rgb": False,
-            "subscribe_rgbd": False,
-            "subscribe_stereo": False,
-            "frame_id": "rtabmap3d_camera_link",
-            "map_frame_id": "rtabmap3d_map",
-            "odom_frame_id": "",
-            "publish_tf": True,
-            "approx_sync": False,
-            "topic_queue_size": 10,
-            "sync_queue_size": 10,
-            # The OAK bridge publishes sensor data best-effort so stale camera
-            # samples cannot back-pressure continuous VIO.
-            "qos_image": 2,
-            "qos_camera_info": 2,
-            "qos_odom": 2,
-            "database_path": "/tmp/rtabmap3d_live.db",
-            # RTAB-Map core parameters are declared as ROS strings, even for
-            # numeric and boolean values.
-            "Rtabmap/DetectionRate": rtabmap_string("mapping_rate_hz"),
-            "Rtabmap/SaveWMState": "true",
-            "RGBD/CreateOccupancyGrid": "true",
-            "Grid/3D": "true",
-            # Keep RTAB-Map's ground label for brown/red Foxglove coloring. The
-            # OctoMap assembler still inserts both ground and obstacles as
-            # occupied, so this does not make floor voxels traversable.
-            "Grid/GroundIsObstacle": "false",
-            "Grid/RayTracing": "true",
-            "Grid/CellSize": rtabmap_string("voxel_size"),
-            "Grid/DepthDecimation": "8",
-            "Grid/RangeMin": rtabmap_string("range_min"),
-            "Grid/RangeMax": rtabmap_string("range_max"),
-            "Grid/PreVoxelFiltering": "true",
-            "Grid/NoiseFilteringRadius": "0.15",
-            "Grid/NoiseFilteringMinNeighbors": "4",
-            "Grid/ClusterRadius": "0.20",
-            "Grid/MinClusterSize": "20",
-        }],
-        remappings=[
-            ("rgb/image", "/rtabmap3d/input/image"),
-            ("depth/image", "/rtabmap3d/input/depth"),
-            ("rgb/camera_info", "/rtabmap3d/input/camera_info"),
-            ("odom", "/rtabmap3d/input/odom"),
-        ],
-        # Start with a fresh map. This launch is for live observation; it never
-        # overwrites the DepthAI SLAM database or changes the PX4 VIO source.
-        arguments=["-d"],
-    )
+    def _mapper(context, *_a, **_k):
+        enable_slam = LaunchConfiguration("slam_enable_slam").perform(
+            context).strip().lower() in ("1", "true", "yes", "on")
+        legacy = LaunchConfiguration("legacy_topics").perform(context).strip().lower()
+        if legacy == "auto":
+            legacy = not enable_slam
+        else:
+            legacy = legacy in ("1", "true", "yes", "on")
+
+        outputs = []
+        if legacy:
+            # The on-device node published these; with it gone the ROS mapper
+            # has to, or vfh_obstacles/route_follower/global_planner go silent.
+            outputs = [
+                ("localization_pose", "/rtabmap/pose"),
+                ("cloud_obstacles", "/rtabmap/obstacle_cloud"),
+                ("cloud_ground", "/rtabmap/ground_cloud"),
+                ("map", "/rtabmap/grid"),
+                ("mapPath", "/rtabmap/path"),
+            ]
+
+        return [Node(
+            package="rtabmap_slam",
+            executable="rtabmap",
+            namespace="rtabmap3d",
+            name="rtabmap",
+            output="screen",
+            emulate_tty=True,
+            parameters=[{
+                "subscribe_depth": True,
+                "subscribe_rgb": False,
+                "subscribe_rgbd": False,
+                "subscribe_stereo": False,
+                "frame_id": "rtabmap3d_camera_link",
+                "map_frame_id": "rtabmap3d_map",
+                "odom_frame_id": "",
+                "publish_tf": True,
+                "approx_sync": False,
+                "topic_queue_size": 10,
+                "sync_queue_size": 10,
+                # The OAK bridge publishes sensor data best-effort so stale
+                # camera samples cannot back-pressure continuous VIO.
+                "qos_image": 2,
+                "qos_camera_info": 2,
+                "qos_odom": 2,
+                "database_path": "/tmp/rtabmap3d_live.db",
+                # RTAB-Map core parameters are declared as ROS strings, even
+                # for numeric and boolean values. The set below is kept at
+                # parity with the on-device RTABMapSLAM params in
+                # basalt_rtabmap_slam_ros2; see the parity table in README.
+                "Rtabmap/DetectionRate": rtabmap_string("mapping_rate_hz"),
+                "Rtabmap/SaveWMState": "true",
+                "RGBD/CreateOccupancyGrid": "true",
+                # Deliberately NOT at parity: the on-device node ran Grid/3D
+                # false to feed the 2D planner. 3D is required here for the
+                # OctoMap, and RTAB-Map still projects a 2D map from it.
+                "Grid/3D": "true",
+                # Keep RTAB-Map's ground label for brown/red Foxglove coloring.
+                # The OctoMap assembler still inserts both ground and obstacles
+                # as occupied, so this does not make floor voxels traversable.
+                "Grid/GroundIsObstacle": "false",
+                "Grid/RayTracing": "true",
+                "Grid/CellSize": rtabmap_string("voxel_size"),
+                "Grid/DepthDecimation": "8",
+                "Grid/RangeMin": rtabmap_string("range_min"),
+                "Grid/RangeMax": rtabmap_string("range_max"),
+                "Grid/PreVoxelFiltering": "true",
+                "Grid/NoiseFilteringRadius": "0.15",
+                "Grid/NoiseFilteringMinNeighbors": "4",
+                "Grid/ClusterRadius": "0.20",
+                "Grid/MinClusterSize": "20",
+                "GridGlobal/FootprintRadius": rtabmap_string(
+                    "grid_footprint_radius"),
+            }],
+            remappings=[
+                ("rgb/image", "/rtabmap3d/input/image"),
+                ("depth/image", "/rtabmap3d/input/depth"),
+                ("rgb/camera_info", "/rtabmap3d/input/camera_info"),
+                ("odom", "/rtabmap3d/input/odom"),
+            ] + outputs,
+            # Start with a fresh map. This launch is for live observation; it
+            # never overwrites the DepthAI SLAM database or changes the PX4 VIO
+            # source.
+            arguments=["-d"],
+        )]
+
+    mapper = OpaqueFunction(function=_mapper)
 
     octomap = Node(
         package="px4_vio_bridge",

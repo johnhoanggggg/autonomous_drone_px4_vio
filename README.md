@@ -392,6 +392,73 @@ run measured 119% for the DepthAI process because the launch leaves
 This has not flown. It still needs props-off and flight gates, and the map
 frame is `rtabmap3d_map` rather than `world`.
 
+##### Parity between the on-device and ROS RTAB-Map SLAM
+
+Turning the on-device SLAM off removes the topics it published, so the ROS
+mapper has to stand in for it. `rtabmap_slam_px4_3d.launch.py` now does that.
+
+**Core parameters.** Compared against the on-device set in
+`basalt_rtabmap_slam_ros2` as the flight stack configures it
+(`rtabmap_slam_px4.launch.py` `slam_grid_*` defaults):
+
+| parameter | on-device | ROS mapper | |
+| --- | --- | --- | --- |
+| `RGBD/CreateOccupancyGrid` | true | true | match |
+| `Grid/DepthDecimation` | 8 | 8 | match |
+| `Grid/RayTracing` | true | true | match |
+| `Grid/PreVoxelFiltering` | true | true | match |
+| `Grid/RangeMin` / `RangeMax` | 0.30 / 4.0 | 0.30 / 4.0 | match |
+| `Grid/NoiseFilteringRadius` / `MinNeighbors` | 0.15 / 4 | 0.15 / 4 | match |
+| `Grid/ClusterRadius` / `MinClusterSize` | 0.20 / 20 | 0.20 / 20 | match |
+| `Grid/GroundIsObstacle` | false (default) | false | match |
+| `Rtabmap/SaveWMState` | true | true | match |
+| `Rtabmap/DetectionRate` | 1 Hz (default) | 1 Hz | match |
+| `Kp/MaxFeatures` | 500 (default) | 500 (default) | match |
+| `GridGlobal/FootprintRadius` | 0.25 | ~~0.0~~ → 0.25 | **fixed** |
+| `Grid/CellSize` | 0.03 | 0.05 (`voxel_size`) | differs, see below |
+| `Grid/3D` | false | true | differs by design |
+
+`Grid/3D` and therefore `Grid/CellSize` are deliberately not at parity: the
+on-device grid was 2D at 0.03 m to feed the 2D planner, while this mapper needs
+a 3D grid for the OctoMap and runs at the 0.05 m voxel size. RTAB-Map still
+projects a 2D map from the 3D grid, which is what `/rtabmap/grid` carries.
+
+Note both run `Rtabmap/DetectionRate` at 1 Hz. An earlier note in this file
+claimed the on-device node processed keyframes at the full ~20 Hz VIO rate;
+that was wrong. It never overrode the parameter, whose default is 1. The CPU
+difference between the two is ingest and per-frame handling, not keyframes.
+
+**Output topics.** With `legacy_topics:=auto` (the default), the mapper's
+outputs are remapped onto the names the existing consumers subscribe to
+exactly when `slam_enable_slam:=false`, so the two mappers can never publish
+the same topic:
+
+| on-device topic | ROS mapper source | verified |
+| --- | --- | --- |
+| `/rtabmap/grid` | `map` | yes |
+| `/rtabmap/obstacle_cloud` | `cloud_obstacles` | yes |
+| `/rtabmap/ground_cloud` | `cloud_ground` | yes |
+| `/rtabmap/path` | `mapPath` | yes |
+| `/rtabmap/pose` | `localization_pose` | **no, see below** |
+
+The grid and cloud topics are event-driven: they republish when the map
+changes, so on a stationary bench they arrive once and then stay quiet. That is
+correct behaviour, not a stall.
+
+**Known gap: `/rtabmap/pose` has no drop-in equivalent.** The on-device node
+published a loop-corrected pose at VIO rate. `rtabmap_slam` has no such topic:
+`localization_pose` only fires on a localization event and stays silent in
+SLAM mode (`Mem/IncrementalMemory=true`), measured 0 messages in 25 s. RTAB-Map
+exposes the correction as the map-to-odom **TF** instead. Consumers that
+default to `pose_topic:=/rtabmap/pose` — `vfh_monitor`, `vfh_obstacles`,
+`route_follower_monitor`, `global_planner_monitor` — therefore need either
+`pose_topic:=/rtabmap/vio_pose` (uncorrected, continuous) or a small relay that
+composes the map-to-odom TF with the VIO pose. `/rtabmap/odom_correction` is
+likewise unpublished in this mode. Until that is resolved, do not run the
+planner or follower launches against `slam_enable_slam:=false`; the
+`offboard_*` and `vfh_monitor` launches still default it to true and are
+unaffected.
+
 ##### Topologies that do not work on this driver
 
 `i_pipeline_type: depth` publishes the device-rectified mono pair and depth but
