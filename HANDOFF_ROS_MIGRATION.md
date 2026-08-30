@@ -252,7 +252,11 @@ far better controlled comparison than walking twice, and it removes the
 trajectory and lighting differences between runs. It costs ~233% CPU, which is
 irrelevant for a hand-carried bench test.
 
-Terminal 1 (launch, leave running):
+Both terminals need the workspace sourced and `export ROS_DOMAIN_ID=42`, and
+the harness path is relative to the repo root, so `cd
+/home/john/autonomous_drone_px4_vio` first.
+
+Terminal 1 (launch, leave running; give it ~60 s to come up):
 
 ```bash
 rm -f /tmp/depthai_loop.db

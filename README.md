@@ -263,17 +263,31 @@ so the counts are compared through the RTAB-Map database with `rtabmap-info`.
 `--slam-database-path` was added to `basalt_rtabmap_slam_ros2` for that; the ROS
 mapper already writes `/tmp/rtabmap3d_live.db`.
 
+Every command below assumes the repo root and a sourced workspace, in **both**
+terminals:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio
+source /opt/ros/jazzy/setup.bash
+source /home/john/ros2_ws/install/setup.bash
+source ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
+```
+
 The launch and the harness run **at the same time in two terminals**; the two
 *stacks* must run **sequentially**, since both need the OAK and the second would
 fail with `X_LINK_DEVICE_ALREADY_IN_USE`. Best of all is one walk with both
 mappers running on the same feed:
 
 ```bash
-# terminal 1 - both mappers on one camera feed, the controlled comparison
+# terminal 1 - both mappers on one camera feed, the controlled comparison.
+# Leave it running and give it ~60 s to bring the camera and both mappers up.
 rm -f /tmp/depthai_loop.db
 ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py foxglove:=false \
   slam_enable_slam:=true slam_database_path:=/tmp/depthai_loop.db
-# terminal 2, while walking the loop
+
+# terminal 2 - start this, then walk the loop. Run it from the repo root:
+# scripts/ is relative, so `cd /home/john/autonomous_drone_px4_vio` first.
 python3 scripts/loop_closure_test.py --label both --seconds 180 --out /tmp/loop_both.json
 # Ctrl-C terminal 1 (not kill -9) so the database is written, then:
 rtabmap-info /tmp/depthai_loop.db   | grep -E "Neighbor:|Closure:"
