@@ -244,7 +244,9 @@ corrections in it matter for reading anything older in this file:
   elsewhere calling them "on-device" is wrong; that is why two of them cost
   ~200%, one core each.
 - The full ROS-native stack on the v3 driver matches the DepthAI accuracy when
-  it starts, but **initialises only about one run in three** and is not
+  it starts. The original RGB profile initialised only about one run in three;
+  the global-shutter mono parity profile now passes an instrumented 10/10
+  startup gate, but still needs the moving-trajectory gate. It is not
   flight-eligible. The hybrid is.
 
 #### Hand-carried loop-closure test
@@ -396,7 +398,7 @@ The 5.9 Hz had two independent causes, both since measured on the Pi.
 The ROS side runs `depthai_ros_driver` 2.12.2 on `ros-jazzy-depthai` 2.31.0,
 that is depthai-core v2. The flying stack (`basalt_rtabmap_slam_ros2`,
 `dai.node.BasaltVIO`, `dai.node.RTABMapVIO`) runs depthai-core/python **3.5.0**,
-where the same BMI270 feeds on-device VIO with no such lag. apt carries no v3
+where the same BMI270 feeds the DepthAI VIO host node with no such lag. apt carries no v3
 `depthai_ros_driver`, so a ROS-native inertial path means building depthai-ros
 v3 from source against the 3.5.0 core already on this machine.
 
@@ -407,7 +409,7 @@ extremely noisy: net displacement 0.113 m over 27 s, yet 25.98 m of
 accumulated path, mean phantom speed 1.06 m/s and peaks of 6.45 m/s. Keeping
 descriptor matching and bundle adjustment does not fix it (16.79 m of path),
 so the noise is the absence of inertial fusion, not the optical-flow setting.
-For comparison, on-device `RTABMapVIO` measures 0.45 mm of stationary drift.
+For comparison, DepthAI-host `RTABMapVIO` measures 0.45 mm of stationary drift.
 Feeding this to EKF2 as external vision would inject metre-per-second velocity
 noise, so `ros_rtabmap_oak_3d.launch.py` still publishes nothing to `/fmu/in/*`.
 These samples were taken in a dark room (150 features against 555 earlier), so
@@ -424,12 +426,12 @@ visual-only with the IMU used just for gravity. A ROS-native flight pose
 therefore needs either a v3 driver plus a real VIO node, or the on-device
 DepthAI VIO retained for pose while ROS keeps only mapping.
 
-##### Hybrid: on-device VIO, ROS mapping (`slam_enable_slam:=false`)
+##### Hybrid: DepthAI-host VIO, ROS mapping (`slam_enable_slam:=false`)
 
-Because the ROS driver's IMU cannot be fused, the inertial estimator stays on
-the device, where depthai-core 3.5.0 fuses the same BMI270 correctly. What is
+Because the v2 ROS driver's IMU cannot be used, the estimator stays in the
+DepthAI host node, where depthai-core 3.5.0 timestamps the same BMI270 correctly. What is
 removed is the *duplicate* map: `basalt_rtabmap_slam_ros2 --enable-slam false`
-drops the on-device `RTABMapSLAM` node and lets a single ROS `rtabmap_slam`
+drops the DepthAI `RTABMapSLAM` host node and lets a single ROS `rtabmap_slam`
 own the map.
 
 PX4 is unaffected. `vio_to_px4_odometry` is fed from `/rtabmap/vio_pose`, the
@@ -461,15 +463,15 @@ overall, roughly 0.8 of a core, not the 1.2 the image-off A/B suggests.
 
 Note where the map work actually sits: the ROS mapper costs the same 12% in
 both columns because it was already running. The hybrid removes the duplicate
-on-device SLAM rather than relocating its cost. The ROS mapper is cheap partly
+DepthAI-host SLAM rather than relocating its cost. The ROS mapper is cheap partly
 because it does much less: it consumes RGB-D at ~2.7 Hz with
-`Rtabmap/DetectionRate` at 1 Hz, while the on-device `RTABMapSLAM` ran at the
+`Rtabmap/DetectionRate` at 1 Hz, while the DepthAI-host `RTABMapSLAM` ingested the
 full ~20 Hz VIO rate. That is a lower keyframe and loop-closure duty cycle, not
 the same work done cheaper, and it has not been evaluated for map quality.
 
 `rtabmap_slam_px4_3d.launch.py` now defaults to `slam_enable_slam:=false`.
 Verified end to end: `/rtabmap/vio_pose` at 20.5 Hz, `/rtabmap3d/input/odom` at
-2.8 Hz, the ROS mapper publishing an OctoMap, and no on-device grid. Pass
+2.8 Hz, the ROS mapper publishing an OctoMap, and no DepthAI-host grid. Pass
 `slam_enable_slam:=true` to restore the previous two-map behaviour. Note that
 run measured 119% for the DepthAI process because the launch leaves
 `slam_publish_image:=true`; host JPEG encoding is roughly the difference from
@@ -478,9 +480,9 @@ run measured 119% for the DepthAI process because the launch leaves
 This has not flown. It still needs props-off and flight gates, and the map
 frame is `rtabmap3d_map` rather than `world`.
 
-##### Parity between the on-device and ROS RTAB-Map SLAM
+##### Parity between the DepthAI-host and ROS RTAB-Map SLAM
 
-Turning the on-device SLAM off removes the topics it published, so the ROS
+Turning the DepthAI SLAM host node off removes the topics it published, so the ROS
 mapper has to stand in for it. `rtabmap_slam_px4_3d.launch.py` now does that.
 
 **Core parameters.** Compared against the on-device set in
@@ -602,6 +604,23 @@ outright. Measured on the same bench:
 | IMU minus image stamp | -397 ms | +110 ms (IMU ahead, which is what RTAB-Map needs) |
 | IMU-caused frame drops | 901 | **0** |
 
+The naming hides how similar the estimators are. DepthAI's `RTABMapVIO` is a
+Pi-host `ThreadedHostNode`, not firmware VIO: its source calls the ordinary
+`rtabmap::Odometry::create()` frame-to-map core, then gives it a rectified CAM_B
+frame, CAM_B-aligned stereo depth, RVC2-tracked Harris points, and one
+interpolated accel/gyro sample at the image timestamp. It does not estimate an
+inertial velocity or IMU biases like Basalt/OpenVINS/VINS-Fusion. The separate
+`RTABMapSLAM` host node consumes that raw odometry; it does not output VIO.
+
+ROS parity is consequently `depthai_ros_driver_v3 -> RGBDOdometry ->
+rtabmap_slam`, not `rtabmap_slam` by itself. `RGBDOdometry` is also frame-to-map
+RTAB-Map odometry with the same RGB-D/IMU class of inputs. ROS extracts and
+matches descriptors on the Pi instead of receiving the RVC2's tracked Harris
+points; that enables the bundle adjustment needed for the stationary accuracy
+shown below. Its raw output is `/rtabmap/vio_odometry`; its loop-corrected map
+pose comes from the `world -> rtabmap_odom` transform generated by
+`rtabmap_slam`.
+
 Run `ros_rtabmap_oak_v3.launch.py`. With the IMU fused the whole ROS-native
 stack becomes viable for the first time:
 
@@ -672,8 +691,37 @@ export PYTHONPATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/python3.1
 Nothing is installed and v2 is untouched, so reverting is
 `rm -rf /home/john/depthai_v3_overlay`.
 
+**Global-shutter parity profile (experimental).** The default v3 profile uses
+the rolling-shutter RGB camera, while DepthAI `RTABMapVIO` tracks the
+global-shutter left mono camera. `oak_v3_rtabmap_mono.yaml` keeps the working
+RGBD+IMU topology but publishes CAM_B rectified mono and aligns depth to CAM_B:
+
+```bash
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3.launch.py \
+  camera_config:=/home/john/autonomous_drone_px4_vio/ros2_ws/src/px4_vio_bridge/config/oak_v3_rtabmap_mono.yaml \
+  image_topic:=/oak/left/image_rect \
+  camera_info_topic:=/oak/left/camera_info
+```
+
+The instrumented startup sweep now passes 10/10. Every attempt required live
+mono, depth and IMU streams, sampled nonzero depth, and five non-lost odometry
+samples with at least 20 median inliers. Starts passed in 8.2-11.9 s with
+91-150 median inliers and 27-48% sampled nonzero depth. Reproduce it with:
+
+```bash
+python3 scripts/ros_rtabmap_startup_sweep.py --profile mono --attempts 10 \
+  --out /tmp/rtabmap_mono_startup_10.json
+```
+
+In longer runs the raw depth stream remained 20 Hz, IMU about 200 Hz, and
+odometry varied from about 10-17 Hz as its single F2M+BA thread saturated.
+Reducing `vis_max_features` from 600 to 400 made this scene slower (~6 Hz), not
+faster. Startup is passed; keep this experimental until it also completes a
+hand-carried closed loop without a reset.
+
 This has not flown. It has no PX4 connection, has not been compared against the
-on-device map on a moving trajectory, and 13 IMU-caused frame drops still
+DepthAI-host map on a moving trajectory, and startup IMU buffering still needs
+to be counted over the full 10-run gate.
 appear over a run.
 
 ##### Topologies that do not work on this driver
@@ -1522,8 +1570,8 @@ Two consequences, both load-bearing:
 ### VIO backend: Basalt is faster and cheaper, RTABMapVIO holds position better
 
 `--vio-backend basalt|rtabmap`, identical flight grid args, OAK-D **stationary**
-on a desk (2026-08-29). `BasaltVIO` runs on the OAK-D, so it removes the pinned
-`RTABMapVIO` host thread entirely:
+on a desk (2026-08-29). `BasaltVIO` is also a Pi-host thread, but replacing
+`RTABMapVIO` still removes that pinned host thread entirely:
 
 | | RTABMapVIO | BasaltVIO (stock) |
 |---|---|---|

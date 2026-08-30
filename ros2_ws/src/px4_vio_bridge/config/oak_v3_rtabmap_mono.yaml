@@ -1,0 +1,64 @@
+# OAK profile for a like-for-like RTABMapVIO comparison.
+#
+# DepthAI's RTABMapVIO tracks the OAK-D Lite's global-shutter CAM_B image and
+# consumes depth aligned to CAM_B.  The original ROS-native profile tracks the
+# rolling-shutter RGB image with RGB-aligned depth.  This profile keeps the
+# working v3 IMU and bandwidth settings, but exposes the rectified left image
+# and aligns depth to that same camera so image pixels, depth pixels and camera
+# calibration are geometrically consistent.
+#
+# Use with ros_rtabmap_oak_v3.launch.py:
+#   camera_config:=.../oak_v3_rtabmap_mono.yaml \
+#   image_topic:=/oak/left/image_rect \
+#   camera_info_topic:=/oak/left/camera_info
+/oak:
+  ros__parameters:
+    driver:
+      i_enable_ir: false
+    pipeline_gen:
+      # RGBD is currently the only v3 topology that starts stereo depth and
+      # the IMU together.  RGB remains in the pipeline but is not used by
+      # RTAB-Map in this profile.
+      i_nn_type: none
+      i_pipeline_type: rgbd
+      i_enable_imu: true
+    rgb:
+      i_synced: true
+      i_fps: 20.0
+      i_resolution: "1080P"
+      i_width: 640
+      i_height: 360
+      i_set_isp_scale: true
+    left:
+      i_fps: 20.0
+      i_resolution: "480P"
+      i_width: 640
+      i_height: 400
+    right:
+      i_fps: 20.0
+      i_resolution: "480P"
+      i_width: 640
+      i_height: 400
+    stereo:
+      # CameraBoardSocket::CAM_B == 1.  On RVC2 this connects CAM_B to
+      # StereoDepth.inputAlignTo, exactly matching RTABMapVIO's depthAlign.
+      i_board_socket_id: 1
+      i_aligned: true
+      i_synced: true
+      i_left_rect_publish_topic: true
+      i_left_rect_synced: true
+      i_fps: 20.0
+      i_width: 640
+      i_height: 400
+      i_set_input_size: true
+      i_input_width: 640
+      i_input_height: 400
+      i_subpixel: true
+      i_left_right_check: true
+    imu:
+      i_batch_report_threshold: 1
+      i_max_batch_reports: 10
+      i_enable_rotation: false
+      i_acc_freq: 200
+      i_gyro_freq: 200
+      i_message_type: IMU

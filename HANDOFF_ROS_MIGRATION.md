@@ -1,9 +1,11 @@
 # ROS-native RTAB-Map Migration — Results Handoff
 
-Status: investigation and bench work complete; **nothing here has flown**. The
+Status: investigation and bench work ongoing; **nothing here has flown**. The
 hybrid described below is committed and is the recommended next thing to take to
 props-off. The full ROS-native stack is committed but is **not** flight-eligible
-because it fails to initialise about two runs in three.
+because the original RGB-camera profile fails to initialise about two runs in
+three. The new global-shutter mono profile has now passed the instrumented
+startup gate 10/10, but it has not passed the moving-trajectory gate.
 
 Branch: `ros-rtabmap-migration`. Nothing on this branch publishes to `/fmu/in/*`
 except the pre-existing `vio_to_px4_odometry`, whose input is unchanged.
@@ -44,10 +46,56 @@ B. Hybrid  (committed, recommended)
    RTABMapSLAM deleted. ONE mapper.
 
 C. Full ROS-native  (committed, NOT flight-eligible)
-   VPU: StereoDepth + FeatureTracker
+   VPU: StereoDepth (ROS extracts its own visual features on the Pi)
    Pi : depthai_ros_driver_v3 -> rtabmap_odom -> rtabmap_slam -> OctoMap
    No DepthAI host VIO at all. Nothing feeds PX4.
 ```
+
+## What DepthAI's RTABMapVIO actually does
+
+This is verified from the depthai-core 3.5 source, not inferred from the node
+name. `RTABMapVIO.cpp` constructs the regular RTAB-Map odometry core with
+`rtabmap::Odometry::create()` and no parameter overrides, so its default is
+frame-to-map (`Odom/Strategy=0`). At each image timestamp it supplies:
+
+- the rectified global-shutter CAM_B mono frame;
+- CAM_B-aligned metric stereo depth;
+- Harris points tracked by the RVC2 `FeatureTracker`; and
+- one linearly interpolated accelerometer and gyroscope sample, transformed
+  with the calibrated IMU-to-camera extrinsic.
+
+It does not run a separate inertial state estimator, integrate every 200 Hz
+sample into position, or estimate velocity and IMU biases. In particular it is
+not equivalent to Basalt, OpenVINS or VINS-Fusion. The word VIO here means
+RTAB-Map frame-to-map RGB-D odometry supplied with IMU measurements. The
+separate `RTABMapSLAM` host node consumes that raw odometry and adds the pose
+graph, loop closures and map; SLAM never produces the raw VIO pose.
+
+The full ROS graph is therefore structurally equivalent:
+
+| layer | DepthAI graph | ROS-native graph |
+| --- | --- | --- |
+| depth | RVC2 `StereoDepth` | RVC2 `StereoDepth` through driver v3 |
+| visual input | RVC2 tracked CAM_B Harris points | host descriptors on selected image |
+| odometry | host `RTABMapVIO` / F2M | `rtabmap_odom::RGBDOdometry` / F2M |
+| raw pose | `/rtabmap/vio_pose` | `/rtabmap/vio_odometry` |
+| mapping | host `RTABMapSLAM` | ROS `rtabmap_slam` |
+| 3D occupancy | no OctoMap API | `mapData` -> `rtabmap_octomap_node` |
+
+The remaining input mismatch was that the ROS launch used rolling-shutter RGB
+while DepthAI RTABMapVIO uses global-shutter CAM_B. The new
+`config/oak_v3_rtabmap_mono.yaml` exposes `/oak/left/image_rect`, aligns depth
+to CAM_B, and the launch now accepts selectable image/depth/camera-info topics.
+An instrumented ten-run sweep passed 10/10. Each attempt required live mono,
+live depth, at least 1% nonzero depth, live IMU, five non-lost odometry samples
+and at least 20 median inliers. All ten crossed the gate in 8.2-11.9 s, with
+91-150 median inliers, 27-48% sampled nonzero depth, and no launch errors.
+Odometry rate in longer runs varied from about 10 to 17 Hz as the single F2M+BA
+thread saturated. A 400-feature trial was slower (~6 Hz), so lowering the
+feature cap is not a CPU fix here. Startup is now a passed gate for this bench
+scene; require a carried loop with no resets before changing the default or
+connecting it to PX4. The JSON is `/tmp/rtabmap_mono_startup_10.json` for this
+boot; reproduce it with `scripts/ros_rtabmap_startup_sweep.py`.
 
 ## Measured CPU
 
@@ -159,7 +207,7 @@ Accuracy, swept against a fresh reference measured in the same position:
 no better than optical flow; BA is a 7x improvement. BA cannot run with
 optical-flow correspondences, which is the only reason `Vis/CorType` moves to 0.
 
-## Blocker: the ROS-native stack does not initialise reliably
+## Historical RGB blocker; mono startup gate now passes
 
 Three consecutive bare launches, same scene, no changes between them:
 
@@ -176,9 +224,10 @@ than of a tuning problem. Two of the three failures logged no device error at
 all, so the occasional `Device ... has crashed` (2 of 9 v3 logs; 0 of 5 on the
 DepthAI-python path) explains only part of it.
 
-**Next diagnostic: confirm whether `/oak/stereo/image_raw` is actually publishing
-during a failed initialisation.** Do not put this path near flight until it is
-10 for 10.
+The new startup harness confirmed `/oak/stereo/image_raw` on every mono attempt,
+sampled whether it contained nonzero depth, and gated on non-lost odometry. The
+mono profile passed 10/10; the RGB numbers below remain the reason RGB is not a
+safe default.
 
 An earlier reading that "explicit arguments work and defaults do not" was wrong;
 it was a coin flip over a small sample.

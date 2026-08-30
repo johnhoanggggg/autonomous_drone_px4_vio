@@ -51,6 +51,13 @@ def generate_launch_description():
         # v3 fuses the IMU correctly, so unlike the v2 launch this defaults on.
         DeclareLaunchArgument("use_imu", default_value="true"),
         DeclareLaunchArgument("imu_topic", default_value="/oak/imu/data"),
+        # Keep these selectable so the same ROS odometry/SLAM graph can be
+        # compared on either the rolling-shutter RGB camera or the
+        # global-shutter rectified mono camera.  The latter is the image path
+        # used by DepthAI's RTABMapVIO host node.
+        DeclareLaunchArgument("image_topic", default_value="/oak/rgb/image_raw"),
+        DeclareLaunchArgument("camera_info_topic", default_value="/oak/rgb/camera_info"),
+        DeclareLaunchArgument("depth_topic", default_value="/oak/stereo/image_raw"),
         DeclareLaunchArgument("odometry_rate_hz", default_value="20.0"),
         DeclareLaunchArgument("mapping_rate_hz", default_value="1.0"),
         DeclareLaunchArgument("voxel_size", default_value="0.05"),
@@ -60,7 +67,7 @@ def generate_launch_description():
         # Bundle adjustment is what buys the accuracy: with it off this
         # odometry sits at 3.3-3.8 mm stationary rms regardless of
         # correspondence type, and with it on it reaches 0.47 mm, matching the
-        # on-device RTABMapVIO's 0.52 mm at the same rate. BA cannot run with
+        # DepthAI-host RTABMapVIO's 0.52 mm at the same rate. BA cannot run with
         # optical-flow correspondences, hence Vis/CorType 0. Raising features to
         # 1000 and the local map to 3000 gives 0.44 mm and a smoother path but
         # drops the rate to ~10 Hz.
@@ -88,12 +95,13 @@ def generate_launch_description():
         }.items(),
     )
 
-    # v3 publishes rgb/image_raw and depth already in the colour optical frame,
-    # so no host rectification or depth alignment is needed.
+    # The default camera profile publishes depth in the colour optical frame.
+    # A mono-parity profile can instead align it to CAM_B and select
+    # /oak/left/image_rect here without changing the RTAB-Map graph.
     sensor_remappings = [
-        ("rgb/image", "/oak/rgb/image_raw"),
-        ("depth/image", "/oak/stereo/image_raw"),
-        ("rgb/camera_info", "/oak/rgb/camera_info"),
+        ("rgb/image", LaunchConfiguration("image_topic")),
+        ("depth/image", LaunchConfiguration("depth_topic")),
+        ("rgb/camera_info", LaunchConfiguration("camera_info_topic")),
     ]
 
     odometry = ComposableNode(
