@@ -245,7 +245,49 @@ Links:
 it the DepthAI mapper keeps the map in memory and writes nothing. The ROS mapper
 already writes `/tmp/rtabmap3d_live.db`.
 
-Run the same physical loop twice, once per stack:
+**Preferred: one walk, both mappers.** With `slam_enable_slam:=true` the 3D
+launch runs the DepthAI RTABMapSLAM *and* the ROS rtabmap_slam on the same
+camera feed, so both close the same physical loop on identical data. That is a
+far better controlled comparison than walking twice, and it removes the
+trajectory and lighting differences between runs. It costs ~233% CPU, which is
+irrelevant for a hand-carried bench test.
+
+Terminal 1 (launch, leave running):
+
+```bash
+rm -f /tmp/depthai_loop.db
+ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py foxglove:=false \
+  slam_enable_slam:=true slam_database_path:=/tmp/depthai_loop.db
+```
+
+Terminal 2 (harness, at the same time — source the workspace and
+`export ROS_DOMAIN_ID=42` here too):
+
+```bash
+python3 scripts/loop_closure_test.py --label both --seconds 180 \
+  --out /tmp/loop_both.json
+```
+
+Walk the loop while the harness records. Then stop the launch with **Ctrl-C**,
+not `kill -9`, and wait for it to exit so the database is written:
+
+```bash
+rtabmap-info /tmp/depthai_loop.db      | grep -E "Neighbor:|Closure:"   # DepthAI
+rtabmap-info /tmp/rtabmap3d_live.db    | grep -E "Neighbor:|Closure:"   # ROS
+```
+
+In this configuration `/rtabmap/pose` and `/rtabmap/odom_correction` come from
+the DepthAI mapper (the relay does not start when `slam_enable_slam` is true),
+and `/rtabmap3d/info` carries the ROS mapper's closure events. So the harness
+reports the DepthAI corrected pose, and the two databases give both closure
+counts.
+
+**Alternative: the same physical loop twice, once per stack.** Use this if you
+want each stack measured in its real configuration, in particular the hybrid
+with its relay-produced corrected pose. The two stacks cannot run at the same
+time — both need the OAK, and the second will fail with
+`X_LINK_DEVICE_ALREADY_IN_USE`. Allow ~30 s between them for the camera to
+release and re-enumerate on USB.
 
 ```bash
 # 1. original full DepthAI pipeline - its own RTABMapSLAM closes the loop

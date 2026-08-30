@@ -54,6 +54,11 @@ def generate_launch_description():
         # obstacles under the graph; RTAB-Map's own default is 0.0, so leaving
         # it unset made the ROS map keep clutter the on-device map removed.
         DeclareLaunchArgument("grid_footprint_radius", default_value="0.25"),
+        # With slam_enable_slam:=true BOTH mappers run on the same camera feed,
+        # which is the controlled way to compare their loop closures: one walk,
+        # identical data. Set this so the DepthAI mapper writes a database too;
+        # the ROS one already writes /tmp/rtabmap3d_live.db.
+        DeclareLaunchArgument("slam_database_path", default_value=""),
         # When the on-device SLAM is off, publish the mapper's products under
         # the /rtabmap names the VFH and planner nodes already subscribe to.
         # "auto" means legacy names exactly when slam_enable_slam is false, so
@@ -76,6 +81,7 @@ def generate_launch_description():
             "oak_startup_delay": LaunchConfiguration("oak_startup_delay"),
             "slam_publish_ros_rgbd": "true",
             "slam_enable_slam": LaunchConfiguration("slam_enable_slam"),
+            "slam_database_path": LaunchConfiguration("slam_database_path"),
             "slam_ros_rgbd_publish_hz": LaunchConfiguration("rgbd_publish_hz"),
         }.items(),
     )

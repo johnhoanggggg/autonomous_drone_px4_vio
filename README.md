@@ -263,6 +263,25 @@ so the counts are compared through the RTAB-Map database with `rtabmap-info`.
 `--slam-database-path` was added to `basalt_rtabmap_slam_ros2` for that; the ROS
 mapper already writes `/tmp/rtabmap3d_live.db`.
 
+The launch and the harness run **at the same time in two terminals**; the two
+*stacks* must run **sequentially**, since both need the OAK and the second would
+fail with `X_LINK_DEVICE_ALREADY_IN_USE`. Best of all is one walk with both
+mappers running on the same feed:
+
+```bash
+# terminal 1 - both mappers on one camera feed, the controlled comparison
+rm -f /tmp/depthai_loop.db
+ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py foxglove:=false \
+  slam_enable_slam:=true slam_database_path:=/tmp/depthai_loop.db
+# terminal 2, while walking the loop
+python3 scripts/loop_closure_test.py --label both --seconds 180 --out /tmp/loop_both.json
+# Ctrl-C terminal 1 (not kill -9) so the database is written, then:
+rtabmap-info /tmp/depthai_loop.db   | grep -E "Neighbor:|Closure:"
+rtabmap-info /tmp/rtabmap3d_live.db | grep -E "Neighbor:|Closure:"
+```
+
+Or measure each stack in its own real configuration, one after the other:
+
 ```bash
 # hybrid
 ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py foxglove:=false
