@@ -279,6 +279,74 @@ the measured odometry rate was only about 5.9 Hz, it has not passed trajectory,
 relocalization, covariance, SITL, props-off or flight gates, and CPU should be
 remeasured during a representative moving run.
 
+##### Why it was 5.9 Hz, and what it is now
+
+The 5.9 Hz had two independent causes, both since measured on the Pi.
+
+1. Odometry cost. The default frame-to-map settings (`Vis/MaxFeatures=1000`,
+   `OdomF2M/MaxSize=2000`, descriptor matching, bundle adjustment on) spend
+   97.6 ms per frame in one thread, which saturates a core and forces the node
+   to drop every second 10 fps frame. Switching to optical-flow
+   correspondences with bundle adjustment off and 600 features costs 47.6 ms
+   per frame, holds a full 10.0 Hz, and slightly *lowers* container CPU
+   (102.8% against 104.7%). Those are now the launch defaults, and every knob
+   is a launch argument (`vis_cor_type`, `vis_max_features`,
+   `odom_f2m_max_size`, `odom_bundle_adjustment`, `odom_strategy`,
+   `odom_image_decimation`).
+
+2. IMU lag. `depthai_ros_driver` 2.12.2 delivers `/oak/imu/data` with
+   timestamps 0.4-0.5 s behind the image stream (IMU stamp age 546 ms mean,
+   442-889 ms spread; image stamp age 189 ms). RTAB-Map requires an IMU sample
+   newer than each image, so it logs `We didn't receive IMU newer than previous
+   image ... The previous image is dropped!` and discards nearly every frame.
+   This is not batching or bandwidth: `imu.i_batch_report_threshold=1`,
+   `i_max_q_size=1`, a 100 Hz IMU and `i_update_ros_base_time_on_ros_msg` all
+   leave it unchanged, and `i_get_base_device_timestamp=true` merely exposes
+   the raw device clock. With `use_imu:=false` the drops stop (1 versus 901)
+   and a 20 fps source reaches 12.95 Hz at 44.9 ms per frame.
+
+##### The IMU path is a driver version split, not a tuning problem
+
+The ROS side runs `depthai_ros_driver` 2.12.2 on `ros-jazzy-depthai` 2.31.0,
+that is depthai-core v2. The flying stack (`basalt_rtabmap_slam_ros2`,
+`dai.node.BasaltVIO`, `dai.node.RTABMapVIO`) runs depthai-core/python **3.5.0**,
+where the same BMI270 feeds on-device VIO with no such lag. apt carries no v3
+`depthai_ros_driver`, so a ROS-native inertial path means building depthai-ros
+v3 from source against the 3.5.0 core already on this machine.
+
+##### Vision-only odometry is not a flight pose source
+
+Stationary on the bench, the tuned vision-only odometry stays bounded but is
+extremely noisy: net displacement 0.113 m over 27 s, yet 25.98 m of
+accumulated path, mean phantom speed 1.06 m/s and peaks of 6.45 m/s. Keeping
+descriptor matching and bundle adjustment does not fix it (16.79 m of path),
+so the noise is the absence of inertial fusion, not the optical-flow setting.
+For comparison, on-device `RTABMapVIO` measures 0.45 mm of stationary drift.
+Feeding this to EKF2 as external vision would inject metre-per-second velocity
+noise, so `ros_rtabmap_oak_3d.launch.py` still publishes nothing to `/fmu/in/*`.
+These samples were taken in a dark room (150 features against 555 earlier), so
+they are a pessimistic bound and worth repeating in daylight.
+
+##### What RTAB-Map can and cannot supply
+
+`rtabmap_slam` does not produce odometry at all; it consumes `/odom` and adds
+loop closure and mapping. Odometry comes from the separate `rtabmap_odom`
+node, and this build has no tightly coupled backend compiled in: the library
+reports `RTAB-Map is not built with OpenVINS/MSCKF_VIO/VINS/OKVIS/FOVIS
+support`, leaving only strategy 0 (frame-to-map) and 1 (frame-to-frame), both
+visual-only with the IMU used just for gravity. A ROS-native flight pose
+therefore needs either a v3 driver plus a real VIO node, or the on-device
+DepthAI VIO retained for pose while ROS keeps only mapping.
+
+##### Topologies that do not work on this driver
+
+`i_pipeline_type: depth` publishes the device-rectified mono pair and depth but
+never starts the IMU. `i_pipeline_type: stereo` starts the IMU but not depth.
+Only `RGBD` brings up depth and IMU together. `i_resolution: "400"` is rejected
+by the OAK-D-Lite's OV7251 ("Resolution 400 not supported ... Using default
+resolution 480P"); the vendor `isaac_vslam.yaml` value targets a different
+sensor.
+
 ```bash
 cd /home/john/autonomous_drone_px4_vio/ros2_ws
 source /opt/ros/jazzy/setup.bash

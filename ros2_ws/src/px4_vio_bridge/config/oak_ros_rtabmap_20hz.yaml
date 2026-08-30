@@ -1,0 +1,45 @@
+/oak:
+  ros__parameters:
+    # 20 fps variant of oak_ros_rtabmap.yaml. The tuned odometry costs ~45 ms
+    # per frame, so a 10 fps source leaves it idle half the time; at 20 fps it
+    # reaches ~13 Hz. Only usable with use_imu:=false, because this driver's
+    # IMU stream lags the image stream by ~0.4 s (see README).
+    camera:
+      i_enable_imu: true
+      i_enable_ir: false
+      i_enable_sync: false
+      i_nn_type: none
+      i_pipeline_type: RGBD
+    pipeline_gen:
+      i_enable_imu: true
+      i_enable_sync: false
+    left:
+      i_fps: 20.0
+      i_resolution: "480P"
+      i_synced: false
+    right:
+      i_fps: 20.0
+      i_resolution: "480P"
+      i_synced: false
+    rgb:
+      i_fps: 20.0
+      i_resolution: "1080P"
+      i_width: 640
+      i_height: 360
+      i_set_isp_scale: true
+    stereo:
+      i_align_depth: true
+      i_depth_filter_size: 5
+      i_left_right_check: true
+      i_publish_synced_rect_pair: false
+      i_set_input_size: true
+      i_subpixel: true
+      i_synced: false
+      i_width: 640
+      i_height: 360
+      i_fps: 20.0
+    imu:
+      i_acc_freq: 200
+      i_gyro_freq: 200
+      i_max_q_size: 10
+      i_message_type: IMU
