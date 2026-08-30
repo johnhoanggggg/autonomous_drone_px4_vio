@@ -439,25 +439,29 @@ the same topic:
 | `/rtabmap/obstacle_cloud` | `cloud_obstacles` | yes |
 | `/rtabmap/ground_cloud` | `cloud_ground` | yes |
 | `/rtabmap/path` | `mapPath` | yes |
-| `/rtabmap/pose` | `localization_pose` | **no, see below** |
+| `/rtabmap/pose` | `cpp_slam_pose_relay` | yes |
+| `/rtabmap/odom_correction` | `cpp_slam_pose_relay` | yes |
 
 The grid and cloud topics are event-driven: they republish when the map
 changes, so on a stationary bench they arrive once and then stay quiet. That is
 correct behaviour, not a stall.
 
-**Known gap: `/rtabmap/pose` has no drop-in equivalent.** The on-device node
-published a loop-corrected pose at VIO rate. `rtabmap_slam` has no such topic:
-`localization_pose` only fires on a localization event and stays silent in
-SLAM mode (`Mem/IncrementalMemory=true`), measured 0 messages in 25 s. RTAB-Map
-exposes the correction as the map-to-odom **TF** instead. Consumers that
-default to `pose_topic:=/rtabmap/pose` — `vfh_monitor`, `vfh_obstacles`,
-`route_follower_monitor`, `global_planner_monitor` — therefore need either
-`pose_topic:=/rtabmap/vio_pose` (uncorrected, continuous) or a small relay that
-composes the map-to-odom TF with the VIO pose. `/rtabmap/odom_correction` is
-likewise unpublished in this mode. Until that is resolved, do not run the
-planner or follower launches against `slam_enable_slam:=false`; the
-`offboard_*` and `vfh_monitor` launches still default it to true and are
-unaffected.
+**The corrected pose is rebuilt, not remapped.** `rtabmap_slam` has no
+continuous corrected-pose topic: `localization_pose` only fires on a
+localization event and stays silent in SLAM mode (`Mem/IncrementalMemory=true`,
+measured 0 messages in 25 s), and the correction is exposed as the
+map-to-odom TF instead. `cpp_slam_pose_relay` composes that TF with the
+continuous `/rtabmap/vio_pose` and republishes both `/rtabmap/pose` and
+`/rtabmap/odom_correction` at VIO rate, which is what the on-device node did.
+Until the mapper publishes a correction the relay passes the pose through with
+an identity correction, matching the on-device behaviour before the first loop
+closure, and it rejects a non-unit correction quaternion the same way. The
+composition maths is ROS-free in `slam_pose_relay.cpp` with 8 gtest cases.
+
+Measured in the hybrid over 25 s: `/rtabmap/pose` 264 messages,
+`/rtabmap/odom_correction` 263, `/rtabmap/path` 19, and the grid and both
+clouds once each. The relay starts only when `slam_enable_slam:=false`, so it
+can never contend with the on-device publisher.
 
 ##### Topologies that do not work on this driver
 

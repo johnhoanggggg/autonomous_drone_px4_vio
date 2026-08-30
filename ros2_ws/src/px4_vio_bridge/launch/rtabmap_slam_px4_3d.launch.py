@@ -101,7 +101,7 @@ def generate_launch_description():
                 ("mapPath", "/rtabmap/path"),
             ]
 
-        return [Node(
+        nodes = [Node(
             package="rtabmap_slam",
             executable="rtabmap",
             namespace="rtabmap3d",
@@ -165,6 +165,29 @@ def generate_launch_description():
             # source.
             arguments=["-d"],
         )]
+
+        if legacy:
+            # rtabmap_slam has no continuous corrected-pose topic: it publishes
+            # localization_pose only on a localization event, which never fires
+            # in SLAM mode, and exposes the correction as the map->odom TF.
+            # Rebuild both topics the on-device node used to publish.
+            nodes.append(Node(
+                package="px4_vio_bridge",
+                executable="cpp_slam_pose_relay",
+                name="slam_pose_relay",
+                output="screen",
+                emulate_tty=True,
+                parameters=[{
+                    "vio_pose_topic": "/rtabmap/vio_pose",
+                    "pose_topic": "/rtabmap/pose",
+                    "correction_topic": "/rtabmap/odom_correction",
+                    "map_frame": "rtabmap3d_map",
+                    "odom_frame": "rtabmap3d_odom",
+                    "output_frame": "world",
+                }],
+            ))
+
+        return nodes
 
     mapper = OpaqueFunction(function=_mapper)
 

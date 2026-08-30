@@ -14,6 +14,8 @@ find_package(RTABMap REQUIRED COMPONENTS core)
 find_package(rtabmap_conversions REQUIRED)
 find_package(rtabmap_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
 ament_python_install_package(${PROJECT_NAME})
@@ -47,6 +49,20 @@ target_include_directories(planner_3d_cpp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
+
+# ROS-free pose composition for the SLAM pose relay, kept separate from the
+# node so the parity tests can link it alone.
+add_library(slam_pose_relay_cpp src/slam_pose_relay.cpp)
+target_compile_features(slam_pose_relay_cpp PUBLIC cxx_std_17)
+target_include_directories(slam_pose_relay_cpp PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+add_executable(cpp_slam_pose_relay src/slam_pose_relay_node.cpp)
+target_compile_features(cpp_slam_pose_relay PUBLIC cxx_std_17)
+target_link_libraries(cpp_slam_pose_relay slam_pose_relay_cpp)
+ament_target_dependencies(cpp_slam_pose_relay geometry_msgs rclcpp tf2 tf2_ros)
 
 add_library(rtabmap_octomap_cpp src/rtabmap_octomap.cpp)
 target_compile_features(rtabmap_octomap_cpp PUBLIC cxx_std_17)
@@ -155,6 +171,8 @@ ament_target_dependencies(cpp_flight_adapter
 
 install(TARGETS
   planner_flight_cpp
+  slam_pose_relay_cpp
+  cpp_slam_pose_relay
   planner_3d_cpp
   rtabmap_octomap_cpp
   cpp_astar_planner
@@ -218,6 +236,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_grid_planner_cpp planner_flight_cpp)
   ament_add_gtest(test_grid_planner_3d_cpp test/test_grid_planner_3d.cpp)
   target_link_libraries(test_grid_planner_3d_cpp planner_3d_cpp)
+  ament_add_gtest(test_slam_pose_relay_cpp test/test_slam_pose_relay.cpp)
+  target_link_libraries(test_slam_pose_relay_cpp slam_pose_relay_cpp)
   ament_add_gtest(test_rtabmap_octomap_cpp test/test_rtabmap_octomap.cpp)
   target_link_libraries(test_rtabmap_octomap_cpp rtabmap_octomap_cpp planner_3d_cpp)
   ament_add_gtest(test_route_follower_3d_cpp test/test_route_follower_3d.cpp)
