@@ -42,6 +42,15 @@ parser.add_argument('--publish-depth', type=parse_bool, default=False,
                     help='Publish RAW16 metric depth for Foxglove.')
 parser.add_argument('--depth-publish-hz', type=float, default=3.0,
                     help='Maximum depth publish rate in Hz.')
+parser.add_argument('--slam-database-path', default='',
+                    help='Save the RTABMapSLAM database here on close. The node '
+                         'otherwise keeps the map in memory and writes nothing, '
+                         'so its loop closures cannot be counted afterwards. '
+                         'With a path set, rtabmap-info reports GlobalClosure '
+                         'and LocalSpaceClosure link counts, which is how the '
+                         'DepthAI and ROS mappers are compared on equal terms. '
+                         'Delete the file first; an existing one is not loaded '
+                         'but a stale file is easy to misread.')
 parser.add_argument('--enable-slam', type=parse_bool, default=True,
                     help='Run the on-device RTABMapSLAM node. Set false to publish '
                          'raw VIO pose and RGB-D only and let a ROS rtabmap_slam own '
@@ -1070,6 +1079,14 @@ with dai.Pipeline() as p:
         slam.setPublishObstacleCloud(args.publish_clouds)
         slam.setPublishGroundCloud(args.publish_clouds)
         slam.setPublishGrid(args.publish_grid)
+        if args.slam_database_path:
+            # RTABMapSLAM detects loop closures but exposes no statistics
+            # output, so the database is the only way to count them.
+            slam.setDatabasePath(args.slam_database_path)
+            slam.setLoadDatabaseOnStart(False)
+            slam.setSaveDatabaseOnClose(True)
+            print(f'RTABMapSLAM database will be saved to '
+                  f'{args.slam_database_path} on close')
 
     ros2Viewer = p.create(Ros2Node)
 

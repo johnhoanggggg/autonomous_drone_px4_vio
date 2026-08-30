@@ -15,6 +15,16 @@ Then: hold still ~20 s, carry the drone slowly around a closed loop of a few
 metres keeping textured scenery in view, return it to the marked start in the
 original orientation, hold still ~20 s. No props.
 
+Both the hybrid and the original full DepthAI pipeline can be measured with
+this and compared directly, because both publish /rtabmap/vio_pose,
+/rtabmap/pose and /rtabmap/odom_correction. Only the ROS mapper publishes
+rtabmap_msgs/Info, so on the DepthAI pipeline the closure count will read 0;
+use "correction_updates" and "corrected_pose_jumps", which work on both.
+
+    # original full DepthAI pipeline (its own RTABMapSLAM does the closing)
+    ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py foxglove:=false
+    python3 scripts/loop_closure_test.py --label depthai --seconds 180
+
 Note: the "odometry_while_moving" section only appears on the ROS-native stack
 (ros_rtabmap_oak_v3.launch.py). The hybrid's odometry is a DepthAI host node,
 which publishes no rtabmap_msgs/OdomInfo, so lost/inlier counts are unavailable
@@ -48,7 +58,7 @@ class LoopClosureTest(Node):
         self.args = args
         self.raw = []          # (t, x, y, z) from the pose PX4 consumes
         self.corrected = []    # (t, x, y, z) from the SLAM-corrected pose
-        self.corrections = []  # (t, |translation| of map->odom)
+        self.corrections = []  # (t, x, y, z of map->odom translation)
         self.closures = []     # (t, ref_id, loop_id, |transform|)
         self.odom = []         # (t, lost, inliers, features)
 
@@ -79,8 +89,7 @@ class LoopClosureTest(Node):
 
     def _correction_cb(self, msg):
         p = msg.pose.position
-        self.corrections.append(
-            (time.monotonic(), math.sqrt(p.x ** 2 + p.y ** 2 + p.z ** 2)))
+        self.corrections.append((time.monotonic(), p.x, p.y, p.z))
 
     def _info_cb(self, msg):
         if msg.loop_closure_id != 0 or msg.proximity_detection_id != 0:
@@ -141,12 +150,26 @@ def report(node, hold):
     }
 
     if node.corrections:
-        mags = [m for _, m in node.corrections]
+        c = node.corrections
+        mags = [math.sqrt(x * x + y * y + z * z) for _, x, y, z in c]
+        # A correction that changes is the cross-stack proxy for a closure:
+        # only the ROS mapper publishes rtabmap_msgs/Info, but both stacks
+        # publish this topic, so this is what makes the two comparable.
+        eps = 1e-4  # 0.1 mm
+        updates = []
+        for i in range(len(c) - 1):
+            step = dist(c[i][1:], c[i + 1][1:])
+            if step > eps:
+                updates.append({"at_s": round(c[i + 1][0] - c[0][0], 1),
+                                "delta_mm": round(1000.0 * step, 2)})
         out["map_to_odom_correction"] = {
             "samples": len(mags),
             "max_mm": round(1000.0 * max(mags), 1),
             "final_mm": round(1000.0 * mags[-1], 1),
             "ever_non_identity": bool(max(mags) > 1e-6),
+            "correction_updates": len(updates),
+            "largest_updates": sorted(
+                updates, key=lambda u: -u["delta_mm"])[:5],
         }
 
     if len(corr) > 2:
@@ -168,12 +191,20 @@ def report(node, hold):
         }
 
     verdict = []
-    if not node.closures:
-        verdict.append("NO loop closure fired - the test proved nothing about "
-                       "closure; repeat with a more textured route.")
-    if node.corrections and max(m for _, m in node.corrections) <= 1e-6:
-        verdict.append("Correction stayed identity, so the relay's "
-                       "non-identity branch is still unexercised.")
+    corr = out.get("map_to_odom_correction", {})
+    if not node.closures and not corr.get("correction_updates"):
+        verdict.append("NO closure and no correction update - the test proved "
+                       "nothing about closure; repeat with a more textured "
+                       "route.")
+    elif not node.closures and corr.get("correction_updates"):
+        verdict.append(
+            f"{corr['correction_updates']} correction updates but no "
+            "rtabmap_msgs/Info: expected on the DepthAI pipeline, whose SLAM "
+            "is a host node that publishes no Info topic. Compare using "
+            "correction_updates and corrected_pose_jumps.")
+    if corr and not corr.get("ever_non_identity"):
+        verdict.append("Correction stayed identity, so the corrected-pose "
+                       "path is still unexercised.")
     r = out["raw_vio_pose_the_one_px4_uses"].get("return_to_origin_error_mm")
     if r is not None:
         verdict.append(f"Raw VIO returned to within {r} mm - this is the drift "
@@ -193,6 +224,8 @@ def main():
     ap.add_argument("--correction-topic", default="/rtabmap/odom_correction")
     ap.add_argument("--info-topic", default="/rtabmap3d/info")
     ap.add_argument("--odom-info-topic", default="/rtabmap/vio_odom_info")
+    ap.add_argument("--label", default="",
+                    help="Tag for the report, e.g. 'hybrid' or 'depthai'.")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -208,6 +241,8 @@ def main():
         print("\nstopped early")
 
     result = report(node, args.hold_seconds)
+    if args.label:
+        result = {"label": args.label, **result}
     text = json.dumps(result, indent=2)
     print(text)
     if args.out:

@@ -257,9 +257,25 @@ consumes, how many closures fired, the map-to-odom correction magnitude, and the
 size of the jumps that feeding the corrected pose to EKF2 would have caused. No
 props are involved.
 
+Both stacks can be measured and compared. Both mappers do detect closures —
+`RTABMapSLAM` is RTAB-Map — but only the ROS one publishes `rtabmap_msgs/Info`,
+so the counts are compared through the RTAB-Map database with `rtabmap-info`.
+`--slam-database-path` was added to `basalt_rtabmap_slam_ros2` for that; the ROS
+mapper already writes `/tmp/rtabmap3d_live.db`.
+
 ```bash
+# hybrid
 ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py foxglove:=false
-python3 scripts/loop_closure_test.py --seconds 180 --out /tmp/loop_test.json
+python3 scripts/loop_closure_test.py --label hybrid --seconds 180 --out /tmp/loop_hybrid.json
+rtabmap-info /tmp/rtabmap3d_live.db | grep -E "Neighbor:|Closure:"
+
+# original full DepthAI pipeline, same physical loop
+rm -f /tmp/depthai_loop.db
+ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py foxglove:=false \
+  slam_database_path:=/tmp/depthai_loop.db
+python3 scripts/loop_closure_test.py --label depthai --seconds 180 --out /tmp/loop_depthai.json
+# stop with SIGINT, not SIGKILL, or the database is not written
+rtabmap-info /tmp/depthai_loop.db | grep -E "Neighbor:|Closure:"
 ```
 
 Hold still ~20 s, carry the drone slowly around a closed loop of a few metres

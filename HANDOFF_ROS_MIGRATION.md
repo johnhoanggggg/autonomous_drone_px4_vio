@@ -225,7 +225,55 @@ installing also upgrades systemd/udev. Reverting is `rm -rf` the overlay.
 ## Hand-carried loop-closure test
 
 Purpose: fire loop closure at least once and record what happens to the pose PX4
-would consume. No props. Run `scripts/loop_closure_test.py` (see README).
+would consume, on **both** stacks so they can be compared. No props.
+
+Both mappers detect loop closures — `RTABMapSLAM` is RTAB-Map, that is its job.
+The difference is only in what is observable: the ROS mapper publishes
+`rtabmap_msgs/Info`, while the DepthAI node exposes `transform`,
+`odomCorrection`, grid and clouds but **no statistics output port**. So the
+closure count is compared through the RTAB-Map **database** instead, which both
+can write and which `rtabmap-info` reads:
+
+```text
+Links:
+  Neighbor:          N
+  GlobalClosure:     N   <- loop closures
+  LocalSpaceClosure: N   <- proximity detections
+```
+
+`--slam-database-path` was added to `basalt_rtabmap_slam_ros2` for this; without
+it the DepthAI mapper keeps the map in memory and writes nothing. The ROS mapper
+already writes `/tmp/rtabmap3d_live.db`.
+
+Run the same physical loop twice, once per stack:
+
+```bash
+# 1. original full DepthAI pipeline - its own RTABMapSLAM closes the loop
+rm -f /tmp/depthai_loop.db
+ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py foxglove:=false \
+  slam_database_path:=/tmp/depthai_loop.db
+python3 scripts/loop_closure_test.py --label depthai --seconds 180 \
+  --out /tmp/loop_depthai.json
+# stop with SIGINT, not SIGKILL, or the database is not written
+rtabmap-info /tmp/depthai_loop.db | grep -E "Neighbor:|Closure:"
+
+# 2. hybrid - the ROS rtabmap_slam closes the loop
+ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py foxglove:=false
+python3 scripts/loop_closure_test.py --label hybrid --seconds 180 \
+  --out /tmp/loop_hybrid.json
+rtabmap-info /tmp/rtabmap3d_live.db | grep -E "Neighbor:|Closure:"
+```
+
+Compare across the two: closure counts from the databases, `correction_updates`
+and `ever_non_identity` from the harness (these work on both stacks), the
+`corrected_pose_jumps` each produced, and the `return_to_origin_error_mm` on the
+raw pose, which is the drift PX4 would actually see and which closure cannot
+remove.
+
+Stationary control values, so a null result is recognisable: return-to-origin
+0.1-0.2 mm, 0 closures, identity correction, largest corrected-pose jump under
+about 3 mm, and `rtabmap-info` reporting 0 nodes and 0 links because RTAB-Map
+adds no graph node while the camera does not move.
 
 Procedure:
 
