@@ -523,13 +523,28 @@ stack becomes viable for the first time:
 | --- | --- | --- | --- |
 | DepthAI RTABMapVIO + on-device SLAM (flown) | 18.7 Hz | 0.58 mm | 233.1% |
 | DepthAI RTABMapVIO + ROS SLAM (hybrid) | 25.3 Hz | 0.63 mm | 150.6% |
-| **ROS-native on v3** (odom + SLAM + OctoMap) | **17.4 Hz** | **3.35 mm** | **~92%** |
+| **ROS-native on v3** (odom + SLAM + OctoMap) | **17.0 Hz** | **0.47 mm** | **~104%** |
 | ROS-native on v2 (vision-only) | 9.7 Hz | 86.15 mm | ~127% |
 
-That is a 26x improvement in rms over the v2 vision-only path, better than
-on-device BasaltVIO (4.69 mm), and the cheapest stack measured. It is still
-about 6x noisier than the on-device RTABMapVIO, which remains the accuracy
-reference.
+**Bundle adjustment is what closes the accuracy gap.** A sweep re-measured
+against a fresh on-device reference in the same position, so the numbers are
+directly comparable:
+
+| config | rate | rms | net | path | max step | CPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| on-device RTABMapVIO (reference) | 17.2 Hz | 0.52 mm | 0.58 mm | 0.208 m | 1.86 mm | - |
+| flow, BA off | 17.0 Hz | 3.34 mm | 6.33 mm | 2.853 m | 13.08 mm | 96.0% |
+| descriptor, BA off | 14.3 Hz | 3.79 mm | 7.42 mm | 2.696 m | 13.83 mm | 99.0% |
+| **descriptor + BA, 600/2000 (default)** | **17.0 Hz** | **0.47 mm** | 0.51 mm | 0.389 m | 1.52 mm | 100.4% |
+| descriptor + BA, 1000/3000 | 10.5 Hz | 0.44 mm | 0.46 mm | 0.227 m | 1.52 mm | 92.9% |
+
+Descriptor matching alone changes nothing (3.79 mm against 3.34 mm); the
+7x improvement comes entirely from `OdomF2M/BundleAdjustment`. BA cannot run
+with optical-flow correspondences, which is the only reason `Vis/CorType` has
+to be 0. The default now beats the on-device reference on rms, net error and
+worst single-frame step at the same rate, for about 5 ms more compute per
+frame. The 1000/3000 variant is smoother still (path 0.227 m against the
+reference's 0.208 m) if 10.5 Hz is acceptable.
 
 Three things are load-bearing and were each found the hard way.
 

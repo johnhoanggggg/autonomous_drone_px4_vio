@@ -57,10 +57,17 @@ def generate_launch_description():
         DeclareLaunchArgument("range_min", default_value="0.30"),
         DeclareLaunchArgument("range_max", default_value="4.0"),
         DeclareLaunchArgument("max_marker_voxels", default_value="50000"),
+        # Bundle adjustment is what buys the accuracy: with it off this
+        # odometry sits at 3.3-3.8 mm stationary rms regardless of
+        # correspondence type, and with it on it reaches 0.47 mm, matching the
+        # on-device RTABMapVIO's 0.52 mm at the same rate. BA cannot run with
+        # optical-flow correspondences, hence Vis/CorType 0. Raising features to
+        # 1000 and the local map to 3000 gives 0.44 mm and a smoother path but
+        # drops the rate to ~10 Hz.
         DeclareLaunchArgument("vis_max_features", default_value="600"),
-        DeclareLaunchArgument("vis_cor_type", default_value="1"),
-        DeclareLaunchArgument("odom_f2m_max_size", default_value="1000"),
-        DeclareLaunchArgument("odom_bundle_adjustment", default_value="0"),
+        DeclareLaunchArgument("vis_cor_type", default_value="0"),
+        DeclareLaunchArgument("odom_f2m_max_size", default_value="2000"),
+        DeclareLaunchArgument("odom_bundle_adjustment", default_value="1"),
         DeclareLaunchArgument("sync_max_interval", default_value="0.05"),
         DeclareLaunchArgument("sensor_qos", default_value="2"),
     ]
