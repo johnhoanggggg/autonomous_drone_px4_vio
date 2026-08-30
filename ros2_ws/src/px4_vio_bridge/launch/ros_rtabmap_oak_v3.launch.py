@@ -1,0 +1,233 @@
+"""ROS-native RTAB-Map on the depthai_ros_driver_v3 (depthai-core v3) driver.
+
+This is the version of ros_rtabmap_oak_3d.launch.py that can actually fuse the
+IMU. The v2 driver delivers /oak/imu/data ~0.4 s behind the images, so
+rtabmap_odom drops nearly every frame; measured on the Pi, v3 brings that to
+about 10 ms and odometry runs with zero IMU-caused drops.
+
+depthai_ros_driver_v3 is NOT installed system-wide. Either install it
+(`sudo apt install ros-jazzy-depthai-ros-driver-v3`, which also upgrades
+systemd/udev), or source the local overlay first:
+
+    export AMENT_PREFIX_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy:$AMENT_PREFIX_PATH
+    export LD_LIBRARY_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib:\
+/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+    export PYTHONPATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/python3.12/site-packages:$PYTHONPATH
+
+Nothing here publishes to /fmu/in/*.
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
+from launch.conditions import IfCondition
+from launch.launch_description_sources import AnyLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import LoadComposableNodes, Node
+from launch_ros.descriptions import ComposableNode
+from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.substitutions import FindPackageShare
+
+
+def typed(name, value_type):
+    return ParameterValue(LaunchConfiguration(name), value_type=value_type)
+
+
+def core_string(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=str)
+
+
+def generate_launch_description():
+    arguments = [
+        DeclareLaunchArgument("foxglove", default_value="true"),
+        DeclareLaunchArgument("foxglove_port", default_value="8765"),
+        DeclareLaunchArgument(
+            "camera_config",
+            default_value=PathJoinSubstitution([
+                FindPackageShare("px4_vio_bridge"),
+                "config",
+                "oak_v3_rtabmap.yaml",
+            ]),
+        ),
+        # v3 fuses the IMU correctly, so unlike the v2 launch this defaults on.
+        DeclareLaunchArgument("use_imu", default_value="true"),
+        DeclareLaunchArgument("imu_topic", default_value="/oak/imu/data"),
+        DeclareLaunchArgument("odometry_rate_hz", default_value="20.0"),
+        DeclareLaunchArgument("mapping_rate_hz", default_value="1.0"),
+        DeclareLaunchArgument("voxel_size", default_value="0.05"),
+        DeclareLaunchArgument("range_min", default_value="0.30"),
+        DeclareLaunchArgument("range_max", default_value="4.0"),
+        DeclareLaunchArgument("max_marker_voxels", default_value="50000"),
+        DeclareLaunchArgument("vis_max_features", default_value="600"),
+        DeclareLaunchArgument("vis_cor_type", default_value="1"),
+        DeclareLaunchArgument("odom_f2m_max_size", default_value="1000"),
+        DeclareLaunchArgument("odom_bundle_adjustment", default_value="0"),
+        DeclareLaunchArgument("sync_max_interval", default_value="0.05"),
+        DeclareLaunchArgument("sensor_qos", default_value="2"),
+    ]
+
+    camera = IncludeLaunchDescription(
+        AnyLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("depthai_ros_driver_v3"),
+                "launch",
+                "driver.launch.py",
+            ])
+        ),
+        launch_arguments={
+            "name": "oak",
+            "camera_model": "OAK-D-LITE",
+            "params_file": LaunchConfiguration("camera_config"),
+            "use_rviz": "false",
+        }.items(),
+    )
+
+    # v3 publishes rgb/image_raw and depth already in the colour optical frame,
+    # so no host rectification or depth alignment is needed.
+    sensor_remappings = [
+        ("rgb/image", "/oak/rgb/image_raw"),
+        ("depth/image", "/oak/stereo/image_raw"),
+        ("rgb/camera_info", "/oak/rgb/camera_info"),
+    ]
+
+    odometry = ComposableNode(
+        package="rtabmap_odom",
+        plugin="rtabmap_odom::RGBDOdometry",
+        namespace="rtabmap",
+        name="rgbd_odometry",
+        parameters=[{
+            "frame_id": "oak",
+            "odom_frame_id": "rtabmap_odom",
+            "publish_tf": True,
+            "publish_null_when_lost": True,
+            "wait_imu_to_init": typed("use_imu", bool),
+            "always_check_imu_tf": typed("use_imu", bool),
+            "approx_sync": True,
+            "approx_sync_max_interval": typed("sync_max_interval", float),
+            "topic_queue_size": 10,
+            "sync_queue_size": 10,
+            "qos": typed("sensor_qos", int),
+            "qos_camera_info": typed("sensor_qos", int),
+            "expected_update_rate": typed("odometry_rate_hz", float),
+            "max_update_rate": typed("odometry_rate_hz", float),
+            # RTAB-Map core parameters are declared as strings; passing them as
+            # numbers makes the node abort at startup.
+            "Odom/Strategy": "0",
+            "Vis/MaxFeatures": core_string("vis_max_features"),
+            "Vis/CorType": core_string("vis_cor_type"),
+            "OdomF2M/MaxSize": core_string("odom_f2m_max_size"),
+            "OdomF2M/BundleAdjustment": core_string("odom_bundle_adjustment"),
+        }],
+        remappings=sensor_remappings + [
+            ("imu", LaunchConfiguration("imu_topic")),
+            ("odom", "/rtabmap/vio_odometry"),
+            ("odom_info", "/rtabmap/vio_odom_info"),
+        ],
+    )
+
+    mapper = ComposableNode(
+        package="rtabmap_slam",
+        plugin="rtabmap_slam::CoreWrapper",
+        namespace="rtabmap",
+        name="rtabmap",
+        parameters=[{
+            "subscribe_depth": True,
+            "subscribe_rgb": False,
+            "subscribe_rgbd": False,
+            "subscribe_stereo": False,
+            "subscribe_odom_info": True,
+            "frame_id": "oak",
+            "map_frame_id": "world",
+            "publish_tf": True,
+            "approx_sync": True,
+            "approx_sync_max_interval": typed("sync_max_interval", float),
+            "topic_queue_size": 10,
+            "sync_queue_size": 10,
+            "qos_image": typed("sensor_qos", int),
+            "qos_camera_info": typed("sensor_qos", int),
+            "qos_odom": typed("sensor_qos", int),
+            "database_path": "",
+            "Mem/IncrementalMemory": "true",
+            "Mem/InitWMWithAllNodes": "false",
+            "Rtabmap/DetectionRate": core_string("mapping_rate_hz"),
+            "Rtabmap/SaveWMState": "false",
+            "RGBD/CreateOccupancyGrid": "true",
+            "Kp/MaxFeatures": "400",
+            "Grid/3D": "true",
+            "Grid/GroundIsObstacle": "false",
+            "Grid/RayTracing": "true",
+            "Grid/CellSize": core_string("voxel_size"),
+            "Grid/DepthDecimation": "8",
+            "Grid/RangeMin": core_string("range_min"),
+            "Grid/RangeMax": core_string("range_max"),
+            "Grid/PreVoxelFiltering": "true",
+            "Grid/NoiseFilteringRadius": "0.15",
+            "Grid/NoiseFilteringMinNeighbors": "4",
+            "Grid/ClusterRadius": "0.20",
+            "Grid/MinClusterSize": "20",
+        }],
+        remappings=sensor_remappings + [
+            ("odom", "/rtabmap/vio_odometry"),
+            ("odom_info", "/rtabmap/vio_odom_info"),
+        ],
+    )
+
+    ros_mapping_components = LoadComposableNodes(
+        target_container="/oak_container",
+        composable_node_descriptions=[odometry, mapper],
+    )
+
+    octomap = Node(
+        package="px4_vio_bridge",
+        executable="rtabmap_octomap_node",
+        name="ros_rtabmap_octomap",
+        output="screen",
+        emulate_tty=True,
+        parameters=[{
+            "map_data_topic": "/rtabmap/mapData",
+            "frame_id": "world",
+            "octomap_topic": "/rtabmap/octomap",
+            "metadata_topic": "/rtabmap/octomap_metadata",
+            "markers_topic": "/rtabmap/octomap_markers",
+            "ground_markers_topic": "/rtabmap/octomap_ground_markers",
+            "obstacle_markers_topic": "/rtabmap/octomap_obstacle_markers",
+            "max_marker_voxels": typed("max_marker_voxels", int),
+        }],
+    )
+
+    foxglove = IncludeLaunchDescription(
+        AnyLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("foxglove_bridge"),
+                "launch",
+                "foxglove_bridge_launch.xml",
+            ])
+        ),
+        condition=IfCondition(LaunchConfiguration("foxglove")),
+        launch_arguments={
+            "port": LaunchConfiguration("foxglove_port"),
+            "topic_whitelist": (
+                "['^/tf(_static)?$', "
+                "'^/oak/(rgb/(image_raw(/compressed)?|camera_info)|stereo/image_raw|imu/data)$', "
+                "'^/rtabmap/(vio_odometry|vio_odom_info|mapPath|localization_pose|info|"
+                "octomap_(ground_|obstacle_)?markers|octomap_metadata)$']"
+            ),
+            "service_whitelist": "['^$']",
+            "param_whitelist": "['^$']",
+            "client_topic_whitelist": "['^$']",
+            "capabilities": "[connectionGraph]",
+            "min_qos_depth": "1",
+            "max_qos_depth": "1",
+        }.items(),
+    )
+
+    return LaunchDescription(arguments + [
+        LogInfo(msg=(
+            "ROS-native RTAB-Map on depthai_ros_driver_v3, IMU fusion enabled. "
+            "No node publishes to /fmu/in/*. Foxglove fixed frame is 'world'. "
+            "Requires the v3 driver on AMENT_PREFIX_PATH; see the module docstring."
+        )),
+        camera,
+        ros_mapping_components,
+        octomap,
+        foxglove,
+    ])

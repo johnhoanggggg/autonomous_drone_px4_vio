@@ -505,6 +505,76 @@ from them. An earlier note in this file quoted 6.45 m/s peaks for the
 vision-only path; treat `path` and `max step` as the robust jitter measures
 instead.
 
+##### The v3 driver fixes the IMU lag; ROS-native VIO now works
+
+`depthai_ros_driver_v3` (depthai-core v3) removes the timestamp defect
+outright. Measured on the same bench:
+
+| | v2 (2.12.2) | v3 (3.2.1) |
+| --- | --- | --- |
+| IMU stamp age | 546.6 ms | **9.7 ms** |
+| IMU minus image stamp | -397 ms | +110 ms (IMU ahead, which is what RTAB-Map needs) |
+| IMU-caused frame drops | 901 | **0** |
+
+Run `ros_rtabmap_oak_v3.launch.py`. With the IMU fused the whole ROS-native
+stack becomes viable for the first time:
+
+| stack | odom rate | stationary rms | total CPU |
+| --- | --- | --- | --- |
+| DepthAI RTABMapVIO + on-device SLAM (flown) | 18.7 Hz | 0.58 mm | 233.1% |
+| DepthAI RTABMapVIO + ROS SLAM (hybrid) | 25.3 Hz | 0.63 mm | 150.6% |
+| **ROS-native on v3** (odom + SLAM + OctoMap) | **17.4 Hz** | **3.35 mm** | **~92%** |
+| ROS-native on v2 (vision-only) | 9.7 Hz | 86.15 mm | ~127% |
+
+That is a 26x improvement in rms over the v2 vision-only path, better than
+on-device BasaltVIO (4.69 mm), and the cheapest stack measured. It is still
+about 6x noisier than the on-device RTABMapVIO, which remains the accuracy
+reference.
+
+Three things are load-bearing and were each found the hard way.
+
+**Bandwidth limits are mandatory.** Without explicit fps/resolution the driver
+runs full resolution at 30 fps, the OAK-D-Lite's USB link starves the image
+streams while the IMU keeps flowing, and the log fills with
+`Communication exception - Couldn't read data from stream` (69 in one run).
+With the limits in `config/oak_v3_rtabmap.yaml` that count is 0.
+
+**Odometry and the mapper must be composable nodes in the driver's own
+`/oak_container`.** As separate processes the images cross a process boundary
+twice over best-effort DDS and odometry runs at 2.95 Hz with 42.2 ms of compute
+and no core saturated; composed into the container the same configuration
+reaches 17.44 Hz at 29.4 ms.
+
+**RTAB-Map core parameters are declared as ROS strings.** Passing
+`Vis/CorType:=1` from the command line makes the node abort at startup with
+`InvalidParameterTypeException`; they must be quoted as strings.
+
+**No v2 setting reproduces this.** Batch threshold, queue size, IMU rate,
+`i_get_base_device_timestamp` and `i_update_ros_base_time_on_ros_msg` all leave
+the v2 lag unchanged, and setting `i_synced`/`i_enable_sync` true on v2 stops
+the IMU publishing entirely (0 messages, odometry never initializes) - the same
+failure as `i_pipeline_type: depth` on v2.
+
+**Installation.** `depthai_ros_driver_v3` is not installed system-wide. apt has
+it (`ros-jazzy-depthai-ros-driver-v3` 3.2.1 with `ros-jazzy-depthai-v3` 3.6.1)
+and the package names are `_v3`-suffixed so they coexist with v2, but the
+install also upgrades systemd/udev. To avoid touching a flight Pi the packages
+were unpacked into a local overlay instead:
+
+```bash
+export AMENT_PREFIX_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy:$AMENT_PREFIX_PATH
+export LD_LIBRARY_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib:\
+/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+export PYTHONPATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/python3.12/site-packages:$PYTHONPATH
+```
+
+Nothing is installed and v2 is untouched, so reverting is
+`rm -rf /home/john/depthai_v3_overlay`.
+
+This has not flown. It has no PX4 connection, has not been compared against the
+on-device map on a moving trajectory, and 13 IMU-caused frame drops still
+appear over a run.
+
 ##### Topologies that do not work on this driver
 
 `i_pipeline_type: depth` publishes the device-rectified mono pair and depth but

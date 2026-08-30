@@ -1,0 +1,51 @@
+# OAK profile for depthai_ros_driver_v3 (depthai-core v3).
+#
+# The v2 driver ships /oak/imu/data ~0.4 s behind the images, which makes
+# rtabmap_odom drop nearly every frame; no v2 setting fixes it, and enabling
+# i_synced/i_enable_sync on v2 kills the IMU outright. On v3 the same BMI270
+# lands ~10 ms from the images and odometry fuses it with zero drops.
+#
+# The fps/resolution limits are not optional: without them the driver runs full
+# resolution at 30 fps, the OAK-D-Lite's USB link starves the image streams
+# while the IMU keeps flowing, and the device logs continuous
+# "Communication exception - Couldn't read data from stream". With these limits
+# that count is zero.
+/oak:
+  ros__parameters:
+    driver:
+      i_enable_ir: false
+    pipeline_gen:
+      i_nn_type: none
+      i_pipeline_type: rgbd
+      i_enable_imu: true
+    rgb:
+      # Same bandwidth budget the working v2 config uses. Without these the
+      # driver runs full resolution at 30 fps and the OAK-D-Lite's USB link
+      # starves the image streams while the IMU keeps flowing.
+      i_synced: true
+      i_fps: 20.0
+      i_resolution: "1080P"
+      i_width: 640
+      i_height: 360
+      i_set_isp_scale: true
+    left:
+      i_fps: 20.0
+      i_resolution: "480P"
+    right:
+      i_fps: 20.0
+      i_resolution: "480P"
+    stereo:
+      i_synced: true
+      i_fps: 20.0
+      i_width: 640
+      i_height: 360
+      i_set_input_size: true
+      i_subpixel: true
+      i_left_right_check: true
+    imu:
+      i_batch_report_threshold: 1
+      i_max_batch_reports: 10
+      i_enable_rotation: false
+      i_acc_freq: 200
+      i_gyro_freq: 200
+      i_message_type: IMU
