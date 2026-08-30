@@ -463,6 +463,48 @@ Measured in the hybrid over 25 s: `/rtabmap/pose` 264 messages,
 clouds once each. The relay starts only when `slam_enable_slam:=false`, so it
 can never contend with the on-device publisher.
 
+##### Measured stationary drift of every estimator
+
+All four configurations sampled on the bench, camera untouched, 45 s windows,
+same scene and the same metric. `net` is start-to-end displacement, `rms` is
+the spread about the mean position, `path` is total accumulated motion (the
+jitter measure) and `max step` is the largest jump between consecutive samples.
+
+| estimator | rate | net | rms | path | max step |
+| --- | --- | --- | --- | --- | --- |
+| DepthAI **RTABMapVIO** (flown) | 18.7 Hz | **0.31 mm** | **0.58 mm** | 0.28 m | 2.7 mm |
+| DepthAI RTABMapVIO + on-device SLAM | 18.7 Hz | 0.31 mm | 0.58 mm | 0.28 m | 2.7 mm |
+| DepthAI RTABMapVIO + **ROS SLAM** (hybrid) | 25.3 Hz | 0.69 mm | 0.63 mm | 0.40 m | 3.0 mm |
+| DepthAI **BasaltVIO** | 39.5 Hz | 18.29 mm | 4.69 mm | **0.15 m** | 2.5 mm |
+| **ROS `rtabmap_odom`** (vision-only) | 9.7 Hz | 120.66 mm | 86.15 mm | 27.25 m | 318.68 mm |
+
+Three conclusions.
+
+**The hybrid costs nothing in accuracy.** Swapping the on-device SLAM for the
+ROS one leaves the pose statistically unchanged (rms 0.63 mm against 0.58 mm),
+because PX4 is fed from the raw VIO either way and the correction is identity
+while stationary. The corrected output tracks the raw pose as it should.
+
+**Basalt and RTABMapVIO fail differently.** Basalt is the *smoothest* — the
+least accumulated path of anything here, 0.15 m — but it walks away steadily,
+18.29 mm net against RTABMapVIO's 0.31 mm. RTABMapVIO is frame-to-map, so it
+stays anchored and does not accumulate. That is why the flight chain hardcodes
+`--vio-backend rtabmap`, and it reproduces the earlier 0.45 mm versus ~11 mm
+result.
+
+**ROS `rtabmap_odom` is two orders of magnitude worse and is not a flight pose
+source.** 86 mm rms against 0.58 mm is ~150x, and it produced a single 319 mm
+jump between consecutive frames. That is the cost of having no usable IMU on
+this driver, not of the tuning: it is the same conclusion as the vision-only
+comparison above, now quantified against the alternatives.
+
+Caveat on one column: `max step` is dt-independent and trustworthy, but a
+per-sample *speed* is not — these topics deliver in bursts, so consecutive
+samples can share almost the same timestamp and inflate any velocity computed
+from them. An earlier note in this file quoted 6.45 m/s peaks for the
+vision-only path; treat `path` and `max step` as the robust jitter measures
+instead.
+
 ##### Topologies that do not work on this driver
 
 `i_pipeline_type: depth` publishes the device-rectified mono pair and depth but
