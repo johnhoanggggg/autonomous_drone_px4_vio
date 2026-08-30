@@ -71,7 +71,7 @@ class GlobalPlannerMonitor(Node):
     def __init__(self):
         super().__init__("global_planner_monitor")
         self.declare_parameter("map_topic", "/rtabmap/grid")
-        self.declare_parameter("pose_topic", "/rtabmap/pose")
+        self.declare_parameter("pose_topic", "/rtabmap/body_pose")
         self.declare_parameter("goal_topic", "/waypoint/clicked")
         self.declare_parameter("frame_id", "world")
         self.declare_parameter("rate_hz", 2.0)

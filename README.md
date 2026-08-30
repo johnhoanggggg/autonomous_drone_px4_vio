@@ -6,7 +6,10 @@ and an observation-only 3D OctoMap planner under development.
 
 RTAB-Map VIO/SLAM on the OAK-D Lite publishes its continuous VIO pose on
 `/rtabmap/vio_pose`; `px4_vio_bridge` converts that into PX4 `VehicleOdometry` on
-`/fmu/in/vehicle_visual_odometry`, and EKF2 fuses it as external vision.
+`/fmu/in/vehicle_visual_odometry`, and EKF2 fuses it as external vision. That PX4
+branch remains camera-origin because EKF2 applies `EKF2_EV_POS_*`. In parallel,
+`camera_to_body_pose` subtracts the rotated camera lever arm and publishes
+`/rtabmap/body_vio_pose` and `/rtabmap/body_pose` for planning and clearance.
 
 **Nothing here is a supported autonomous product.** Every flight mode is
 experimental, every armed flight needs an RC kill switch in someone's hand, and
@@ -50,7 +53,7 @@ source /home/john/ros2_ws/install/setup.bash
 colcon build --packages-select px4_vio_bridge
 ```
 
-Run the Python test suite (404 tests, no hardware needed; `colcon test` also
+Run the Python test suite (430 tests, no hardware needed; `colcon test` also
 runs the C++ gtests):
 
 ```bash
@@ -520,6 +523,11 @@ coloured by follower state (green `FOLLOWING`, amber `CLEARANCE_ESCAPING`, red
 line is the accepted path as it stood at that instant, white is the requested
 goal and orange the effective one.
 
+The rendered vehicle track defaults to `/rtabmap/body_pose`, the Pixhawk/body
+origin used by the planner. Old bags without that topic fall back to the legacy
+camera-origin `/rtabmap/pose` with an explicit warning; `--pose-topic` can select
+either topic deliberately.
+
 It also prints a fault table with the pose's exact clearance at each event:
 
 ```text
@@ -635,10 +643,17 @@ rather than replaces the RC kill switch.
 ### Which pose is which
 
 - **PX4 does not receive the loop-corrected SLAM pose.** The bridge consumes the
-  continuous raw VIO pose on `/rtabmap/vio_pose`. This keeps loop-closure jumps
-  out of EKF2.
+  continuous raw camera VIO pose on `/rtabmap/vio_pose`. This keeps loop-closure
+  jumps out of EKF2. It is intentionally not translated: EKF2 applies the saved
+  camera lever arm internally.
+- **The flown 2D planner uses the body origin.** `camera_to_body_pose` derives
+  continuous `/rtabmap/body_vio_pose` and loop-corrected
+  `/rtabmap/body_pose` using the same FRD camera offset as `EKF2_EV_POS_*`.
+  A reset sentinel stays invalid on the derived raw topic rather than becoming
+  a plausible shifted pose.
 - **Foxglove's SLAM visualization is loop-corrected**: `/rtabmap/pose`,
-  `/rtabmap/odometry`, `/rtabmap/path`.
+  `/rtabmap/odometry`, `/rtabmap/path`. These remain camera-origin. Add
+  `/rtabmap/body_pose` to display the actual planner origin.
 - `/rtabmap/odom_correction` is DepthAI RTAB-Map's native map-to-odometry
   correction. The route follower consumes it directly and fails closed on stale,
   non-finite or oversized corrections. It is not added to TF or sent to PX4.
@@ -653,8 +668,9 @@ discontinuous pose to PX4 is not the flight default.
 ### `rtabmap_slam_px4.launch.py` — the stack
 
 Starts OAK-D RTAB-Map VIO/SLAM, `vio_to_px4_odometry`, the PX4
-local-position-to-ROS converter, `battery_to_ros`, and one Foxglove bridge on
-8765. Defaults: depth publishing off, compressed image on, clouds off, grid off.
+local-position-to-ROS converter, `camera_to_body_pose`, `battery_to_ros`, and one
+Foxglove bridge on 8765. Defaults: depth publishing off, compressed image on,
+clouds off, grid off.
 
 The flown planner consumes only the projected 2D grid. The separate fail-closed
 3D architecture in [`HANDOFF_3D_NAVIGATION.md`](HANDOFF_3D_NAVIGATION.md) now has
@@ -671,6 +687,7 @@ a flight-ready launch mode.
 | `slam_grid_ray_tracing` | `false` | host-side cost, scales with cell count |
 | `slam_publish_clouds` | `false` | needed by VFH and cloud visualisation |
 | `slam_publish_image` | `true` | compressed feed for Foxglove |
+| `camera_position_frd_x/y/z` | `+0.100/-0.036/+0.056` | body-to-camera offset used only for planner-facing body poses; keep equal to `EKF2_EV_POS_*` |
 | `start_xrce_agent` | `false` | systemd owns the agent — see below |
 | `battery_monitor` | `true` | |
 
@@ -863,6 +880,8 @@ Pre-flight gate, all green, via `scripts/nsh.py`:
   `heading_good_for_control` all true
 - `listener estimator_status_flags 1` -> no `reject_*`, no `fs_*`,
   `cs_ev_pos` and `cs_ev_yaw` true
+- `ros2 topic hz /rtabmap/body_pose` and `/rtabmap/body_vio_pose` -> both live;
+  `/rtabmap/body_pose/config` records the exact FRD lever arm
 
 ### `offboard_waypoint` — Foxglove click-to-fly
 

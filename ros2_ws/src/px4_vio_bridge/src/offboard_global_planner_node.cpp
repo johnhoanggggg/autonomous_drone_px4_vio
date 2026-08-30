@@ -71,7 +71,7 @@ public:
       declare_parameter<std::string>("correction_topic", "/rtabmap/odom_correction");
     path_topic_ = declare_parameter<std::string>("path_topic", "/planner/path");
     map_topic_ = declare_parameter<std::string>("map_topic", "/rtabmap/grid");
-    map_pose_topic_ = declare_parameter<std::string>("map_pose_topic", "/rtabmap/pose");
+    map_pose_topic_ = declare_parameter<std::string>("map_pose_topic", "/rtabmap/body_pose");
     follower_config_topic_ =
       declare_parameter<std::string>("follower_config_topic", "/planner/follower/config");
     frame_id_ = declare_parameter<std::string>("frame_id", "world");

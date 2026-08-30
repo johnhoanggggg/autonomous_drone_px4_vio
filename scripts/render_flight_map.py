@@ -57,6 +57,7 @@ OTHER_COLOUR = (150, 150, 150)
 TOPICS = (
     "/rtabmap/grid",
     "/rtabmap/pose",
+    "/rtabmap/body_pose",
     "/planner/path",
     "/planner/follower/status",
     "/planner/flight/status",
@@ -258,6 +259,11 @@ def main(argv=None):
     parser.add_argument("--clearance", type=float, default=0.25,
                         help="hard clearance to shade, metres (0 disables)")
     parser.add_argument("--occupied-threshold", type=int, default=65)
+    parser.add_argument(
+        "--pose-topic", default="/rtabmap/body_pose",
+        help=("vehicle-centre pose to render (default /rtabmap/body_pose; "
+              "falls back to legacy camera-origin /rtabmap/pose for old bags)"),
+    )
     parser.add_argument("--supersample", type=int, default=3,
                         help="clearance-band accuracy: resolution/supersample")
     parser.add_argument("--scale", type=int, default=0,
@@ -274,11 +280,20 @@ def main(argv=None):
     if not grids:
         print("no /rtabmap/grid in this bag; nothing to render", file=sys.stderr)
         return 1
-    poses = [(t, (m.pose.position.x, m.pose.position.y)) for t, m in data["/rtabmap/pose"]]
+    pose_topic = args.pose_topic
+    if not data.get(pose_topic) and pose_topic == "/rtabmap/body_pose":
+        pose_topic = "/rtabmap/pose"
+        print(
+            "WARNING: bag has no /rtabmap/body_pose; rendering legacy "
+            "camera-origin clearance",
+            file=sys.stderr,
+        )
+    pose_rows = data.get(pose_topic, [])
+    poses = [(t, (m.pose.position.x, m.pose.position.y)) for t, m in pose_rows]
     follower = [(t, m.data) for t, m in data["/planner/follower/status"]]
     flight = [(t, m.data) for t, m in data["/planner/flight/status"]]
     if not poses:
-        print("no /rtabmap/pose in this bag; nothing to draw", file=sys.stderr)
+        print(f"no {args.pose_topic} in this bag; nothing to draw", file=sys.stderr)
         return 1
 
     out = args.out or (args.bag / "render")
@@ -325,6 +340,7 @@ def main(argv=None):
 
     print(f"{args.bag.name}: {len(poses)} poses, {len(grids)} grids, "
           f"final grid {grid.width}x{grid.height} @ {grid.resolution:.3f}m")
+    print(f"vehicle centre source = {pose_topic}")
     print(f"clearance band = {clearance}m (approx, +/-{grid.resolution / args.supersample:.3f}m); "
           f"printed clearances are exact")
     print(f"\n{'time':>7}  {'source':8} {'pose clearance':>14}  status")

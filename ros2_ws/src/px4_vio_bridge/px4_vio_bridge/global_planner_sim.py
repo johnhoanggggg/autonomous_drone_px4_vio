@@ -23,6 +23,14 @@ class GlobalPlannerSim(Node):
         self.map_pub = self.create_publisher(OccupancyGrid, "/rtabmap/grid", qos)
         self.pose_pub = self.create_publisher(PoseStamped, "/rtabmap/pose", 10)
         self.raw_vio_pub = self.create_publisher(PoseStamped, "/rtabmap/vio_pose", 10)
+        # Simulated poses already represent the robot origin, so publish the
+        # body-center interfaces directly as well as the legacy camera topics.
+        self.body_pose_pub = self.create_publisher(
+            PoseStamped, "/rtabmap/body_pose", 10
+        )
+        self.body_raw_vio_pub = self.create_publisher(
+            PoseStamped, "/rtabmap/body_vio_pose", 10
+        )
         self.correction_pub = self.create_publisher(
             PoseStamped, "/rtabmap/odom_correction", 10
         )
@@ -92,6 +100,8 @@ class GlobalPlannerSim(Node):
         pose.pose.orientation.w = 1.0
         self.pose_pub.publish(pose)
         self.raw_vio_pub.publish(pose)
+        self.body_pose_pub.publish(pose)
+        self.body_raw_vio_pub.publish(pose)
         correction = PoseStamped()
         correction.header.frame_id = "world"
         correction.header.stamp = pose.header.stamp

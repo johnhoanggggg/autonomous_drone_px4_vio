@@ -21,6 +21,7 @@ setup(
     entry_points={
         "console_scripts": [
             "basalt_odometry_test = px4_vio_bridge.basalt_odometry_test:main",
+            "camera_to_body_pose = px4_vio_bridge.camera_to_body_pose:main",
             "offboard_hold_yaw = px4_vio_bridge.offboard_hold_yaw:main",
             "offboard_hover = px4_vio_bridge.offboard_hover:main",
             "process_monitor = px4_vio_bridge.process_monitor:main",

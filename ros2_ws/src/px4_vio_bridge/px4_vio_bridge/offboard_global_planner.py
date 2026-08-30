@@ -53,7 +53,7 @@ class OffboardGlobalPlanner(OffboardHover):
         self.declare_parameter("correction_topic", "/rtabmap/odom_correction")
         self.declare_parameter("path_topic", "/planner/path")
         self.declare_parameter("map_topic", "/rtabmap/grid")
-        self.declare_parameter("map_pose_topic", "/rtabmap/pose")
+        self.declare_parameter("map_pose_topic", "/rtabmap/body_pose")
         self.declare_parameter("follower_config_topic", "/planner/follower/config")
         self.declare_parameter("frame_id", "world")
         self.declare_parameter("follower_timeout", 0.30)

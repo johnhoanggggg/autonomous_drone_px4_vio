@@ -796,7 +796,11 @@ Pi, so `04_13_50.ulg` = the 041514Z bag):
 - `MPC_Z_VEL_MAX_UP=0.5 m/s`
 
 The EV lever arm is already handled by PX4. Do not also apply the translation in
-the ROS bridge. A complete pre-change parameter backup is
+the ROS-to-PX4 `VehicleOdometry` branch. The planner-facing
+`camera_to_body_pose` node intentionally applies the same offset on separate
+`/rtabmap/body_*` topics because the map planner otherwise mistakes the forward
+camera for the airframe centre; those topics are never sent to EKF2. A complete
+pre-change parameter backup is
 `params_backup_20260725_pre_yaw_safety.params`.
 
 ### Build/test state

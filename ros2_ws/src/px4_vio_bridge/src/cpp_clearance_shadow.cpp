@@ -56,6 +56,8 @@ public:
   {
     const auto rate_hz = declare_parameter<double>("rate_hz", 20.0);
     frame_id_ = declare_parameter<std::string>("frame_id", "world");
+    const auto map_pose_topic =
+      declare_parameter<std::string>("map_pose_topic", "/rtabmap/body_pose");
     map_timeout_ = declare_parameter<double>("map_timeout", 3.0);
     pose_timeout_ = declare_parameter<double>("map_pose_timeout", 1.0);
     correction_timeout_ = declare_parameter<double>("correction_timeout", 1.0);
@@ -69,7 +71,7 @@ public:
       "/rtabmap/grid", map_qos,
       [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {on_map(*msg);});
     map_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-      "/rtabmap/pose", 10,
+      map_pose_topic, 10,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {on_map_pose(*msg);});
     correction_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "/rtabmap/odom_correction", 10,

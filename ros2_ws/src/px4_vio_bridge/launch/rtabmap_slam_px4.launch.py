@@ -10,6 +10,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -18,6 +19,9 @@ def generate_launch_description():
     output_odometry_topic = LaunchConfiguration("output_odometry_topic")
     frame_transform = LaunchConfiguration("frame_transform")
     vio_yaw_offset_deg = LaunchConfiguration("vio_yaw_offset_deg")
+    camera_position_frd_x = LaunchConfiguration("camera_position_frd_x")
+    camera_position_frd_y = LaunchConfiguration("camera_position_frd_y")
+    camera_position_frd_z = LaunchConfiguration("camera_position_frd_z")
     px4_local_path_size = LaunchConfiguration("px4_local_path_size")
     px4_local_path_publish_stride = LaunchConfiguration(
         "px4_local_path_publish_stride"
@@ -69,6 +73,13 @@ def generate_launch_description():
                 "frame_transform", default_value="enu_flu_to_ned_frd"
             ),
             DeclareLaunchArgument("vio_yaw_offset_deg", default_value="0.0"),
+            # Planner-facing poses are shifted from the OAK camera origin to
+            # the airframe/Pixhawk origin. These must match EKF2_EV_POS_X/Y/Z,
+            # but the PX4 VehicleOdometry branch below remains unshifted: EKF2
+            # applies its own copy of the lever arm exactly once.
+            DeclareLaunchArgument("camera_position_frd_x", default_value="0.100"),
+            DeclareLaunchArgument("camera_position_frd_y", default_value="-0.036"),
+            DeclareLaunchArgument("camera_position_frd_z", default_value="0.056"),
             DeclareLaunchArgument("px4_local_path_size", default_value="300"),
             DeclareLaunchArgument(
                 "px4_local_path_publish_stride", default_value="10"
@@ -111,7 +122,7 @@ def generate_launch_description():
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf(_static)?$', "
-                    "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count|grid|octomap_(ground_|obstacle_)?markers|octomap_metadata)$', "
+                    "'^/rtabmap/(vio_pose|pose|body_vio_pose|body_pose(/config)?|odometry|odom_correction|path|vio_feature_count|grid|octomap_(ground_|obstacle_)?markers|octomap_metadata)$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
@@ -208,6 +219,25 @@ def generate_launch_description():
             TimerAction(
                 period=px4_startup_delay,
                 actions=[
+                    Node(
+                        package="px4_vio_bridge",
+                        executable="camera_to_body_pose",
+                        name="camera_to_body_pose",
+                        output="screen",
+                        parameters=[
+                            {
+                                "camera_position_frd_x": ParameterValue(
+                                    camera_position_frd_x, value_type=float
+                                ),
+                                "camera_position_frd_y": ParameterValue(
+                                    camera_position_frd_y, value_type=float
+                                ),
+                                "camera_position_frd_z": ParameterValue(
+                                    camera_position_frd_z, value_type=float
+                                ),
+                            }
+                        ],
+                    ),
                     Node(
                         package="px4_vio_bridge",
                         executable="vio_to_px4_odometry",

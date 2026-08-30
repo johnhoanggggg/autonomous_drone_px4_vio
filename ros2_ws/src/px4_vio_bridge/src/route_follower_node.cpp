@@ -163,8 +163,8 @@ public:
   {
     path_topic_ = declare_parameter<std::string>("path_topic", "/planner/path");
     map_topic_ = declare_parameter<std::string>("map_topic", "/rtabmap/grid");
-    pose_topic_ = declare_parameter<std::string>("pose_topic", "/rtabmap/pose");
-    raw_vio_topic_ = declare_parameter<std::string>("raw_vio_topic", "/rtabmap/vio_pose");
+    pose_topic_ = declare_parameter<std::string>("pose_topic", "/rtabmap/body_pose");
+    raw_vio_topic_ = declare_parameter<std::string>("raw_vio_topic", "/rtabmap/body_vio_pose");
     goal_topic_ = declare_parameter<std::string>("goal_topic", "/waypoint/clicked");
     goal_terminal_topic_ =
       declare_parameter<std::string>("goal_terminal_topic", "/planner/goal_terminal");

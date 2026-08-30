@@ -125,7 +125,7 @@ public:
   : Node("global_planner_monitor")
   {
     map_topic_ = declare_parameter<std::string>("map_topic", "/rtabmap/grid");
-    pose_topic_ = declare_parameter<std::string>("pose_topic", "/rtabmap/pose");
+    pose_topic_ = declare_parameter<std::string>("pose_topic", "/rtabmap/body_pose");
     goal_topic_ = declare_parameter<std::string>("goal_topic", "/waypoint/clicked");
     frame_id_ = declare_parameter<std::string>("frame_id", "world");
     const auto rate_hz = declare_parameter<double>("rate_hz", 2.0);

@@ -60,6 +60,7 @@ TOPICS = (
     "/planner/follower/lookahead",
     "/planner/path",
     "/rtabmap/grid",
+    "/rtabmap/body_pose",
     "/rtabmap/pose",
     "/waypoint/clicked",
 )
@@ -117,6 +118,11 @@ def load_bag(path):
     for entries in messages.values():
         entries.sort(key=lambda item: item[0])
     return messages
+
+
+def planner_pose_messages(messages):
+    """Prefer body-centre poses, retaining old-bag replay compatibility."""
+    return messages.get("/rtabmap/body_pose") or messages.get("/rtabmap/pose", [])
 
 
 def latest(entries, timestamp):
@@ -389,7 +395,7 @@ def evaluate_plan_events(messages, config, band_clearance, continuous_clearance)
         if len(recorded_message.poses) < 2:
             continue
         map_item = latest(messages.get("/rtabmap/grid", []), timestamp)
-        pose_item = latest(messages.get("/rtabmap/pose", []), timestamp)
+        pose_item = latest(planner_pose_messages(messages), timestamp)
         goal_item = latest(messages.get("/waypoint/clicked", []), timestamp)
         if map_item is None or pose_item is None or goal_item is None:
             continue
@@ -562,7 +568,7 @@ def evaluate_lookahead(messages, follower_config, required_clearance):
     map_cache = {}
     for timestamp, lookahead_message in messages.get("/planner/follower/lookahead", []):
         path_item = latest(messages.get("/planner/path", []), timestamp)
-        pose_item = latest(messages.get("/rtabmap/pose", []), timestamp)
+        pose_item = latest(planner_pose_messages(messages), timestamp)
         map_item = latest(messages.get("/rtabmap/grid", []), timestamp)
         if path_item is None or pose_item is None or map_item is None:
             continue

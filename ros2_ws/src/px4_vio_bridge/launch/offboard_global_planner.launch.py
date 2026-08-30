@@ -62,8 +62,11 @@ FLIGHT_RECORD_TOPICS = (
     "/rtabmap/grid",
     "/rtabmap/odom_correction",
     "/rtabmap/pose",
+    "/rtabmap/body_pose",
+    "/rtabmap/body_pose/config",
     "/rtabmap/vio_feature_count",
     "/rtabmap/vio_pose",
+    "/rtabmap/body_vio_pose",
     "/vio/yaw_offset/pose",
     # Requested goal and A* outputs needed by evaluate_planner_bags.py.
     "/waypoint/clicked",
@@ -248,6 +251,7 @@ def generate_launch_description():
         DeclareLaunchArgument("replan_during_yaw_align", default_value="false"),
         DeclareLaunchArgument("geofence_radius", default_value="3.0"),
         DeclareLaunchArgument("planner_fault_land_time", default_value="6.0"),
+        DeclareLaunchArgument("map_pose_topic", default_value="/rtabmap/body_pose"),
         DeclareLaunchArgument("goal_hold_time", default_value="3.0"),
         DeclareLaunchArgument("max_correction_m", default_value="1.0"),
         DeclareLaunchArgument("max_correction_yaw_deg", default_value="10.0"),
@@ -310,6 +314,7 @@ def generate_launch_description():
         "replan_during_yaw_align": typed("replan_during_yaw_align", bool),
         "geofence_radius": typed("geofence_radius", float),
         "planner_fault_land_time": typed("planner_fault_land_time", float),
+        "map_pose_topic": LaunchConfiguration("map_pose_topic"),
         "goal_hold_time": typed("goal_hold_time", float),
         "max_correction_m": typed("max_correction_m", float),
         "max_correction_yaw_deg": typed("max_correction_yaw_deg", float),
@@ -358,6 +363,7 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("cpp_shadow")),
         parameters=[{
             "rate_hz": typed("rate_hz", float),
+            "map_pose_topic": LaunchConfiguration("map_pose_topic"),
         }],
     )
     recorder = ExecuteProcess(

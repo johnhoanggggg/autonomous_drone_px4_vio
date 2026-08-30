@@ -70,6 +70,10 @@ def generate_launch_description():
         DeclareLaunchArgument("rate_hz", default_value="2.0"),
         DeclareLaunchArgument("map_timeout", default_value="3.0"),
         DeclareLaunchArgument("pose_timeout", default_value="1.0"),
+        DeclareLaunchArgument("pose_topic", default_value="/rtabmap/body_pose"),
+        DeclareLaunchArgument(
+            "raw_vio_topic", default_value="/rtabmap/body_vio_pose"
+        ),
         DeclareLaunchArgument("occupied_threshold", default_value="65"),
         DeclareLaunchArgument("robot_radius", default_value="0.25"),
         DeclareLaunchArgument("safety_margin", default_value="0.00"),
@@ -118,6 +122,7 @@ def generate_launch_description():
         "rate_hz": typed("rate_hz", float),
         "map_timeout": typed("map_timeout", float),
         "pose_timeout": typed("pose_timeout", float),
+        "pose_topic": typed("pose_topic", str),
         "occupied_threshold": typed("occupied_threshold", int),
         "robot_radius": typed("robot_radius", float),
         "safety_margin": typed("safety_margin", float),
@@ -154,6 +159,8 @@ def generate_launch_description():
     follower_parameters = [{
         "rate_hz": typed("follower_rate_hz", float),
         "map_timeout": typed("map_timeout", float),
+        "pose_topic": typed("pose_topic", str),
+        "raw_vio_topic": typed("raw_vio_topic", str),
         "occupied_threshold": typed("occupied_threshold", int),
         "robot_radius": typed("robot_radius", float),
         "safety_margin": typed("safety_margin", float),
@@ -197,6 +204,8 @@ def generate_launch_description():
             "--disable-keyboard-controls",
             "--topics",
             "/rtabmap/grid", "/rtabmap/pose", "/rtabmap/vio_pose",
+            "/rtabmap/body_pose", "/rtabmap/body_vio_pose",
+            "/rtabmap/body_pose/config",
             "/rtabmap/odom_correction", "/rtabmap/vio_feature_count",
             "/waypoint/clicked",
             "/planner/path", "/planner/candidate_path", "/planner/inflated_map",
