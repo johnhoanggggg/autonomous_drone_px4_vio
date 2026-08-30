@@ -1,0 +1,43 @@
+/oak:
+  ros__parameters:
+    # Keep DepthAI at the sensor-driver boundary only. Visual odometry, graph
+    # SLAM and occupancy mapping run in the standard ROS RTAB-Map nodes.
+    camera:
+      i_enable_imu: true
+      i_enable_ir: false
+      i_enable_sync: false
+      i_nn_type: none
+      i_pipeline_type: RGBD
+    pipeline_gen:
+      i_enable_imu: true
+      i_enable_sync: false
+    left:
+      i_fps: 10.0
+      i_resolution: "480P"
+      i_synced: false
+    right:
+      i_fps: 10.0
+      i_resolution: "480P"
+      i_synced: false
+    rgb:
+      i_fps: 10.0
+      i_resolution: "1080P"
+      i_width: 640
+      i_height: 360
+      i_set_isp_scale: true
+    stereo:
+      i_align_depth: true
+      i_depth_filter_size: 5
+      i_left_right_check: true
+      i_publish_synced_rect_pair: false
+      i_set_input_size: true
+      i_subpixel: true
+      i_synced: false
+      i_width: 640
+      i_height: 360
+      i_fps: 10.0
+    imu:
+      i_acc_freq: 200
+      i_gyro_freq: 200
+      i_max_q_size: 10
+      i_message_type: IMU

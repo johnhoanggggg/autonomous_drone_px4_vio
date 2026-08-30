@@ -232,6 +232,53 @@ This launch is a live mapping/visualization gate, not flight authorization. It
 runs a second host-side RTAB-Map process and therefore needs CPU measurement on
 the Pi before its output is connected to the 3D planner.
 
+#### Experimental ROS-native RTAB-Map stack
+
+The `ros-rtabmap-migration` branch also has a standalone replacement benchmark
+that removes the custom DepthAI VIO/SLAM application and the redundant ROS 3D
+mapper. DepthAI remains only as the OAK hardware driver; standard ROS
+`rtabmap_odom` owns visual-inertial odometry and `rtabmap_slam` owns the one 3D
+map:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source /home/john/ros2_ws/install/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+
+ros2 launch px4_vio_bridge ros_rtabmap_oak_3d.launch.py
+```
+
+Do not run `rtabmap_slam_px4.launch.py` or
+`rtabmap_slam_px4_3d.launch.py` at the same time: all three launches need the
+same OAK camera. This benchmark intentionally publishes nothing under
+`/fmu/in/*`, loads no saved RTAB-Map database, and does not replace the flight
+VIO path yet.
+
+For Foxglove, connect to `ws://<pi-ip>:8765`, set the 3D panel fixed frame to
+`world`, then add `/rtabmap/octomap_ground_markers` and
+`/rtabmap/octomap_obstacle_markers`. Their colors can be overridden
+independently. Set `foxglove:=false` if another Foxglove bridge already owns
+port 8765. Useful health checks are:
+
+```bash
+ros2 topic echo /rtabmap/vio_odom_info --once --no-arr
+ros2 topic echo /rtabmap/octomap_metadata --field data --once
+ros2 topic hz /rtabmap/vio_odometry
+```
+
+On the Pi on 2026-08-30, an active 10-second sample measured the composable OAK
+driver + RGB-D odometry + mapper at 123.8% CPU and the OctoMap converter at
+2.9%, versus 218.6% custom VIO/SLAM + 11.8% redundant ROS mapper + 32.9%
+OctoMap in the previous stack. That is 126.7% versus 263.3% for the mapping
+group (about 52% less, or 1.36 four-core-Pi cores freed). The sample produced a
+live 0.05 m OctoMap with ground, obstacles and observed free space, while
+odometry reported `lost: false` and 79 inliers. This is not yet a flight result:
+the measured odometry rate was only about 5.9 Hz, it has not passed trajectory,
+relocalization, covariance, SITL, props-off or flight gates, and CPU should be
+remeasured during a representative moving run.
+
 ```bash
 cd /home/john/autonomous_drone_px4_vio/ros2_ws
 source /opt/ros/jazzy/setup.bash

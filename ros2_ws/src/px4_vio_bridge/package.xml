@@ -27,7 +27,10 @@
 
   <exec_depend>python3-psutil</exec_depend>
   <exec_depend>ros2launch</exec_depend>
+  <exec_depend>depthai_ros_driver</exec_depend>
   <exec_depend>foxglove_bridge</exec_depend>
+  <exec_depend>image_proc</exec_depend>
+  <exec_depend>rtabmap_odom</exec_depend>
   <exec_depend>rtabmap_slam</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
