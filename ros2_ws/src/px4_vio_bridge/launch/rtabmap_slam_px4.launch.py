@@ -111,11 +111,11 @@ def generate_launch_description():
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf(_static)?$', "
-                    "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count|grid|octomap_markers|octomap_metadata)$', "
+                    "'^/rtabmap/(vio_pose|pose|odometry|odom_correction|path|vio_feature_count|grid|octomap_(ground_|obstacle_)?markers|octomap_metadata)$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
-                    "'^/rtabmap3d/(octomap_markers|octomap_metadata)$', "
+                    "'^/rtabmap3d/(octomap_(ground_|obstacle_)?markers|octomap_metadata)$', "
                     "'^/vio/yaw_offset/(pose|odometry|path)$', "
                     "'^/px4/local_position/(pose|odometry|path)$', "
                     "'^/waypoint/(clicked|clicked_pose|target|commanded|status)$', "

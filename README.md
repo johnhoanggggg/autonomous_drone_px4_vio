@@ -200,13 +200,17 @@ duplicates. Its topics are deliberately isolated under `/rtabmap3d/*`; they are
 not consumed by the flown 2D planner or sent to PX4.
 
 Connect Foxglove to `ws://<pi-ip>:8765`, add a **3D** panel, select fixed frame
-`rtabmap3d_map`, then add `/rtabmap3d/octomap_markers`. Brown cubes are ground
-and red cubes are obstacles. Useful checks are:
+`rtabmap3d_map`, then add `/rtabmap3d/octomap_ground_markers` and
+`/rtabmap3d/octomap_obstacle_markers`. Open each topic's settings to override
+its color independently. The published defaults are brown ground and red
+obstacles. `/rtabmap3d/octomap_markers` remains available as a combined view.
+Useful checks are:
 
 ```bash
 ros2 topic hz /rtabmap3d/mapData
 ros2 topic echo /rtabmap3d/octomap_metadata --once
-ros2 topic hz /rtabmap3d/octomap_markers
+ros2 topic hz /rtabmap3d/octomap_ground_markers
+ros2 topic hz /rtabmap3d/octomap_obstacle_markers
 ```
 
 This launch is a live mapping/visualization gate, not flight authorization. It

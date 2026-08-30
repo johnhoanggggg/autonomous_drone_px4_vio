@@ -199,6 +199,7 @@ def generate_launch_description():
             "--disable-keyboard-controls", "--topics",
             "/rtabmap/mapData", "/rtabmap/octomap", "/rtabmap/octomap_metadata",
             "/rtabmap/octomap_markers",
+            "/rtabmap/octomap_ground_markers", "/rtabmap/octomap_obstacle_markers",
             "/rtabmap/pose", "/rtabmap/vio_pose",
             "/rtabmap/odom_correction", "/waypoint/clicked",
             "/planner3d/path", "/planner3d/candidate_path",
@@ -226,7 +227,7 @@ def generate_launch_description():
             "port": LaunchConfiguration("foxglove_port"),
             "topic_whitelist": (
                 "['^/tf(_static)?$', "
-                "'^/rtabmap/(octomap_markers|octomap_metadata|pose|vio_pose|odom_correction)$', "
+                "'^/rtabmap/(octomap_(ground_|obstacle_)?markers|octomap_metadata|pose|vio_pose|odom_correction)$', "
                 "'^/planner3d/.*$', '^/waypoint/clicked$']"
             ),
             "service_whitelist": "['^$']",

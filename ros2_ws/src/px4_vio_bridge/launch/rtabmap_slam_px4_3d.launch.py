@@ -125,6 +125,8 @@ def generate_launch_description():
             "octomap_topic": "/rtabmap3d/octomap",
             "metadata_topic": "/rtabmap3d/octomap_metadata",
             "markers_topic": "/rtabmap3d/octomap_markers",
+            "ground_markers_topic": "/rtabmap3d/octomap_ground_markers",
+            "obstacle_markers_topic": "/rtabmap3d/octomap_obstacle_markers",
             "max_marker_voxels": typed("max_marker_voxels", int),
         }],
     )
@@ -132,7 +134,8 @@ def generate_launch_description():
     return LaunchDescription(arguments + [
         LogInfo(msg=(
             "Live 3D mapping is observation-only. In Foxglove select fixed frame "
-            "'rtabmap3d_map' and add /rtabmap3d/octomap_markers."
+            "'rtabmap3d_map' and add /rtabmap3d/octomap_ground_markers and "
+            "/rtabmap3d/octomap_obstacle_markers."
         )),
         base_stack,
         mapper,

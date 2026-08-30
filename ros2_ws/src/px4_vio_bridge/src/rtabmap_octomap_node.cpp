@@ -34,6 +34,10 @@ public:
       "metadata_topic", "/rtabmap/octomap_metadata");
     const auto markers_topic = declare_parameter<std::string>(
       "markers_topic", "/rtabmap/octomap_markers");
+    const auto ground_markers_topic = declare_parameter<std::string>(
+      "ground_markers_topic", "/rtabmap/octomap_ground_markers");
+    const auto obstacle_markers_topic = declare_parameter<std::string>(
+      "obstacle_markers_topic", "/rtabmap/octomap_obstacle_markers");
     const auto max_marker_voxels = declare_parameter<int>("max_marker_voxels", 50000);
     if (max_marker_voxels < 0) {
       throw std::invalid_argument("max_marker_voxels cannot be negative");
@@ -48,6 +52,10 @@ public:
     metadata_pub_ = create_publisher<std_msgs::msg::String>(metadata_topic, output_qos);
     markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       markers_topic, output_qos);
+    ground_markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      ground_markers_topic, output_qos);
+    obstacle_markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      obstacle_markers_topic, output_qos);
     map_data_sub_ = create_subscription<rtabmap_msgs::msg::MapData>(
       map_data_topic_, input_qos,
       [this](rtabmap_msgs::msg::MapData::ConstSharedPtr message) {on_map_data(*message);});
@@ -139,11 +147,17 @@ private:
   std::size_t publish_markers(const std_msgs::msg::Header & header)
   {
     visualization_msgs::msg::MarkerArray array;
+    visualization_msgs::msg::MarkerArray ground_array;
+    visualization_msgs::msg::MarkerArray obstacle_array;
     visualization_msgs::msg::Marker clear;
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     array.markers.push_back(clear);
+    ground_array.markers.push_back(clear);
+    obstacle_array.markers.push_back(clear);
     if (max_marker_voxels_ == 0 || assembler_.tree() == nullptr) {
       markers_pub_->publish(array);
+      ground_markers_pub_->publish(ground_array);
+      obstacle_markers_pub_->publish(obstacle_array);
       return 0;
     }
 
@@ -196,9 +210,13 @@ private:
       (is_ground ? ground.points : obstacles.points).push_back(point);
       ++displayed;
     }
+    ground_array.markers.push_back(ground);
+    obstacle_array.markers.push_back(obstacles);
     array.markers.push_back(std::move(ground));
     array.markers.push_back(std::move(obstacles));
     markers_pub_->publish(array);
+    ground_markers_pub_->publish(ground_array);
+    obstacle_markers_pub_->publish(obstacle_array);
     return displayed;
   }
 
@@ -213,6 +231,8 @@ private:
   rclcpp::Publisher<octomap_msgs::msg::Octomap>::SharedPtr octomap_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr metadata_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr ground_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr obstacle_markers_pub_;
 };
 
 }  // namespace px4_vio_bridge
