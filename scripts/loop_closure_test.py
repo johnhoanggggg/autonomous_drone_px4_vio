@@ -172,6 +172,26 @@ def report(node, hold):
                 updates, key=lambda u: -u["delta_mm"])[:5],
         }
 
+    # A VIO reset snaps the pose toward the origin. It teleports the odom
+    # frame, which is what makes loop closures fail RTAB-Map's geometric
+    # consistency check, so count them explicitly.
+    if len(raw) > 2:
+        resets = []
+        for i in range(len(raw) - 1):
+            step = dist(raw[i][1:], raw[i + 1][1:])
+            near_origin = math.sqrt(sum(v * v for v in raw[i + 1][1:])) < 0.05
+            if step > 0.25:
+                resets.append({"at_s": round(raw[i + 1][0] - raw[0][0], 1),
+                               "jump_mm": round(1000.0 * step, 1),
+                               "landed_near_origin": bool(near_origin)})
+        out["vio_resets_and_jumps"] = {
+            "count": len(resets),
+            "events": resets[:10],
+            "note": ("Steps over 250 mm in the RAW pose. These teleport the "
+                     "odom frame and are the usual reason loop closures get "
+                     "rejected for graph error. PX4 sees these directly."),
+        }
+
     if len(corr) > 2:
         out["corrected_pose_jumps"] = {
             "samples": len(corr),
@@ -205,6 +225,12 @@ def report(node, hold):
     if corr and not corr.get("ever_non_identity"):
         verdict.append("Correction stayed identity, so the corrected-pose "
                        "path is still unexercised.")
+    rs = out.get("vio_resets_and_jumps", {}).get("count", 0)
+    if rs:
+        verdict.append(
+            f"{rs} large jumps in the RAW pose. VIO tracking was lost during "
+            "the run. Loop closures will be rejected for graph error until "
+            "this is fixed, and PX4 would see these steps directly.")
     r = out["raw_vio_pose_the_one_px4_uses"].get("return_to_origin_error_mm")
     if r is not None:
         verdict.append(f"Raw VIO returned to within {r} mm - this is the drift "

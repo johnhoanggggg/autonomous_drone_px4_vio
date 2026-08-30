@@ -208,12 +208,66 @@ New code: `src/slam_pose_relay.cpp` + `_node.cpp`,
 `ros-jazzy-depthai-ros-driver-v3`, `_v3`-suffixed so it coexists with v2, but
 installing also upgrades systemd/udev. Reverting is `rm -rf` the overlay.
 
+## First loop-closure result, 2026-08-30
+
+One walk, both mappers on the same feed, ~7.6 m carried loop.
+
+| | nodes | GlobalClosure |
+| --- | --- | --- |
+| DepthAI RTABMapSLAM | 35 | **5** |
+| ROS rtabmap_slam | 18 | **0** |
+
+The ROS mapper was not blind. It detected at least seven closures and rejected
+every one, with reasons in its log:
+
+```text
+Rejected loop closure 10 -> 36: Not enough inliers after bundle adjustment 19/20 (matches=21)
+Loop closure 49->2 rejected!  graph error ratio 7.30 (abs error 35.6 deg)
+Loop closure 50->2 rejected!  graph error ratio 6.58 (abs error 21.7 deg)
+   51, 52, 53, 54 likewise, 15-35 deg   [RGBD/OptimizeMaxError = 3.0]
+```
+
+One failed by a single inlier against `Vis/MinInliers=20`. The other six were
+geometrically inconsistent by 15-35 degrees.
+
+**The cause is VIO tracking loss, not the mapper.** The harness recorded a
+**3343 mm single-sample jump** at t=12.4 s and a **620.6 mm return-to-origin
+error over a 7.56 m walk**, and `vio_to_px4_odometry` rejected 400+ poses as
+`RTABMap reset sentinel`. The VIO reset repeatedly while being carried; the log
+shows tracked features dipping to 93/500. Each reset teleports the odom frame,
+which is exactly what fails a 3-sigma geometric consistency check, so the
+rejections were correct behaviour.
+
+Two consequences, in priority order:
+
+1. **620 mm of return error is disqualifying by itself** - 8% of path, against
+   0.1-0.2 mm stationary. This is the drift PX4 would see, and no amount of
+   loop closure removes it, because PX4 reads the raw pose.
+2. **A 3.3 m position step is a flight-safety problem.** If the VIO resets like
+   this in the air, EKF2 receives that step directly.
+
+So the blocker is upstream of the whole ROS-vs-DepthAI question: **the VIO does
+not survive hand-carried motion**. Investigate that before tuning any mapper.
+Candidates are motion blur at 20 fps, occlusion, and the low feature counts;
+`--num-features`, exposure and carrying more slowly are the first things to try.
+Do not raise `RGBD/OptimizeMaxError` or lower `Vis/MinInliers` to force closures
+through until the trajectory is trustworthy - that would accept geometrically
+wrong closures.
+
+Secondary: the ROS mapper built half the nodes (18 against 35) because it gets
+RGB-D at 3 Hz. Raising `rgbd_publish_hz` gives it more constraints, at CPU cost.
+
+The harness now reports `vio_resets_and_jumps` directly, so a repeat run makes
+this visible without reading launch logs.
+
 ## Open gates before flight
 
-1. Hand-carried loop-closure test (below). Loop closure has **never** fired in
-   any bench test: the SLAM correction was identity every time, so the corrected
-   pose path and `cpp_slam_pose_relay`'s non-identity branch are unexercised
-   outside unit tests.
+1. **VIO stability under motion.** The first carried run reset repeatedly, with
+   a 3.3 m jump and 620 mm return error. Everything else is blocked on this.
+2. Re-run the loop-closure test once the VIO holds tracking, and confirm the
+   ROS mapper accepts closures when the trajectory is consistent. The
+   corrected-pose path and `cpp_slam_pose_relay`'s non-identity branch remain
+   unexercised outside unit tests.
 2. Moving-scene CPU. Every CPU number here is stationary.
 3. Map quality against the DepthAI map on a real trajectory.
 4. `Grid/3D` differs by design: the DepthAI grid was 2D at 0.03 m for the
