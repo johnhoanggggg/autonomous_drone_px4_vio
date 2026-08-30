@@ -1,0 +1,252 @@
+# ROS-native RTAB-Map Migration — Results Handoff
+
+Status: investigation and bench work complete; **nothing here has flown**. The
+hybrid described below is committed and is the recommended next thing to take to
+props-off. The full ROS-native stack is committed but is **not** flight-eligible
+because it fails to initialise about two runs in three.
+
+Branch: `ros-rtabmap-migration`. Nothing on this branch publishes to `/fmu/in/*`
+except the pre-existing `vio_to_px4_odometry`, whose input is unchanged.
+
+## Terminology correction that matters
+
+`RTABMapVIO`, `RTABMapSLAM` and `BasaltVIO` are **`ThreadedHostNode`** — they run
+on the Pi CPU, not on the OAK. Only `StereoDepth` and `FeatureTracker` are
+`DeviceNode` and execute on the RVC2. Verified from the class hierarchy:
+
+```text
+RTABMapVIO      ThreadedHostNode  -> Pi CPU
+RTABMapSLAM     ThreadedHostNode  -> Pi CPU
+BasaltVIO       ThreadedHostNode  -> Pi CPU
+FeatureTracker  DeviceNode        -> RVC2 VPU
+StereoDepth     DeviceNode        -> RVC2 VPU
+```
+
+Earlier notes in this repo, including parts of the README and several commit
+messages, call these "on-device". That is wrong and it misled the CPU analysis
+for a while. Each host node gets one dedicated thread and is single-threaded and
+compute-bound, which is exactly why `RTABMapVIO` + `RTABMapSLAM` together cost
+~200%: two threads, each pinning a core.
+
+## The three architectures
+
+```text
+A. As flown today
+   VPU: StereoDepth + FeatureTracker
+   Pi : RTABMapVIO ---> RTABMapSLAM ---> grid/clouds
+                  \--> /rtabmap/vio_pose -> PX4
+   plus a second ROS rtabmap_slam in the 3D launch = TWO mappers
+
+B. Hybrid  (committed, recommended)
+   VPU: StereoDepth + FeatureTracker
+   Pi : RTABMapVIO --> /rtabmap/vio_pose -> PX4
+                   \-> RGB-D @3 Hz -> ROS rtabmap_slam -> OctoMap
+   RTABMapSLAM deleted. ONE mapper.
+
+C. Full ROS-native  (committed, NOT flight-eligible)
+   VPU: StereoDepth + FeatureTracker
+   Pi : depthai_ros_driver_v3 -> rtabmap_odom -> rtabmap_slam -> OctoMap
+   No DepthAI host VIO at all. Nothing feeds PX4.
+```
+
+## Measured CPU
+
+Per-process, sampled from `/proc` deltas over 20 s.
+
+| process | A (two mappers) | B (hybrid) |
+| --- | --- | --- |
+| DepthAI process | 208.5% | 118.9% |
+| ROS rtabmap_slam | 12.3% | 12.2% |
+| OctoMap converter | 2.2% | 2.3% |
+| PX4 odom bridge | 10.1% | 17.1% |
+| **total** | **233.1%** | **150.6%** |
+
+C measures ~104% total but see the blocker below.
+
+Note the ROS mapper costs the same 12% in both columns: it was already running.
+The hybrid removes duplicated work, it does not relocate cost. The ROS mapper is
+cheap partly because it ingests RGB-D at ~2.7 Hz with `Rtabmap/DetectionRate` at
+1 Hz, whereas `RTABMapSLAM` ingested every frame at ~20 Hz on the host. Both run
+detection at 1 Hz; an earlier claim that the DepthAI node ran keyframes at 20 Hz
+was wrong.
+
+## Measured stationary drift
+
+45 s windows, camera untouched, same scene and metric per group. `net` is
+start-to-end, `rms` is spread about the mean, `path` is accumulated motion, and
+`max step` is the largest consecutive-sample jump. Per-sample *speed* is not a
+sound metric on these topics: they deliver in bursts, so timestamps can nearly
+coincide and inflate any computed velocity.
+
+| estimator | rate | net | rms | path | max step |
+| --- | --- | --- | --- | --- | --- |
+| DepthAI RTABMapVIO (flown) | 18.7 Hz | 0.31 mm | 0.58 mm | 0.28 m | 2.7 mm |
+| RTABMapVIO + ROS SLAM (hybrid) | 25.3 Hz | 0.69 mm | 0.63 mm | 0.40 m | 3.0 mm |
+| DepthAI BasaltVIO | 39.5 Hz | 18.29 mm | 4.69 mm | 0.15 m | 2.5 mm |
+| ROS rtabmap_odom, v2 driver | 9.7 Hz | 120.66 mm | 86.15 mm | 27.25 m | 318.7 mm |
+
+Basalt and RTABMapVIO fail differently: Basalt is the smoothest by accumulated
+path but walks away 18 mm, while RTABMapVIO is frame-to-map, stays anchored and
+does not accumulate. That is why the flight chain hardcodes
+`--vio-backend rtabmap`.
+
+The hybrid costs nothing in accuracy (0.63 mm against 0.58 mm) because PX4 is fed
+from the raw VIO either way and the SLAM correction is identity while stationary.
+
+## The v2 driver IMU defect
+
+`depthai_ros_driver` 2.12.2 delivers `/oak/imu/data` with stamps 0.4-0.5 s behind
+the images (IMU age 546.6 ms mean, 442-889 ms spread; image age 189.4 ms).
+RTAB-Map requires an IMU sample newer than each image, so `rtabmap_odom` logs
+`The previous image is dropped!` and discards nearly every frame. **This, not
+compute, is what capped the ROS-native benchmark at 5.9 Hz.**
+
+Ruled out by measurement, none of which changed the offset:
+
+- `imu.i_batch_report_threshold: 1`, `i_max_batch_reports: 10`
+- `imu.i_max_q_size: 1`
+- IMU at 100 Hz instead of 200 Hz
+- `i_update_ros_base_time_on_ros_msg: true`
+- `i_get_base_device_timestamp: true` (merely exposes the raw device clock)
+- `i_synced: true` + `i_enable_sync: true` — **makes it worse**: the IMU stops
+  publishing entirely (0 messages) and odometry never initialises, the same
+  failure as `i_pipeline_type: depth` on v2
+
+It is a major-version split: the ROS driver is depthai-core v2 while the flying
+stack uses depthai-core/python 3.5.0, where the same BMI270 feeds host VIO with
+no such lag. **Any ROS-side inertial estimator on v2 inherits this**, OpenVINS
+included, because they all consume the same topic. Note also that this RTAB-Map
+build has no tightly coupled backend compiled in — the library reports
+`RTAB-Map is not built with OpenVINS/MSCKF_VIO/VINS/OKVIS/FOVIS support`, leaving
+only strategy 0 (frame-to-map) and 1 (frame-to-frame).
+
+## The v3 driver fixes the lag
+
+`depthai_ros_driver_v3` (3.2.1, depthai-core v3):
+
+| | v2 | v3 |
+| --- | --- | --- |
+| IMU stamp age | 546.6 ms | 9.7 ms |
+| IMU minus image stamp | -397 ms | +110 ms (ahead, which is what RTAB-Map needs) |
+| IMU-caused frame drops | 901 | 0 |
+
+Three things are load-bearing, each found the hard way:
+
+1. **Bandwidth limits are mandatory.** Without explicit fps/resolution the driver
+   runs full resolution at 30 fps, the OAK-D-Lite's USB link starves the *image*
+   streams while the IMU keeps flowing, and the log fills with
+   `Communication exception - Couldn't read data from stream` (69 in one run).
+   With the limits in `config/oak_v3_rtabmap.yaml` that count is 0.
+2. **Odometry and mapper must be composable nodes in the driver's own
+   `/oak_container`.** As separate processes the images cross a process boundary
+   twice over best-effort DDS and odometry runs at 2.95 Hz with 42.2 ms of
+   compute and no core saturated; composed, the same configuration reaches
+   17.44 Hz at 29.4 ms.
+3. **RTAB-Map core parameters are ROS strings.** `-p Vis/CorType:=1` aborts the
+   node with `InvalidParameterTypeException`; they must be quoted.
+
+Accuracy, swept against a fresh reference measured in the same position:
+
+| config | rate | rms | net | path | max step | CPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| DepthAI RTABMapVIO (reference) | 17.2 Hz | 0.52 mm | 0.58 mm | 0.208 m | 1.86 mm | - |
+| flow, BA off | 17.0 Hz | 3.34 mm | 6.33 mm | 2.853 m | 13.08 mm | 96.0% |
+| descriptor, BA off | 14.3 Hz | 3.79 mm | 7.42 mm | 2.696 m | 13.83 mm | 99.0% |
+| descriptor + BA, 600/2000 | 17.0 Hz | 0.47 mm | 0.51 mm | 0.389 m | 1.52 mm | 100.4% |
+| descriptor + BA, 1000/3000 | 10.5 Hz | 0.44 mm | 0.46 mm | 0.227 m | 1.52 mm | 92.9% |
+
+`OdomF2M/BundleAdjustment` is the whole story. Descriptor matching on its own is
+no better than optical flow; BA is a 7x improvement. BA cannot run with
+optical-flow correspondences, which is the only reason `Vis/CorType` moves to 0.
+
+## Blocker: the ROS-native stack does not initialise reliably
+
+Three consecutive bare launches, same scene, no changes between them:
+
+| attempt | tracking | inliers | matches | time/frame |
+| --- | --- | --- | --- | --- |
+| 1 | lost 100% | 0 | 13 | 28.1 ms |
+| 2 | ok | 205 | 346 | 56.9 ms |
+| 3 | lost 100% | 0 | 9 | 27.8 ms |
+
+About one in three initialises. Roughly 500 features are detected either way but
+matching collapses to single digits and inliers to zero. The failing runs are
+*faster*, which is the signature of odometry receiving no usable depth rather
+than of a tuning problem. Two of the three failures logged no device error at
+all, so the occasional `Device ... has crashed` (2 of 9 v3 logs; 0 of 5 on the
+DepthAI-python path) explains only part of it.
+
+**Next diagnostic: confirm whether `/oak/stereo/image_raw` is actually publishing
+during a failed initialisation.** Do not put this path near flight until it is
+10 for 10.
+
+An earlier reading that "explicit arguments work and defaults do not" was wrong;
+it was a coin flip over a small sample.
+
+## What is in the repo
+
+Commits on `ros-rtabmap-migration`, oldest first:
+
+- `f3ddf86` original ROS-native benchmark (pre-existing)
+- `5af8acb` tuned rtabmap_odom, isolated the v2 IMU lag
+- `48b2bb6` `--enable-slam false`, the hybrid
+- `1d2c1e0` corrected the CPU saving with a per-process breakdown
+- `1649d55` parameter and output-topic parity for the ROS mapper
+- `87236fe` `cpp_slam_pose_relay`, rebuilds `/rtabmap/pose`
+- `5d1bc92` quantified drift across all estimators
+- `38a5631` ROS-native stack on the v3 driver
+- `46538c5` bundle adjustment closes the accuracy gap
+
+New code: `src/slam_pose_relay.cpp` + `_node.cpp`,
+`include/px4_vio_bridge/slam_pose_relay.hpp`, `test/test_slam_pose_relay.cpp`
+(8 gtest cases). New launches: `ros_rtabmap_oak_v3.launch.py`. New configs:
+`oak_ros_rtabmap_20hz.yaml`, `oak_v3_rtabmap.yaml`. 571 tests pass.
+
+`depthai_ros_driver_v3` is **not installed**. It is unpacked at
+`/home/john/depthai_v3_overlay` and used via three environment variables (see the
+`ros_rtabmap_oak_v3.launch.py` docstring). apt has it as
+`ros-jazzy-depthai-ros-driver-v3`, `_v3`-suffixed so it coexists with v2, but
+installing also upgrades systemd/udev. Reverting is `rm -rf` the overlay.
+
+## Open gates before flight
+
+1. Hand-carried loop-closure test (below). Loop closure has **never** fired in
+   any bench test: the SLAM correction was identity every time, so the corrected
+   pose path and `cpp_slam_pose_relay`'s non-identity branch are unexercised
+   outside unit tests.
+2. Moving-scene CPU. Every CPU number here is stationary.
+3. Map quality against the DepthAI map on a real trajectory.
+4. `Grid/3D` differs by design: the DepthAI grid was 2D at 0.03 m for the
+   planner, the ROS one is 3D at 0.05 m projected down. Verified to publish, not
+   verified equivalent for the planner.
+5. Planner and follower have never run against the hybrid.
+6. Props-off, then flight.
+
+## Hand-carried loop-closure test
+
+Purpose: fire loop closure at least once and record what happens to the pose PX4
+would consume. No props. Run `scripts/loop_closure_test.py` (see README).
+
+Procedure:
+
+1. Place the drone at a marked start point with a textured view. Mark the
+   footprint so it can be returned to the same spot within a centimetre or two.
+2. Start the harness. Let it record ~20 s stationary to establish a baseline.
+3. Lift and carry the drone slowly around a closed loop of a few metres, keeping
+   the camera pointed at textured scenery, and return it to the marked spot in
+   the original orientation.
+4. Hold still for ~20 s at the end.
+5. Stop the harness and read the report.
+
+What it reports and what to look for:
+
+- **return-to-origin error** on the raw VIO pose. This is the drift PX4 would
+  see; loop closure cannot fix it because PX4 reads the raw pose by design.
+- **loop closures detected** and the magnitude of the map-to-odom correction.
+  Zero closures means the test did not exercise anything; repeat with a more
+  textured route.
+- **corrected-pose jump size** at each closure. This is the reason PX4 is fed the
+  raw pose; the number quantifies how bad a jump would have been.
+- **lost fraction and inlier counts while moving**, which the stationary tests
+  cannot show.
+- **CPU under motion** for each process.

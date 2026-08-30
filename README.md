@@ -232,6 +232,43 @@ This launch is a live mapping/visualization gate, not flight authorization. It
 runs a second host-side RTAB-Map process and therefore needs CPU measurement on
 the Pi before its output is connected to the 3D planner.
 
+#### ROS migration: read the handoff first
+
+`HANDOFF_ROS_MIGRATION.md` collects the whole investigation: the three
+architectures measured, the CPU and drift tables, the v2 driver IMU defect and
+everything that failed to fix it, the v3 driver result, and the open gates. Two
+corrections in it matter for reading anything older in this file:
+
+- `RTABMapVIO`, `RTABMapSLAM` and `BasaltVIO` are **host** nodes on the Pi CPU,
+  not on the OAK. Only `StereoDepth` and `FeatureTracker` run on the RVC2. Text
+  elsewhere calling them "on-device" is wrong; that is why two of them cost
+  ~200%, one core each.
+- The full ROS-native stack on the v3 driver matches the DepthAI accuracy when
+  it starts, but **initialises only about one run in three** and is not
+  flight-eligible. The hybrid is.
+
+#### Hand-carried loop-closure test
+
+Loop closure has never fired in any bench test — stationary, the SLAM correction
+stays identity, so the corrected-pose path and `cpp_slam_pose_relay`'s
+non-identity branch are unexercised outside unit tests. `scripts/loop_closure_test.py`
+records a carried loop and reports the return-to-origin error on the pose PX4
+consumes, how many closures fired, the map-to-odom correction magnitude, and the
+size of the jumps that feeding the corrected pose to EKF2 would have caused. No
+props are involved.
+
+```bash
+ros2 launch px4_vio_bridge rtabmap_slam_px4_3d.launch.py foxglove:=false
+python3 scripts/loop_closure_test.py --seconds 180 --out /tmp/loop_test.json
+```
+
+Hold still ~20 s, carry the drone slowly around a closed loop of a few metres
+with textured scenery in view, return it to the marked start in its original
+orientation, hold still ~20 s. A stationary control run reports
+`return_to_origin_error_mm: 0.1`, 0 closures and an identity correction, so a
+run that still shows 0 closures means the route had too little texture rather
+than that something is broken.
+
 #### Experimental ROS-native RTAB-Map stack
 
 The `ros-rtabmap-migration` branch also has a standalone replacement benchmark
