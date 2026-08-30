@@ -351,14 +351,35 @@ raw continuous VIO pose, deliberately not the loop-corrected `/rtabmap/pose`.
 Without SLAM that publisher is driven straight from `odom.transform`, which is
 the same data `slam.passthroughOdom` used to forward.
 
-Measured on the Pi with identical flags, only `--enable-slam` differing:
+Measured on the Pi with identical flags, only `--enable-slam` differing, with
+host JPEG image publishing **off**:
 
 | | DepthAI process CPU | `/basalt/pose` |
 | --- | --- | --- |
 | `--enable-slam true` | 187.5% | 23.97 Hz |
 | `--enable-slam false` | 64.9% | 24.49 Hz |
 
-That is 122.6 points, about 1.2 of the four cores, at an unchanged pose rate.
+As `rtabmap_slam_px4_3d.launch.py` actually ships, image publishing is on, so
+the saving is smaller. Per-process CPU sampled from `/proc` deltas over 20 s:
+
+| process | hybrid | previous |
+| --- | --- | --- |
+| DepthAI VIO (`basalt_rtabmap_slam_ros2`) | 118.9% | 208.5% |
+| **ROS SLAM (`rtabmap3d/rtabmap`)** | **12.2%** | **12.3%** |
+| OctoMap converter (C++) | 2.3% | 2.2% |
+| PX4 odom bridge | 17.1% | 10.1% |
+| **total** | **150.6%** | **233.1%** |
+
+So the shipped saving is about 90 points on the DepthAI process and 82 points
+overall, roughly 0.8 of a core, not the 1.2 the image-off A/B suggests.
+
+Note where the map work actually sits: the ROS mapper costs the same 12% in
+both columns because it was already running. The hybrid removes the duplicate
+on-device SLAM rather than relocating its cost. The ROS mapper is cheap partly
+because it does much less: it consumes RGB-D at ~2.7 Hz with
+`Rtabmap/DetectionRate` at 1 Hz, while the on-device `RTABMapSLAM` ran at the
+full ~20 Hz VIO rate. That is a lower keyframe and loop-closure duty cycle, not
+the same work done cheaper, and it has not been evaluated for map quality.
 
 `rtabmap_slam_px4_3d.launch.py` now defaults to `slam_enable_slam:=false`.
 Verified end to end: `/rtabmap/vio_pose` at 20.5 Hz, `/rtabmap3d/input/odom` at
