@@ -113,7 +113,12 @@ def generate_launch_description():
             "frame_id": "oak",
             "odom_frame_id": "rtabmap_odom",
             "publish_tf": True,
-            "publish_null_when_lost": True,
+            # A null odometry message is an identity pose. Publishing it on a
+            # brief tracking loss looks like a teleport to the origin to an
+            # unsynchronised consumer. Pause pose output instead; OdomInfo and
+            # diagnostics still report the loss, so a future PX4 adapter can
+            # fail stale rather than forward an invalid pose.
+            "publish_null_when_lost": False,
             "wait_imu_to_init": typed("use_imu", bool),
             "always_check_imu_tf": typed("use_imu", bool),
             "approx_sync": True,
@@ -127,6 +132,10 @@ def generate_launch_description():
             # RTAB-Map core parameters are declared as strings; passing them as
             # numbers makes the node abort at startup.
             "Odom/Strategy": "0",
+            # Preserve the odometry frame through a temporary registration
+            # failure. The default is zero too, but make this flight-critical
+            # behavior explicit.
+            "Odom/ResetCountdown": "0",
             "Vis/MaxFeatures": core_string("vis_max_features"),
             "Vis/CorType": core_string("vis_cor_type"),
             "OdomF2M/MaxSize": core_string("odom_f2m_max_size"),

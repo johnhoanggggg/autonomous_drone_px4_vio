@@ -274,7 +274,7 @@ New code: `src/slam_pose_relay.cpp` + `_node.cpp`,
 `include/px4_vio_bridge/slam_pose_relay.hpp`, `test/test_slam_pose_relay.cpp`
 (8 gtest cases). New launches: `ros_rtabmap_oak_v3.launch.py` and
 `ros_rtabmap_oak_v3_mono.launch.py`. New configs:
-`oak_ros_rtabmap_20hz.yaml`, `oak_v3_rtabmap.yaml`. 571 tests pass.
+`oak_ros_rtabmap_20hz.yaml`, `oak_v3_rtabmap.yaml`. 577 tests pass.
 
 `depthai_ros_driver_v3` is **not installed**. It is unpacked at
 `/home/john/depthai_v3_overlay` and used via three environment variables (see the
@@ -334,11 +334,42 @@ RGB-D at 3 Hz. Raising `rgbd_publish_hz` gives it more constraints, at CPU cost.
 The harness now reports `vio_resets_and_jumps` directly, so a repeat run makes
 this visible without reading launch logs.
 
+## First tuned mono motion result, 2026-08-31
+
+The first mono carry was stopped after 60 s rather than the requested 180 s,
+but it exposed a useful distinction. It recorded 446 odometry-status samples at
+7.4 Hz, 12 lost updates (2.7%) in three episodes lasting roughly 0.2-1.1 s,
+and ten combined global-closure-or-proximity events. The old harness did not
+retain which event type fired, so they cannot honestly all be called global
+closures.
+
+The reported six 0.4-1.18 m "resets" were three pairs: a jump to identity on
+loss and a jump back to the continuing pose on recovery. They came from
+`publish_null_when_lost=true`, not an odometry-frame reset. The core default
+`Odom/ResetCountdown=0` disables automatic resets, the launch log contains no
+automatic-reset message, and each identity sample has a same-stamp
+`OdomInfo.lost=true`. Consequently the old jump, path and RMS metrics are
+contaminated. The 1.243 m hold error is also not interpretable because the test
+was stopped after 60 s, leaving no controlled final 20 s stationary hold. None
+of those values should be used as a drift measurement.
+
+The launch now sets `publish_null_when_lost=false` and explicitly pins
+`Odom/ResetCountdown=0`. A loss therefore pauses valid pose output while
+`OdomInfo` and diagnostics continue to report it. The harness also filters
+same-stamp null samples, reports their count, and separates global closures from
+proximity detections. This prevents a future PX4 adapter from mistaking an
+invalid identity for a pose, but it does **not** make the motion result pass:
+an output pause approaching 1.1 s is still disqualifying. Repeat the full
+180-second loop with the corrected launch/harness, then address any remaining
+loss episodes.
+
 ## Open gates before flight
 
-1. **Mono VIO stability under motion.** The stationary mono control has no lost
-   samples or resets, but it has not been carried. The earlier RGB-profile
-   carried run reset repeatedly, with a 3.3 m jump and 620 mm return error.
+1. **Mono VIO stability under motion.** The first 60 s carry lost tracking for
+   2.7% of status updates in three episodes. Its large apparent jumps were null
+   identity messages rather than true resets and are now suppressed, but a
+   roughly 1.1 s pose-output pause is still not flight-safe. Repeat for the full
+   180 s, then eliminate the dropouts.
 2. Re-run the loop-closure test once the VIO holds tracking, and confirm the
    ROS mapper accepts closures when the trajectory is consistent. The
    corrected-pose path and `cpp_slam_pose_relay`'s non-identity branch remain

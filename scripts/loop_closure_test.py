@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Hand-carried loop-closure test for the hybrid stack.
 
-Loop closure has never fired in any bench test: stationary, the SLAM correction
-stays identity, so the corrected-pose path and cpp_slam_pose_relay's
-non-identity branch are unexercised outside unit tests. This records a carried
-loop and reports what closure does to the pose PX4 would consume.
+Stationary tests keep the SLAM correction at identity, so this records a carried
+loop and reports tracking loss, valid-pose discontinuities, global loop closures
+and proximity detections. The ROS-native launch does not yet publish the relay
+topics needed to measure its corrected pose directly.
 
 Usage, with the hybrid already running:
 
@@ -67,8 +67,10 @@ class LoopClosureTest(Node):
         self.raw = []          # (t, x, y, z) from the pose PX4 consumes
         self.corrected = []    # (t, x, y, z) from the SLAM-corrected pose
         self.corrections = []  # (t, x, y, z of map->odom translation)
-        self.closures = []     # (t, ref_id, loop_id, |transform|)
+        self.closures = []     # (t, ref_id, loop_id, |transform|, kind)
         self.odom = []         # (t, lost, inliers, features)
+        self.raw_odom_stamps = []
+        self.lost_odom_stamps = set()
 
         # A best-effort reader is compatible with both best-effort sensor-data
         # publishers and reliable publishers. Creating one reader of each kind
@@ -96,10 +98,17 @@ class LoopClosureTest(Node):
 
     def _raw_cb(self, msg):
         self.raw.append(self._pt(msg))
+        self.raw_odom_stamps.append(None)
 
     def _raw_odom_cb(self, msg):
         p = msg.pose.pose.position
         self.raw.append((time.monotonic(), p.x, p.y, p.z))
+        self.raw_odom_stamps.append(self._stamp_ns(msg))
+
+    @staticmethod
+    def _stamp_ns(msg):
+        stamp = msg.header.stamp
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
     def _corrected_cb(self, msg):
         self.corrected.append(self._pt(msg))
@@ -111,13 +120,18 @@ class LoopClosureTest(Node):
     def _info_cb(self, msg):
         if msg.loop_closure_id != 0 or msg.proximity_detection_id != 0:
             t = msg.loop_closure_transform.translation
+            kind = ("global_loop_closure" if msg.loop_closure_id != 0
+                    else "proximity_detection")
             self.closures.append((
                 time.monotonic(), int(msg.ref_id),
                 int(msg.loop_closure_id or msg.proximity_detection_id),
                 math.sqrt(t.x ** 2 + t.y ** 2 + t.z ** 2),
+                kind,
             ))
 
     def _odom_cb(self, msg):
+        if msg.lost:
+            self.lost_odom_stamps.add(self._stamp_ns(msg))
         self.odom.append(
             (time.monotonic(), bool(msg.lost), int(msg.inliers),
              int(msg.features)))
@@ -134,7 +148,18 @@ def biggest_jumps(series, n=5):
 
 def report(node, hold):
     out = {}
-    raw, corr = node.raw, node.corrected
+    # When publish_null_when_lost was enabled, RTAB-Map paired a lost OdomInfo
+    # with an identity nav_msgs/Odometry at the same stamp. Those are invalid
+    # samples, not estimator resets. Exclude them before measuring the valid
+    # pose trajectory while continuing to report the tracking loss below.
+    invalid_null_samples = sum(
+        1 for stamp in node.raw_odom_stamps
+        if stamp is not None and stamp in node.lost_odom_stamps)
+    raw = [
+        sample for sample, stamp in zip(node.raw, node.raw_odom_stamps)
+        if stamp is None or stamp not in node.lost_odom_stamps
+    ]
+    corr = node.corrected
 
     if len(raw) > 20:
         span = raw[-1][0] - raw[0][0]
@@ -154,6 +179,7 @@ def report(node, hold):
             "rms_about_mean_mm": round(1000.0 * rms_radius(raw_points), 2),
             "max_step_mm": raw_steps[0]["jump_mm"] if raw_steps else 0.0,
             "largest_steps": raw_steps,
+            "invalid_null_samples_excluded": invalid_null_samples,
             "start_hold_samples": len(start),
             "end_hold_samples": len(end),
             "return_to_origin_error_mm": (
@@ -165,12 +191,17 @@ def report(node, hold):
         out["raw_vio_pose_the_one_px4_uses"] = {"samples": len(raw),
                                                 "error": "insufficient data"}
 
+    global_closures = sum(
+        1 for event in node.closures if event[4] == "global_loop_closure")
+    proximity_detections = len(node.closures) - global_closures
     out["loop_closures"] = {
         "count": len(node.closures),
+        "global_count": global_closures,
+        "proximity_count": proximity_detections,
         "events": [{"at_s": round(t - (raw[0][0] if raw else t), 1),
                     "ref_id": r, "matched_id": l,
-                    "transform_mm": round(1000.0 * m, 1)}
-                   for t, r, l, m in node.closures[:20]],
+                    "transform_mm": round(1000.0 * m, 1), "kind": kind}
+                   for t, r, l, m, kind in node.closures[:20]],
     }
 
     if node.corrections:
@@ -224,12 +255,37 @@ def report(node, hold):
                      "this quantifies what it avoids."),
         }
 
+    lost_fraction = 0.0
     if node.odom:
         lost = sum(1 for _, l, _, _ in node.odom if l)
+        lost_fraction = lost / len(node.odom)
         inl = [i for _, _, i, _ in node.odom]
+        loss_episodes = []
+        loss_start = None
+        for stamp, is_lost, _, _ in node.odom:
+            if is_lost and loss_start is None:
+                loss_start = stamp
+            elif not is_lost and loss_start is not None:
+                loss_episodes.append((loss_start, stamp - loss_start))
+                loss_start = None
+        if loss_start is not None:
+            loss_episodes.append((loss_start,
+                                  node.odom[-1][0] - loss_start))
         out["odometry_while_moving"] = {
             "samples": len(node.odom),
-            "lost_fraction": round(lost / len(node.odom), 3),
+            "lost_updates": lost,
+            "lost_fraction": round(lost_fraction, 3),
+            "loss_episodes": len(loss_episodes),
+            "longest_loss_s": round(
+                max((duration for _, duration in loss_episodes), default=0.0),
+                2),
+            "loss_events": [
+                {
+                    "at_s": round(start - node.odom[0][0], 1),
+                    "duration_s": round(duration, 2),
+                }
+                for start, duration in loss_episodes[:20]
+            ],
             "inliers_mean": round(sum(inl) / len(inl)),
             "inliers_min": min(inl),
         }
@@ -255,6 +311,15 @@ def report(node, hold):
             f"{rs} large jumps in the RAW pose. VIO tracking was lost during "
             "the run. Loop closures will be rejected for graph error until "
             "this is fixed, and PX4 would see these steps directly.")
+    if lost_fraction:
+        loss = out["odometry_while_moving"]
+        verdict.append(
+            f"Tracking was lost for {100.0 * lost_fraction:.1f}% of odometry "
+            f"updates across {loss['loss_episodes']} episodes (longest "
+            f"{loss['longest_loss_s']:.2f} s). Invalid identity samples are "
+            "excluded from pose metrics; "
+            "with publish_null_when_lost=false the pose topic pauses instead. "
+            "This still fails the moving flight gate until dropouts are fixed.")
     r = out["raw_vio_pose_the_one_px4_uses"].get("return_to_origin_error_mm")
     if r is not None:
         verdict.append(f"Raw VIO returned to within {r} mm - this is the drift "

@@ -255,13 +255,13 @@ For the ROS-native carried run, pass `--raw-odom-topic
 
 #### Hand-carried loop-closure test
 
-Loop closure has never fired in any bench test — stationary, the SLAM correction
-stays identity, so the corrected-pose path and `cpp_slam_pose_relay`'s
-non-identity branch are unexercised outside unit tests. `scripts/loop_closure_test.py`
-records a carried loop and reports the return-to-origin error on the pose PX4
-consumes, how many closures fired, the map-to-odom correction magnitude, and the
-size of the jumps that feeding the corrected pose to EKF2 would have caused. No
-props are involved.
+The first tuned mono carry produced ten combined global-closure-or-proximity
+events; the revised harness now distinguishes the two. The corrected-pose path
+and `cpp_slam_pose_relay`'s non-identity branch remain unexercised on the
+ROS-native graph because that launch does not publish the relay topics.
+`scripts/loop_closure_test.py` records a carried loop and reports raw drift,
+tracking loss, closures, map-to-odom correction when available, and valid-pose
+discontinuities. No props are involved.
 
 Both stacks can be measured and compared. Both mappers do detect closures —
 `RTABMapSLAM` is RTAB-Map — but only the ROS one publishes `rtabmap_msgs/Info`,
@@ -725,11 +725,28 @@ therefore costs about 13 CPU points for 30% less RMS jitter and 65% more inliers
 it is close to the 0.52 mm DepthAI reference while the overall graph remains
 cheaper than the hybrid. Reducing features to 400 was slower (~6 Hz), so that is
 not a useful CPU lever. Startup and stationary gates pass; keep this experimental
-until it completes a hand-carried closed loop without a reset.
+until it completes a hand-carried closed loop without tracking loss.
+
+The first carried mono recording was stopped after 60 s. It produced 446 status
+samples at 7.4 Hz and ten combined closure-or-proximity events, but lost tracking
+for 12 updates (2.7%) in three episodes lasting approximately 0.2-1.1 s. Its six
+reported 0.4-1.18 m jumps were paired jumps to identity and back: RTAB-Map was
+publishing a null identity odometry message when `OdomInfo.lost=true`. They were
+not six odometry-frame resets (`Odom/ResetCountdown` was zero and the log has no
+automatic-reset event), so its jump/path/RMS metrics are contaminated. Its
+1.243 m hold error is also not a valid return-drift result because stopping at
+60 s left no controlled final 20 s stationary hold.
+
+The launch now suppresses null odometry with `publish_null_when_lost=false` and
+explicitly disables automatic reset. The harness excludes any historical
+same-stamp null messages and distinguishes global closures from proximity
+detections. Loss now appears as a pose-output pause instead of a teleport, which
+is safer but still fails the moving gate when it lasts about 1.1 s. A corrected
+full 180 s carry is required next.
 
 This has not flown. It has no PX4 connection, has not been compared against the
 DepthAI-host map on a moving trajectory, and has not yet completed a carried
-loop without a reset.
+loop without tracking loss.
 
 ##### Topologies that do not work on this driver
 
