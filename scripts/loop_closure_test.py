@@ -53,6 +53,13 @@ def mean_point(points):
     return tuple(sum(p[i] for p in points) / n for i in range(3))
 
 
+def rms_radius(points):
+    """3D RMS distance from the point-cloud mean."""
+    centre = mean_point(points)
+    return math.sqrt(sum(dist(point, centre) ** 2 for point in points)
+                     / len(points))
+
+
 class LoopClosureTest(Node):
     def __init__(self, args):
         super().__init__("loop_closure_test")
@@ -63,23 +70,25 @@ class LoopClosureTest(Node):
         self.closures = []     # (t, ref_id, loop_id, |transform|)
         self.odom = []         # (t, lost, inliers, features)
 
-        best = QoSProfile(depth=50, history=HistoryPolicy.KEEP_LAST,
-                          reliability=ReliabilityPolicy.BEST_EFFORT)
-        rel = QoSProfile(depth=50, history=HistoryPolicy.KEEP_LAST,
-                         reliability=ReliabilityPolicy.RELIABLE)
-        for qos in (best, rel):
+        # A best-effort reader is compatible with both best-effort sensor-data
+        # publishers and reliable publishers. Creating one reader of each kind
+        # would duplicate every sample from a reliable publisher and emit an
+        # incompatibility warning for every best-effort publisher.
+        qos = QoSProfile(depth=50, history=HistoryPolicy.KEEP_LAST,
+                         reliability=ReliabilityPolicy.BEST_EFFORT)
+        if args.raw_odom_topic:
+            self.create_subscription(Odometry, args.raw_odom_topic,
+                                     self._raw_odom_cb, qos)
+        else:
             self.create_subscription(PoseStamped, args.raw_pose_topic,
                                      self._raw_cb, qos)
-            if args.raw_odom_topic:
-                self.create_subscription(Odometry, args.raw_odom_topic,
-                                         self._raw_odom_cb, qos)
-            self.create_subscription(PoseStamped, args.pose_topic,
-                                     self._corrected_cb, qos)
-            self.create_subscription(PoseStamped, args.correction_topic,
-                                     self._correction_cb, qos)
-            self.create_subscription(Info, args.info_topic, self._info_cb, qos)
-            self.create_subscription(OdomInfo, args.odom_info_topic,
-                                     self._odom_cb, qos)
+        self.create_subscription(PoseStamped, args.pose_topic,
+                                 self._corrected_cb, qos)
+        self.create_subscription(PoseStamped, args.correction_topic,
+                                 self._correction_cb, qos)
+        self.create_subscription(Info, args.info_topic, self._info_cb, qos)
+        self.create_subscription(OdomInfo, args.odom_info_topic,
+                                 self._odom_cb, qos)
 
     def _pt(self, msg):
         p = msg.pose.position
@@ -133,11 +142,18 @@ def report(node, hold):
         end = [p for p in raw if raw[-1][0] - p[0] <= hold]
         travelled = sum(dist(raw[i][1:], raw[i + 1][1:])
                         for i in range(len(raw) - 1))
+        raw_points = [p[1:] for p in raw]
+        raw_steps = biggest_jumps(raw)
         out["raw_vio_pose_the_one_px4_uses"] = {
             "samples": len(raw),
             "duration_s": round(span, 1),
             "rate_hz": round((len(raw) - 1) / span, 1) if span else 0.0,
             "path_travelled_m": round(travelled, 2),
+            "net_displacement_mm": round(
+                1000.0 * dist(raw_points[0], raw_points[-1]), 2),
+            "rms_about_mean_mm": round(1000.0 * rms_radius(raw_points), 2),
+            "max_step_mm": raw_steps[0]["jump_mm"] if raw_steps else 0.0,
+            "largest_steps": raw_steps,
             "start_hold_samples": len(start),
             "end_hold_samples": len(end),
             "return_to_origin_error_mm": (

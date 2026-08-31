@@ -107,6 +107,14 @@ python3 scripts/loop_closure_test.py --label ros-native-mono --seconds 180 \
   --out /tmp/loop_ros_native_mono.json
 ```
 
+A 30 s stationary control of that exact mono graph passed before attempting
+motion: 288 raw samples at 10.0 Hz, 1.04 mm RMS about the mean, 1.02 mm net
+displacement, 4.10 mm largest step, 0.35 m accumulated sub-frame motion, zero
+lost samples, zero reset-sized jumps, and 197 mean / 169 minimum inliers. The
+start/end five-second means differed by 0.3 mm. This is stable, but its RMS and
+largest step are about twice the same-scene DepthAI reference; moving parity is
+still open. Report: `/tmp/loop_ros_native_mono_stationary_clean.json`.
+
 ## Measured CPU
 
 Per-process, sampled from `/proc` deltas over 20 s.
@@ -321,19 +329,20 @@ this visible without reading launch logs.
 
 ## Open gates before flight
 
-1. **VIO stability under motion.** The first carried run reset repeatedly, with
-   a 3.3 m jump and 620 mm return error. Everything else is blocked on this.
+1. **Mono VIO stability under motion.** The stationary mono control has no lost
+   samples or resets, but it has not been carried. The earlier RGB-profile
+   carried run reset repeatedly, with a 3.3 m jump and 620 mm return error.
 2. Re-run the loop-closure test once the VIO holds tracking, and confirm the
    ROS mapper accepts closures when the trajectory is consistent. The
    corrected-pose path and `cpp_slam_pose_relay`'s non-identity branch remain
    unexercised outside unit tests.
-2. Moving-scene CPU. Every CPU number here is stationary.
-3. Map quality against the DepthAI map on a real trajectory.
-4. `Grid/3D` differs by design: the DepthAI grid was 2D at 0.03 m for the
+3. Moving-scene CPU. Every CPU number here is stationary.
+4. Map quality against the DepthAI map on a real trajectory.
+5. `Grid/3D` differs by design: the DepthAI grid was 2D at 0.03 m for the
    planner, the ROS one is 3D at 0.05 m projected down. Verified to publish, not
    verified equivalent for the planner.
-5. Planner and follower have never run against the hybrid.
-6. Props-off, then flight.
+6. Planner and follower have never run against the hybrid.
+7. Props-off, then flight.
 
 ## Hand-carried loop-closure test
 

@@ -320,7 +320,7 @@ rtabmap-info /tmp/depthai_loop.db | grep -E "Neighbor:|Closure:"
 Hold still ~20 s, carry the drone slowly around a closed loop of a few metres
 with textured scenery in view, return it to the marked start in its original
 orientation, hold still ~20 s. A stationary control run reports
-`return_to_origin_error_mm: 0.1`, 0 closures and an identity correction, so a
+`return_to_origin_error_mm: 0.3`, 0 closures and no correction update, so a
 run that still shows 0 closures means the route had too little texture rather
 than that something is broken.
 
@@ -723,10 +723,17 @@ Reducing `vis_max_features` from 600 to 400 made this scene slower (~6 Hz), not
 faster. Startup is passed; keep this experimental until it also completes a
 hand-carried closed loop without a reset.
 
+A clean 30 s stationary control of the mono graph produced 288 raw odometry
+samples at 10.0 Hz, 1.04 mm RMS spread, 1.02 mm net displacement, a 4.10 mm
+largest step, no lost samples, no reset-sized jumps, and 197 mean / 169 minimum
+inliers. The start/end five-second means differed by 0.3 mm. This is stable but
+roughly twice the RMS jitter and worst step of the same-scene DepthAI reference,
+so it passes the stationary safety gate without yet proving moving parity. The
+report is `/tmp/loop_ros_native_mono_stationary_clean.json`.
+
 This has not flown. It has no PX4 connection, has not been compared against the
-DepthAI-host map on a moving trajectory, and startup IMU buffering still needs
-to be counted over the full 10-run gate.
-appear over a run.
+DepthAI-host map on a moving trajectory, and has not yet completed a carried
+loop without a reset.
 
 ##### Topologies that do not work on this driver
 
