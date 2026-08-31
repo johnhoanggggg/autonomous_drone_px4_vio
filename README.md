@@ -780,6 +780,15 @@ ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_mono.launch.py \
   vis_cor_type:=1 odom_bundle_adjustment:=0
 ```
 
+The 600/2000 moving screen still failed. It improved valid output from 19.1 s
+at 8.7 Hz to 27.1 s at 10.1 Hz, with no reset-sized jump, but then entered one
+32.59 s loss episode and left the final 32.85 s without a valid pose. The log
+continued receiving frames and spent about 95-100 ms processing each one, but
+registration quality remained zero; there was no USB, camera, IMU-sync or
+automatic-reset failure. Reducing descriptor count helps throughput but does
+not solve moving robustness. The optical-flow/no-BA comparison above is now
+the next required run.
+
 This has not flown. It has no PX4 connection, has not been compared against the
 DepthAI-host map on a moving trajectory, and has not yet completed a carried
 loop without tracking loss.

@@ -331,9 +331,15 @@ def report(node, hold, recording_start=None, recording_end=None):
     verdict = []
     corr = out.get("map_to_odom_correction", {})
     if not node.closures and not corr.get("correction_updates"):
-        verdict.append("NO closure and no correction update - the test proved "
-                       "nothing about closure; repeat with a more textured "
-                       "route.")
+        if lost_fraction:
+            verdict.append(
+                "NO closure and no correction update because raw odometry "
+                "failed before the route completed; this run evaluates "
+                "tracking robustness, not loop closure.")
+        else:
+            verdict.append(
+                "NO closure and no correction update - the test proved "
+                "nothing about closure; repeat with a more textured route.")
     elif not node.closures and corr.get("correction_updates"):
         verdict.append(
             f"{corr['correction_updates']} correction updates but no "
