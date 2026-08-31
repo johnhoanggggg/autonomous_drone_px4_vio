@@ -13,7 +13,10 @@
 ///    map solution the caller supplies, so a loop-closure correction moves the
 ///    pose and the route together instead of looking like cross-track error;
 ///  * a command chord must clear the full configured hard clearance, with the
-///    single exception of an escape that begins from a pose already inside it.
+///    single exception of an escape that begins from a pose already inside it;
+///  * the cross-track FAULT is measured on the raw projection and the cross-track
+///    RECOVERY on a low-passed one. Faulting must not lag, but recovery must not
+///    be resettable by a single noisy sample.
 
 #include <array>
 #include <cstdint>
@@ -218,7 +221,8 @@ public:
     double cross_track_resume = 0.05,
     double cross_track_recovery_time = 1.0,
     double arrival_tolerance = 0.12,
-    double arrival_release_tolerance = 0.20);
+    double arrival_release_tolerance = 0.20,
+    double cross_track_filter_time_constant = 0.30);
 
   void clear_path();
   void reset_route_progress();
@@ -266,6 +270,13 @@ public:
   [[nodiscard]] const Point2 & vio_displacement() const {return commanded_displacement_vio_;}
   [[nodiscard]] std::int32_t generation() const {return generation_;}
   [[nodiscard]] bool cross_track_latched() const {return cross_track_latched_;}
+  /// The low-passed cross-track the recovery gate tests, or no value before the
+  /// first update(). Published so a bag records why recovery did or did not
+  /// close, which the raw signal alone cannot show.
+  [[nodiscard]] const std::optional<double> & cross_track_filtered() const
+  {
+    return cross_track_filtered_;
+  }
   [[nodiscard]] bool at_goal() const {return at_goal_;}
   [[nodiscard]] bool escaping() const {return escaping_;}
 
@@ -280,6 +291,7 @@ private:
   double max_cross_track_;
   double cross_track_resume_;
   double cross_track_recovery_time_;
+  double cross_track_filter_time_constant_;
   double arrival_tolerance_;
   double arrival_release_tolerance_;
   std::vector<Point2> vio_points_;
@@ -294,6 +306,8 @@ private:
   bool cross_track_latched_{false};
   std::int32_t cross_track_fault_generation_{};
   double cross_track_recovery_elapsed_{};
+  // Low-passed cross-track, for the recovery gate only. See update().
+  std::optional<double> cross_track_filtered_;
   bool at_goal_{false};
   bool escaping_{false};
 };

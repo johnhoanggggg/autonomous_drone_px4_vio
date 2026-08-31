@@ -25,6 +25,7 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
 
 #include "offboard_hover_node.hpp"
@@ -81,6 +82,10 @@ public:
     map_timeout_ = declare_parameter<double>("map_timeout", 3.0);
     map_pose_timeout_ = declare_parameter<double>("map_pose_timeout", 1.0);
     planner_fault_land_time_ = declare_parameter<double>("planner_fault_land_time", 3.0);
+    // How long after the route is engaged a follower latch is held rather than
+    // counted towards a landing. Covers the post-climb settle; a latch that
+    // outlasts it lands as before.
+    route_entry_grace_ = declare_parameter<double>("route_entry_grace", 3.0);
     // Must match the follower's value: the two nodes have to agree on what
     // counts as an escape, or one proposes a chord the other vetoes.
     escape_minimum_improvement_ =
@@ -95,8 +100,10 @@ public:
     const auto command_acceleration =
       declare_parameter<double>("command_acceleration", 0.30);
     horizontal_feedforward_ = declare_parameter<bool>("horizontal_feedforward", true);
-    const auto corner_blending = declare_parameter<bool>("corner_blending", false);
-    const auto junction_deviation = declare_parameter<double>("junction_deviation", 0.05);
+    corner_blending_ = declare_parameter<bool>("corner_blending", false);
+    junction_deviation_ = declare_parameter<double>("junction_deviation", 0.05);
+    const auto corner_blending = corner_blending_;
+    const auto junction_deviation = junction_deviation_;
     const auto projection_tolerance =
       declare_parameter<double>("path_command_projection_tolerance", 0.05);
     const auto entry_tolerance =
@@ -105,7 +112,8 @@ public:
       declare_parameter<double>("path_command_connector_tolerance", 0.20);
     const auto suffix_tolerance =
       declare_parameter<double>("path_command_suffix_tolerance", 0.01);
-    const auto corner_tolerance = declare_parameter<double>("path_corner_tolerance", 0.05);
+    path_corner_tolerance_ = declare_parameter<double>("path_corner_tolerance", 0.05);
+    const auto corner_tolerance = path_corner_tolerance_;
     route_command_grace_ = declare_parameter<double>("route_command_grace", 2.0);
     replan_during_yaw_align_ = declare_parameter<bool>("replan_during_yaw_align", false);
     geofence_radius_ = declare_parameter<double>("geofence_radius", 1.0);
@@ -167,6 +175,23 @@ public:
       [this](std_msgs::msg::String::ConstSharedPtr msg) {on_follower_config(*msg);});
     route_status_pub_ = create_publisher<std_msgs::msg::String>(
       "/planner/flight/status", 10);
+    // Numeric companions to the status string. `route_status_text()` is
+    // rate-limited and deduplicated for the log; these are not, so a bag gets a
+    // real per-tick series instead of prose sampled at whatever rate the text
+    // happened to change.
+    command_speed_pub_ = create_publisher<std_msgs::msg::Float32>(
+      "/planner/flight/command_speed", 10);
+    path_offset_pub_ = create_publisher<std_msgs::msg::Float32>(
+      "/planner/flight/path_offset", 10);
+    joining_pub_ = create_publisher<std_msgs::msg::Bool>(
+      "/planner/flight/joining", 10);
+    // Latched, like /planner/config and /planner/follower/config, so a bag
+    // records what the adapter was configured to do even when the recorder
+    // started after the node did. Until this existed, corner_blending and the
+    // command limits were not recoverable from a flight at all.
+    flight_config_pub_ = create_publisher<std_msgs::msg::String>(
+      "/planner/flight/config", map_qos);
+    publish_flight_config();
 
     RCLCPP_WARN(
       get_logger(),
@@ -322,13 +347,13 @@ protected:
           horizontal_error_ && *horizontal_error_ <= pre_route_max_horizontal_error_;
         if (altitude_ok && horizontal_ok) {
           RCLCPP_WARN(get_logger(), "stable hover reached; enabling route command");
-          set_state(State::Route);
+          enter_route_state();
         } else if (t_ > climb_timeout_) {
           trigger_landing("climb timeout without stable pre-route hover");
         }
       } else if (t_ > climb_timeout_) {
         RCLCPP_WARN(get_logger(), "dry run: enabling route command without arming");
-        set_state(State::Route);
+        enter_route_state();
       }
       return true;
     }
@@ -337,9 +362,11 @@ protected:
     if (!fault) {
       const auto [command_fault, deferral] = update_route_command();
       if (command_fault) {
-        fault = command_fault;
+        fault = PlannerFault{*command_fault};
       } else if (deferral) {
-        fault = hold_route_command(*deferral);
+        if (const auto stall = hold_route_command(*deferral)) {
+          fault = PlannerFault{*stall};
+        }
       } else {
         clear_route_command_stall();
       }
@@ -352,6 +379,7 @@ protected:
       clear_planner_fault();
     }
     publish_setpoint(hover_height_, route_yaw());
+    publish_flight_telemetry();
 
     if (goal_reached_ && !fault && !route_command_holding_) {
       if (!goal_since_) {
@@ -531,7 +559,35 @@ private:
     }
   }
 
-  std::optional<std::string> planner_health_reason()
+  /// Why the adapter is holding, and whether that reason may end the flight.
+  ///
+  /// The distinction exists because the two are not equally urgent. A broken
+  /// stack cannot be waited out and the vehicle must come down. A follower that
+  /// has latched its own cross-track gate is a statement about a route, and
+  /// during the climb -- and the settle straight after it -- that route is one
+  /// the vehicle has not started flying. Both flights on 20260831 latched
+  /// exactly there, on the 0.3-0.4 m of lateral drift the climb puts in, with
+  /// 0.75 m of clearance to the nearest obstacle; the first ran its 6 s land
+  /// countdown down to 0.2 s remaining before the follower recovered.
+  enum class FaultKind
+  {
+    /// Missing publishers, stale topics, rejected configuration.
+    Hard,
+    /// The follower published valid=false.
+    FollowerLatch,
+  };
+
+  struct PlannerFault
+  {
+    // Implicit on purpose: every existing `return format(...)` in
+    // planner_health_reason() keeps meaning exactly what it meant, a hard fault.
+    PlannerFault(std::string text, FaultKind fault_kind = FaultKind::Hard)  // NOLINT
+    : reason(std::move(text)), kind(fault_kind) {}
+    std::string reason;
+    FaultKind kind{FaultKind::Hard};
+  };
+
+  std::optional<PlannerFault> planner_health_reason()
   {
     const double now = monotonic_time();
     const std::pair<const char *, const char *> required[] = {
@@ -557,7 +613,7 @@ private:
     // follower stops publishing displacement and goal state, so those go stale a
     // fraction of a second later and would otherwise overwrite the real reason.
     if (!follower_valid_) {
-      return std::string("follower validity is false");
+      return PlannerFault{"follower validity is false", FaultKind::FollowerLatch};
     }
     if (!goal_received_ || now - *goal_received_ > follower_timeout_) {
       return format("follower goal state stale for >%.2fs", follower_timeout_);
@@ -615,8 +671,8 @@ private:
     if (const auto reason = vio_fault_reason()) {
       return reason;
     }
-    if (const auto reason = planner_health_reason()) {
-      return reason;
+    if (const auto fault = planner_health_reason()) {
+      return fault->reason;
     }
     if (goal_reached_) {
       return std::string("planner goal is already reached; provide a new route");
@@ -667,6 +723,54 @@ private:
   }
 
   // --- status / holds ------------------------------------------------------
+  void publish_flight_config()
+  {
+    nlohmann::json config;
+    config["implementation"] = "cpp";
+    config["command_speed"] = limiter_->max_speed();
+    config["command_acceleration"] = limiter_->max_acceleration();
+    config["corner_blending"] = corner_blending_;
+    config["junction_deviation"] = junction_deviation_;
+    config["path_corner_tolerance"] = path_corner_tolerance_;
+    config["hover_height"] = hover_height_;
+    config["climb_rate"] = commanded_climb_rate_;
+    config["climb_leash"] = climb_leash_;
+    config["climb_release"] = climb_release_;
+    config["climb_timeout"] = climb_timeout_;
+    config["geofence_radius"] = geofence_radius_;
+    config["planner_fault_land_time"] = planner_fault_land_time_;
+    config["route_entry_grace"] = route_entry_grace_;
+    config["route_command_grace"] = route_command_grace_;
+    config["goal_hold_time"] = goal_hold_time_;
+    config["yaw_track"] = yaw_track_;
+    config["yaw_align_error_deg"] = degrees(yaw_align_error_);
+    config["yaw_resume_error_deg"] = degrees(yaw_resume_error_);
+    config["horizontal_feedforward"] = horizontal_feedforward_;
+    config["replan_during_yaw_align"] = replan_during_yaw_align_;
+    config["max_correction_m"] = max_correction_m_;
+    config["max_correction_yaw_deg"] = degrees(max_correction_yaw_);
+    config["auto_arm"] = auto_arm_;
+    std_msgs::msg::String msg;
+    msg.data = config.dump();
+    flight_config_pub_->publish(msg);
+  }
+
+  void publish_flight_telemetry()
+  {
+    std_msgs::msg::Float32 scalar;
+    scalar.data = static_cast<float>(
+      std::hypot(limiter_->velocity().first, limiter_->velocity().second));
+    command_speed_pub_->publish(scalar);
+    if (route_limiter_->path() && route_limiter_->position()) {
+      scalar.data = static_cast<float>(
+        route_limiter_->path()->project(*route_limiter_->position()).cross_track);
+      path_offset_pub_->publish(scalar);
+    }
+    std_msgs::msg::Bool flag;
+    flag.data = route_limiter_->joining();
+    joining_pub_->publish(flag);
+  }
+
   void publish_route_status(const std::string & text, const std::string & kind)
   {
     const double now = monotonic_time();
@@ -687,7 +791,7 @@ private:
     }
   }
 
-  void latch_fault_hold(const std::string & reason)
+  void latch_fault_hold(const PlannerFault & fault)
   {
     const double now = monotonic_time();
     if (!holding_for_fault_) {
@@ -702,16 +806,50 @@ private:
     if (!planner_fault_since_) {
       planner_fault_since_ = now;
     }
-    planner_fault_reason_text_ = reason;
+    planner_fault_reason_text_ = fault.reason;
+    // Hold the clock at zero rather than skipping the landing test, so the full
+    // countdown is available from the instant the grace ends -- a latch that
+    // outlives the settle still lands, it just does not inherit the seconds it
+    // spent being legitimately ignored.
+    const bool suppressed = fault.kind == FaultKind::FollowerLatch &&
+      follower_latch_countdown_suppressed(now);
+    if (suppressed) {
+      planner_fault_since_ = now;
+    }
     const double elapsed = now - *planner_fault_since_;
     publish_route_status(
+      suppressed ?
       format(
-        "HOLD planner fault: %s; land in %.1fs", reason.c_str(),
+        "HOLD planner fault: %s; land countdown held while the route settles",
+        fault.reason.c_str()) :
+      format(
+        "HOLD planner fault: %s; land in %.1fs", fault.reason.c_str(),
         std::max(0.0, planner_fault_land_time_ - elapsed)),
       "HOLD");
-    if (is_armed() && elapsed >= planner_fault_land_time_) {
-      trigger_landing("planner fault persisted: " + reason);
+    if (is_armed() && !suppressed && elapsed >= planner_fault_land_time_) {
+      trigger_landing("planner fault persisted: " + fault.reason);
     }
+  }
+
+  /// Whether a follower latch is currently allowed to run the land countdown.
+  ///
+  /// False during the climb, when the adapter publishes a fixed hover and does
+  /// not consume the route at all, and for `route_entry_grace_` after the route
+  /// is engaged, while the vehicle sheds the drift the climb put in. A hard
+  /// fault is never suppressed, and the vehicle still holds position either way
+  /// -- this governs only whether the hold escalates to a landing.
+  bool follower_latch_countdown_suppressed(double now) const
+  {
+    if (state_ == State::ClimbHold) {
+      return true;
+    }
+    return route_entered_ && (now - *route_entered_) < route_entry_grace_;
+  }
+
+  void enter_route_state()
+  {
+    route_entered_ = monotonic_time();
+    set_state(State::Route);
   }
 
   void clear_planner_fault()
@@ -1020,17 +1158,23 @@ private:
   std::string frame_id_;
   double follower_timeout_{}, correction_timeout_{}, path_timeout_{};
   double map_timeout_{}, map_pose_timeout_{};
-  double planner_fault_land_time_{}, goal_hold_time_{};
+  double planner_fault_land_time_{}, goal_hold_time_{}, route_entry_grace_{};
   double escape_minimum_improvement_{};
   double max_follower_displacement_{}, max_correction_m_{}, max_correction_yaw_{};
   bool horizontal_feedforward_{};
   double route_command_grace_{};
   bool replan_during_yaw_align_{};
+  bool corner_blending_{};
+  double junction_deviation_{}, path_corner_tolerance_{};
   double geofence_radius_{}, geofence_tolerance_{};
   double transit_horizontal_error_{}, pre_route_max_horizontal_error_{};
   bool yaw_track_{};
   double yaw_track_min_displacement_{}, yaw_track_deadband_{};
   double yaw_align_error_{}, yaw_resume_error_{};
+
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr command_speed_pub_, path_offset_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr joining_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr flight_config_pub_;
 
   std::unique_ptr<HorizontalCommandLimiter> limiter_;
   std::unique_ptr<PathCommandLimiter> route_limiter_;
@@ -1059,6 +1203,7 @@ private:
   std::optional<int> follower_occupied_threshold_;
   std::optional<double> follower_command_speed_;
   std::string follower_config_reason_{"not received"};
+  std::optional<double> route_entered_;
   std::optional<double> planner_fault_since_;
   std::string planner_fault_reason_text_;
   std::optional<double> route_command_stall_since_;

@@ -13,6 +13,12 @@ from px4_vio_bridge.path_follower import PositionRouteFollower
 
 
 TOLERANCE = 1.0e-9
+# The C++ follower low-passes cross-track for its recovery gate; the legacy
+# Python follower does not, and is not being taught to (new planner/follower
+# work is C++ only). Parity therefore covers the shared safety state machine
+# with the filter switched off -- CPP_ONLY_CONFIG below is added to the C++
+# side's scenario and withheld from the Python constructor. The filter itself is
+# covered by the RouteFollower.CrossTrackRecovery* gtests.
 DEFAULT_CONFIG = {
     "lookahead": 0.60,
     "max_carrot_speed": 0.20,
@@ -23,6 +29,10 @@ DEFAULT_CONFIG = {
     "arrival_tolerance": 0.12,
     "arrival_release_tolerance": 0.20,
 }
+
+# Keys the C++ follower accepts and the legacy Python one does not.
+CPP_ONLY_CONFIG = {"cross_track_filter_time_constant": 1.0e-9}
+DEFAULT_CONFIG.update(CPP_ONLY_CONFIG)
 
 
 def replay_binary():
@@ -77,7 +87,9 @@ def state_dict(follower):
 
 
 def run_python(scenario):
-    follower = PositionRouteFollower(**scenario["follower"])
+    follower = PositionRouteFollower(
+        **{k: v for k, v in scenario["follower"].items() if k not in CPP_ONLY_CONFIG}
+    )
     output = []
     for step in scenario["steps"]:
         op = step["op"]

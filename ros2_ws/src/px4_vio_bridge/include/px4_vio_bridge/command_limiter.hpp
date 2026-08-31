@@ -112,6 +112,9 @@ public:
   [[nodiscard]] const std::optional<Point2> & position() const {return position_;}
   [[nodiscard]] const Point2 & velocity() const {return velocity_;}
   [[nodiscard]] const std::optional<double> & waiting_vertex() const {return waiting_vertex_;}
+  /// True while the command point is rejoining a replacement path. Published so
+  /// a bag shows directly what used to have to be inferred from a speed dip.
+  [[nodiscard]] bool joining() const {return join_target_.has_value();}
   [[nodiscard]] double max_speed() const {return max_speed_;}
   [[nodiscard]] double max_acceleration() const {return max_acceleration_;}
 
@@ -121,6 +124,10 @@ private:
   [[nodiscard]] std::optional<double> shared_suffix_offset(const Polyline & new_path) const;
   void install(std::shared_ptr<const PathInstallation> installation, double progress);
   Point2 update_join(double dt, bool advance);
+  /// The on-path speed for this tick, shared by the advance and the join so a
+  /// lane change is braked by corners and the path end exactly as motion is.
+  double along_path_speed(double along, double dt, bool advance);
+  [[nodiscard]] Point2 path_tangent(double along) const;
   [[nodiscard]] double next_motion_target(double desired_progress) const;
   [[nodiscard]] double corner_speed(double turn) const;
   [[nodiscard]] double corner_speed_limit() const;
@@ -132,6 +139,10 @@ private:
   double max_entry_error_;
   double max_connector_error_;
   double suffix_tolerance_;
+  /// Cross-track at or below which a join is finished and the command point is
+  /// placed on the path. A tenth of a grid cell: small enough that snapping is
+  /// below the map's own resolution, large enough that the join terminates.
+  double join_tolerance_{0.003};
   bool corner_blending_;
   double junction_deviation_;
 

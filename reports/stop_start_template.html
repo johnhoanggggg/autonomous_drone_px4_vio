@@ -1,0 +1,294 @@
+<title>The 1.5 Second Rule</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<style>
+:root{
+  --bg:#EAECEF; --panel:#F6F7F8; --ink:#14171C; --ink-2:#3E4650; --mute:#7A838F;
+  --rule:#C9CFD6; --rule-soft:#DDE1E6;
+  --peach:#E9A575; --peachdeep:#B96A31;
+  --ok:#2E9E4F; --warn:#C98200; --crit:#CE3626; --xt:#B81F76; --corr:#3B72C4;
+  --measure:70ch;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#161A20; --panel:#1E232B; --ink:#E6E9ED; --ink-2:#B3BBC5; --mute:#7E8894;
+    --rule:#333B45; --rule-soft:#272E37; --peach:#E9A575; --peachdeep:#F0BE96;
+    --ok:#4FC46E; --warn:#E5A22B; --crit:#F2685A; --xt:#EE5AA8; --corr:#6FA3EE;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#161A20; --panel:#1E232B; --ink:#E6E9ED; --ink-2:#B3BBC5; --mute:#7E8894;
+  --rule:#333B45; --rule-soft:#272E37; --peach:#E9A575; --peachdeep:#F0BE96;
+  --ok:#4FC46E; --warn:#E5A22B; --crit:#F2685A; --xt:#EE5AA8; --corr:#6FA3EE;
+}
+*{box-sizing:border-box}
+body{background:var(--bg); color:var(--ink);
+  font-family:"Source Serif 4",Georgia,serif; font-size:17px; line-height:1.62; margin:0;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1000px; margin:0 auto; padding:0 28px 110px}
+.col{max-width:var(--measure)}
+h1,h2,h3,.eyebrow,.lbl,.val,.ax,.thr,th{font-family:Archivo,"Helvetica Neue",Arial,sans-serif}
+.mono,code,.ax,.thr,.eyebrow,td{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace}
+header.top{padding:60px 0 28px; border-bottom:2px solid var(--ink)}
+.kicker{font-family:"IBM Plex Mono",monospace; font-size:11.5px; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--peachdeep); font-weight:500}
+h1{font-size:clamp(36px,6vw,60px); line-height:1.02; letter-spacing:-.025em; font-weight:700;
+  margin:14px 0 0; text-wrap:balance; max-width:17ch}
+.dek{font-size:20px; line-height:1.5; color:var(--ink-2); margin:20px 0 0; max-width:60ch}
+section{margin-top:58px}
+.eyebrow{font-size:11.5px; letter-spacing:.16em; text-transform:uppercase; color:var(--mute);
+  font-weight:500; display:flex; align-items:center; gap:10px}
+.eyebrow::after{content:""; flex:1; height:1px; background:var(--rule-soft)}
+h2{font-size:clamp(25px,3.4vw,34px); line-height:1.14; letter-spacing:-.02em; font-weight:700;
+  margin:12px 0 0; text-wrap:balance}
+h3{font-size:19px; font-weight:600; margin:32px 0 0; letter-spacing:-.01em}
+p{margin:16px 0 0} p.lead{font-size:19px; color:var(--ink-2)}
+strong{font-weight:600}
+code{font-size:.87em; background:var(--panel); border:1px solid var(--rule-soft);
+  border-radius:3px; padding:1px 5px; color:var(--peachdeep)}
+:focus-visible{outline:2px solid var(--peachdeep); outline-offset:2px}
+.stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:1px;
+  background:var(--rule-soft); border:1px solid var(--rule-soft); margin-top:28px}
+.stat{background:var(--bg); padding:18px}
+.stat .k{font-family:"IBM Plex Mono",monospace; font-size:10.5px; letter-spacing:.11em;
+  text-transform:uppercase; color:var(--mute)}
+.stat .v{font-family:Archivo,sans-serif; font-weight:700; font-size:31px; letter-spacing:-.03em;
+  margin-top:7px; font-variant-numeric:tabular-nums; line-height:1}
+.stat .v small{font-size:15px; font-weight:500; color:var(--mute)}
+.stat .c{font-size:13.5px; color:var(--ink-2); margin-top:6px; line-height:1.4}
+figure{margin:30px 0 0}
+.fig-body{background:var(--panel); border:1px solid var(--rule-soft); padding:18px 20px}
+figcaption{font-size:14px; color:var(--ink-2); margin-top:10px; max-width:78ch; line-height:1.5}
+figcaption b{font-family:Archivo,sans-serif; font-weight:600; color:var(--ink); font-size:13px;
+  letter-spacing:.02em; text-transform:uppercase; margin-right:7px}
+svg{display:block; width:100%; height:auto}
+.ax{font-size:10.5px; fill:var(--mute)} .thr{font-size:10.5px; font-weight:500; fill:var(--crit)}
+.lbl{font-size:12.5px; fill:var(--ink-2); font-family:"IBM Plex Mono",monospace}
+.val{font-size:12.5px; fill:var(--ink); font-weight:600; font-family:"IBM Plex Mono",monospace}
+.maps{display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:30px}
+.maps img{width:100%; height:auto; display:block; background:#2C333C}
+pre{background:var(--panel); border:1px solid var(--rule-soft); padding:14px 16px; overflow-x:auto;
+  font-family:"IBM Plex Mono",monospace; font-size:13px; line-height:1.55; margin:20px 0 0}
+pre b{color:var(--crit); font-weight:600}
+.tw{overflow-x:auto; margin-top:24px; border:1px solid var(--rule-soft)}
+table{border-collapse:collapse; width:100%; min-width:600px; background:var(--panel)}
+th,td{text-align:left; padding:11px 15px; border-bottom:1px solid var(--rule-soft); font-size:14px}
+th{font-size:10.5px; letter-spacing:.11em; text-transform:uppercase; color:var(--mute);
+  font-weight:600; background:var(--bg); border-bottom:1px solid var(--rule); white-space:nowrap}
+td{font-family:"IBM Plex Mono",monospace; font-size:13px; vertical-align:top}
+td.why{font-family:"Source Serif 4",serif; font-size:14.5px; color:var(--ink-2); line-height:1.45}
+tr:last-child td{border-bottom:0}
+ol.steps{counter-reset:s; list-style:none; padding:0; margin:24px 0 0}
+ol.steps li{counter-increment:s; position:relative; padding:0 0 0 44px; margin-top:22px;
+  max-width:var(--measure)}
+ol.steps li::before{content:counter(s); position:absolute; left:0; top:1px;
+  font-family:"IBM Plex Mono",monospace; font-size:12px; font-weight:600; color:var(--peachdeep);
+  border:1px solid var(--peach); width:26px; height:26px; display:grid; place-items:center}
+ol.steps b{font-family:Archivo,sans-serif; font-weight:600; font-size:16px; display:block}
+.note{border-left:3px solid var(--crit); padding:4px 0 4px 18px; margin-top:24px;
+  max-width:var(--measure)}
+.note .t{font-family:Archivo,sans-serif; font-weight:600; font-size:13px; text-transform:uppercase;
+  letter-spacing:.06em; color:var(--crit)}
+footer{margin-top:70px; padding-top:22px; border-top:2px solid var(--ink);
+  font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--mute); line-height:1.75}
+footer b{color:var(--ink-2); font-weight:500}
+@media (max-width:720px){.maps{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+<header class="top">
+  <div class="kicker">Three flights &middot; 2026-08-31 06:41, 06:42, 06:48 UTC</div>
+  <h1>Leave a path alone for 1.5 seconds and it flies at full speed.</h1>
+  <p class="dek">It almost never gets 1.5 seconds. The stopping and starting is not a
+  fault, a corner, or a yaw pause &mdash; it is the command limiter zeroing its speed
+  every time a replacement path arrives, roughly once a second.</p>
+</header>
+
+<section>
+  <div class="eyebrow">The measurement</div>
+  <h2>Nothing is wrong when it stops</h2>
+  <div class="col">
+    <p class="lead">Across the three flights there are 27 discrete stops &mdash; commanded
+    speed falling below 0.05 m/s. <strong>24 of them begin while the adapter is in
+    <code>ROUTE</code> and the follower is <code>FOLLOWING</code> and valid.</strong> No
+    clearance event, no cross-track fault, no yaw alignment, no corner hold. The carrot is
+    sitting at a median 0.250 m against a 0.25 m lookahead, so the follower is asking for
+    exactly what it should.</p>
+    <p><strong>20 of the 27 begin within 0.6 s of a path rebuild.</strong> That is the
+    whole story, and the chart below is the proof.</p>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="k">Stops with nothing faulted</div><div class="v">24<small> / 27</small></div>
+      <div class="c">adapter ROUTE, follower FOLLOWING</div></div>
+    <div class="stat"><div class="k">Within 0.6 s of a rebuild</div><div class="v">20<small> / 27</small></div>
+      <div class="c">3/5, 8/12, 9/10 by flight</div></div>
+    <div class="stat"><div class="k">Path rebuild rate</div><div class="v">1.1<small>/s</small></div>
+      <div class="c">one every 0.84–0.95 s</div></div>
+    <div class="stat"><div class="k">Speed actually used</div><div class="v">57–62<small>%</small></div>
+      <div class="c">of the 0.20 m/s ceiling</div></div>
+  </div>
+
+  <figure>
+    <div class="fig-body">{{CHART1}}</div>
+    <figcaption><b>Fig 1</b> Mean commanded speed, binned by how long ago the last path
+    arrived. All three flights do the same thing: a dip bottoming at 0.4&ndash;0.9 s, then
+    recovery. In the <b>1.5 s +</b> bin the 06:48 flight averages <b>0.199 m/s</b> &mdash;
+    the ceiling, to three decimals. The drone can fly this corridor at full speed. It is
+    only ever allowed to for about a third of its samples.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <div class="eyebrow">The mechanism</div>
+  <h2>A replacement path sets the command speed to zero</h2>
+  <div class="col">
+    <p><code>PathCommandLimiter::set_path</code> has two ways to install a new route. If
+    the geometry ahead of the command point is <em>identical</em>, the shared-suffix branch
+    renumbers the arc length and keeps the speed. Otherwise it takes the join branch:</p>
+  </div>
+  <pre>if (projection.cross_track &gt; kEpsilon) {
+    join_target_ = projection.point;
+    join_limit_  = limit;
+    <b>speed_ = 0.0;</b>            // command point restarts from rest
+} else {
+    position_ = projection.point;
+    speed_ = std::min(max_speed_, std::hypot(velocity_.first, velocity_.second));
+}</pre>
+  <div class="col">
+    <p>A replanned route is essentially never bit-identical through the standing command
+    point, so <code>kEpsilon</code> is not a meaningful escape hatch &mdash; the join branch
+    is the normal case. The command point then re-accelerates from zero at
+    <code>command_acceleration</code> 0.30 m/s&sup2;, needing <b>0.67 s</b> to reach
+    0.20 m/s, and crawls through the bounded join band before it can advance along the path
+    at all. That is the dip in Fig 1, and it lands squarely on top of the next rebuild.</p>
+    <p>The join itself is not gratuitous: it exists so an offset path is rejoined under the
+    speed limit rather than snapped to. But zeroing the speed to do it is a much stronger
+    measure than the geometry requires, and it is applied on every replan.</p>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">My fault</div>
+  <h2>I doubled the rebuild rate last night</h2>
+  <div class="col">
+    <p>Fixing F3 I dropped <code>path_retain_tolerance</code> from 0.12 m to 0.04 m so a
+    loop-closure correction would replan instead of faulting. It does. It also makes the
+    planner replace the accepted route far more eagerly.</p>
+  </div>
+  <figure>
+    <div class="fig-body">{{CHART2}}</div>
+    <figcaption><b>Fig 2</b> Path rebuilds per second, before and after. The green line is
+    one rebuild per 0.67 s ramp time &mdash; above it the command point cannot reach cruise
+    between interruptions. All three of last night's flights sit above it; none of the
+    earlier ones did.</figcaption>
+  </figure>
+  <div class="note">
+    <div class="t">In fairness to the change</div>
+    <p style="margin-top:6px">End-to-end goal closure did not get worse: 0.044 / 0.030 /
+    0.058 m/s before, 0.030 / 0.046 / 0.048 m/s after, and the fraction of maximum speed
+    went <em>up</em> slightly (42&ndash;59% to 57&ndash;62%). The doubling did not cost
+    measurable throughput. It is still the wrong direction, and it is the cheapest lever
+    available &mdash; but it is not, on its own, why the drone is slow. The join is.</p>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">The other change I made</div>
+  <h2>Raising the safety margin closed a neck</h2>
+  <div class="maps">
+    <figure style="margin:0">
+      <img src="{{IMG_OK}}" alt="06:42:36 flight, long green run down the corridor to the goal">
+      <figcaption><b>06:42:36 — reached the goal</b> 3.98 m of progress, remaining 2.61 →
+      0.10 m. Only 8.8% of this track was inside the 0.30 m requirement.</figcaption>
+    </figure>
+    <figure style="margin:0">
+      <img src="{{IMG_STUCK}}" alt="06:48:28 flight, stalled at the neck short of the goal">
+      <figcaption><b>06:48:28 — stalled at the neck</b> Goal is the orange dot across the
+      room. <b>44%</b> of this track was inside the requirement; it ended
+      <code>CLEARANCE_ESCAPING</code> at 0.266 m with the land countdown at 2.5 s.</figcaption>
+    </figure>
+  </div>
+  <div class="col">
+    <p><code>safety_margin</code> 0.00 → 0.05 raises <code>lethal_radius</code> to 0.30 m.
+    That bought real contact margin, and it cost 16&ndash;25% of the navigable area
+    (4.50 → 3.78 m&sup2; on one map, 2.77 → 2.07 m&sup2; on the other). On 06:48 the pinch
+    the vehicle needed measures 0.266&ndash;0.294 m &mdash; passable at the old 0.25 m
+    requirement, not at the new one. Three <code>CLEARANCE_BLOCKED</code> events across the
+    two later flights fired with the <em>pose</em> at 0.35&ndash;0.42 m, well clear: it was
+    the chord to the lookahead that could not fit, not the vehicle.</p>
+    <p>This is a genuine trade and it is yours to make, not mine. 0.05 m of margin is the
+    difference between "the airframe may reach 0.03 m inside an obstacle" and closing a
+    doorway this environment actually has.</p>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">What to change</div>
+  <h2>In this order</h2>
+  <ol class="steps">
+    <li><b>Carry speed through the join.</b> In the join branch, seed <code>speed_</code>
+    from the current command velocity instead of zero, clamped by what the join band and
+    the clearance check already permit. This is the change that makes rebuild rate stop
+    mattering, and it is the one that makes the drone fly through rather than stutter.
+    It touches a safety-relevant limiter, so it wants its own tests and a props-off run.</li>
+    <li><b>Then reconsider the cross-track budget as a set.</b> With the join fixed,
+    <code>path_retain_tolerance</code> can stay low without costing speed. Without it,
+    raising retain back toward 0.06 buys a little and is capped by the
+    <code>retain &lt; max_cross_track</code> invariant I put in the launch guard &mdash;
+    which is itself only tight because I set <code>max_cross_track</code> to 0.08.</li>
+    <li><b>Decide the margin deliberately.</b> Either accept 0.03 m of possible penetration
+    and go back to a 0.25&ndash;0.28 m lethal radius so the necks in this space are
+    flyable, or keep 0.30 m and accept that some doorways here are not autonomous routes.
+    Both are defensible; drifting between them is not.</li>
+  </ol>
+</section>
+
+<section>
+  <div class="eyebrow">Working as intended</div>
+  <h2>What last night's fixes did</h2>
+  <div class="col">
+    <p>The climb-phase grace fires and is visible in the bags: <code>HOLD planner fault:
+    follower validity is false; land countdown held while the route settles</code> at 6.04 s
+    and 11.04 s on the 06:41 flight, where the old build would have been six seconds from a
+    landing. The 06:42 flight reached its goal. Minimum pose clearance across the three was
+    0.214&ndash;0.263 m with the required 0.30 m &mdash; tight, but no contact: peak lateral
+    acceleration stayed inside the normal envelope on all three.</p>
+    <p>The cost is visible too. At <code>max_cross_track</code> 0.08 the 06:42 flight took
+    six <code>CROSS_TRACK_EXCEEDED</code> events it would not have taken at 0.15. That was
+    predicted and it is survivable now that a fault no longer runs the land clock during the
+    settle &mdash; but it is the reason step 2 above is a set, not a single number.</p>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">Observability</div>
+  <h2>What the bag should record and doesn't</h2>
+  <div class="tw">
+  <table>
+    <thead><tr><th>Add</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>keep recording<br>until disarm</td><td class="why">The single biggest gap. The 03:37 flight's four door-frame impacts happen three seconds after its bag ends, and last night's 06:48 bag is also truncated. Whatever else changes, the recorder should outlive the flight.</td></tr>
+      <tr><td>/planner/flight/config</td><td class="why">The flight adapter publishes exactly one topic — a String status. <code>corner_blending</code>, <code>command_speed</code>, <code>command_acceleration</code>, <code>route_entry_grace</code>, <code>yaw_rate_deg</code> and the climb parameters are invisible in the bag. The planner and follower already publish latched JSON; the adapter should match them.</td></tr>
+      <tr><td>/planner/flight/joining<br>(Bool)</td><td class="why">Whether the command limiter is in a join. This whole report had to infer that signal from a speed dip. One boolean would have made Fig 1 unnecessary.</td></tr>
+      <tr><td>/planner/flight/command_speed<br>(Float32)</td><td class="why">Currently only available by regex-scraping prose out of the status string. Same for <code>path_offset</code> and <code>displacement</code>.</td></tr>
+      <tr><td>/planner/follower/cross_track_filtered</td><td class="why">The low-passed value that now drives the recovery gate. Without it you cannot tell from a bag why recovery did or did not close.</td></tr>
+      <tr><td>/fmu/out/vehicle_acceleration</td><td class="why">The filtered lateral signal that makes an impact obvious. <code>sensor_combined</code> is already recorded and carries the raw data, but this is the one worth plotting.</td></tr>
+      <tr><td style="color:var(--crit)">drop or fix<br>estimator_status_flags</td><td class="why"><code>/fmu/out/estimator_status_flags</code> is subscribed and records <b>zero</b> messages — PX4 is not publishing it. EKF innovations and test ratios are absent from the bag and the ULog both, which is why VIO fusion health cannot be checked at all right now.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<footer>
+  <b>Bags</b> ros2_ws/flight_logs/offboard_global_20260831T064152Z, ...T064236Z, ...T064828Z<br>
+  <b>Analysis</b> scripts/analyze_route_stalls.py &lt;bag&gt; &nbsp;&middot;&nbsp;
+  scripts/render_flight_map.py &lt;bag&gt; --clearance 0.30 --events<br>
+  <b>This page</b> reports/build_stop_start_report.py<br>
+  <b>Stop</b> commanded speed below 0.05 m/s &nbsp;&middot;&nbsp;
+  <b>rebuild</b> a change in /planner/follower/path_generation<br>
+  <b>Corridor figures</b> distance transform on the final grid, with unknown treated as blocked
+</footer>
+</div>

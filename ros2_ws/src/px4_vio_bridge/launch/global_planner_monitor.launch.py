@@ -7,6 +7,7 @@ from launch.actions import (
     ExecuteProcess,
     GroupAction,
     LogInfo,
+    OpaqueFunction,
     RegisterEventHandler,
     TimerAction,
 )
@@ -21,6 +22,73 @@ from px4_vio_bridge.log_paths import timestamped_bag
 
 def typed(name, value_type):
     return ParameterValue(LaunchConfiguration(name), value_type=value_type)
+
+
+def check_clearance_budget(context, *args, **kwargs):
+    """Refuse to start a combination of tolerances that cannot be flown.
+
+    These four numbers are declared in one file but consumed by two nodes, and
+    nothing at runtime compares them. The two flights on 20260831 were flown at
+    max_cross_track 0.15 with path_retain_tolerance 0.12 and safety_margin 0.00,
+    which is:
+
+      * a 0.03 m band between "rebuild the path" and "fault", narrower than a
+        single measured loop-closure correction (118 mm), so a correction
+        faulted where it should have replanned; and
+      * permission for the airframe to sit 0.15 m inside an obstacle, in a
+        corridor whose narrowest gap left 0.09 m of slack per side.
+
+    Checked at launch because that is the only place both nodes' parameters are
+    visible at once.
+    """
+    def value(name):
+        return float(LaunchConfiguration(name).perform(context))
+
+    max_cross_track = value("max_cross_track")
+    retain = value("path_retain_tolerance")
+    resume = value("cross_track_resume")
+    margin = value("safety_margin")
+    radius = value("robot_radius")
+
+    errors = []
+    if resume >= max_cross_track:
+        errors.append(
+            f"cross_track_resume ({resume:.3f}) must be below "
+            f"max_cross_track ({max_cross_track:.3f}); recovery could never close"
+        )
+    if retain >= max_cross_track:
+        errors.append(
+            f"path_retain_tolerance ({retain:.3f}) must be below "
+            f"max_cross_track ({max_cross_track:.3f}); the follower would fault "
+            f"before the planner rebuilt the path"
+        )
+    if errors:
+        return [LogInfo(msg="ERROR: " + e) for e in errors] + [
+            EmitEvent(event=Shutdown(reason="clearance budget is not flyable"))
+        ]
+
+    messages = []
+    if margin < max_cross_track:
+        # A trade, not a bug: raising the margin costs corridor width. State the
+        # penetration it buys so the number is chosen rather than inherited.
+        # Worst case the vehicle centre sits (lethal_radius - max_cross_track)
+        # from an obstacle, so the airframe is inside it by
+        # robot_radius - (lethal_radius - max_cross_track), which reduces to
+        # max_cross_track - safety_margin.
+        messages.append(LogInfo(msg=(
+            f"clearance budget: contact is POSSIBLE -- the airframe may reach "
+            f"{max_cross_track - margin:.3f} m inside an obstacle "
+            f"(max_cross_track {max_cross_track:.2f} - safety_margin {margin:.2f}); "
+            f"worst-case centre-to-obstacle {radius + margin - max_cross_track:.3f} m "
+            f"against a {radius:.2f} m airframe radius. "
+            f"safety_margin >= max_cross_track is what makes contact impossible."
+        )))
+    messages.append(LogInfo(msg=(
+        f"clearance budget: min plannable gap {2 * (radius + margin):.2f} m, "
+        f"replan at {retain:.2f} m, fault at {max_cross_track:.2f} m, "
+        f"resume below {resume:.2f} m"
+    )))
+    return messages
 
 
 def recorder_exited(event, _context):
@@ -76,6 +144,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("occupied_threshold", default_value="65"),
         DeclareLaunchArgument("robot_radius", default_value="0.25"),
+        # Tight-space profile, chosen 2026-08-31 after the 064x flights. At
+        # 0.30 m of lethal radius the neck on 20260831T064828Z (0.266-0.294 m of
+        # clearance) is not routable and 44% of that flight's track sat inside
+        # the requirement; back at 0.25 m the necks and the 0.68 m doorway are
+        # both flyable. The cost is that contact stays possible: worst case the
+        # airframe reaches max_cross_track (0.08 m) inside an obstacle, about
+        # half the 0.15 m budget it hit the door frame under on 20260831T033736Z.
         DeclareLaunchArgument("safety_margin", default_value="0.00"),
         DeclareLaunchArgument("inflation_extra", default_value="0.25"),
         DeclareLaunchArgument("start_recovery_radius", default_value="0.30"),
@@ -88,15 +163,26 @@ def generate_launch_description():
         DeclareLaunchArgument("min_lookahead", default_value="0.05"),
         DeclareLaunchArgument("max_carrot_speed", default_value="0.20"),
         DeclareLaunchArgument("max_carrot_acceleration", default_value="0.30"),
-        DeclareLaunchArgument("max_cross_track", default_value="0.15"),
-        DeclareLaunchArgument("cross_track_resume", default_value="0.06"),
-        DeclareLaunchArgument("cross_track_recovery_time", default_value="1.0"),
+        # The corridor, not comfort, sets this. At lethal_radius 0.30 the
+        # doorway leaves 0.09 m of slack per side, and the old 0.15 m budget was
+        # wider than the gap. It is also below the airframe's own p90 horizontal
+        # hold error (0.15-0.16 m on 20260831), so faults get MORE frequent, not
+        # less -- that is only tenable with the climb-phase grace and the
+        # filtered recovery gate below.
+        DeclareLaunchArgument("max_cross_track", default_value="0.08"),
+        DeclareLaunchArgument("cross_track_resume", default_value="0.04"),
+        DeclareLaunchArgument("cross_track_recovery_time", default_value="0.6"),
+        # Applies to the recovery gate only, never to the fault threshold.
+        DeclareLaunchArgument("cross_track_filter_time_constant", default_value="0.30"),
         DeclareLaunchArgument("vio_timeout", default_value="0.5"),
         DeclareLaunchArgument("correction_timeout", default_value="1.0"),
         DeclareLaunchArgument("max_correction_m", default_value="1.0"),
         DeclareLaunchArgument("max_correction_yaw_deg", default_value="10.0"),
         DeclareLaunchArgument("switch_improvement", default_value="0.10"),
-        DeclareLaunchArgument("path_retain_tolerance", default_value="0.12"),
+        # Must stay a full correction jump below max_cross_track, or a loop
+        # closure faults instead of replanning. Measured material corrections
+        # reached 118 mm on 20260831T033557Z.
+        DeclareLaunchArgument("path_retain_tolerance", default_value="0.04"),
         DeclareLaunchArgument("path_head_margin", default_value="0.50"),
         # Distinct occupancy grids that must agree before a semantic mode change
         # (PATH_VALID / SAFE_APPROACH / EXPLORING) is committed. Counted on map
@@ -172,6 +258,8 @@ def generate_launch_description():
         "max_cross_track": typed("max_cross_track", float),
         "cross_track_resume": typed("cross_track_resume", float),
         "cross_track_recovery_time": typed("cross_track_recovery_time", float),
+        "cross_track_filter_time_constant": typed(
+            "cross_track_filter_time_constant", float),
         "vio_timeout": typed("vio_timeout", float),
         "correction_timeout": typed("correction_timeout", float),
         "max_correction_m": typed("max_correction_m", float),
@@ -259,6 +347,7 @@ def generate_launch_description():
         actions=[follower, cpp_follower],
     )])
     return LaunchDescription(args + [
+        OpaqueFunction(function=check_clearance_budget),
         LogInfo(msg="global planner monitor is observation only; it cannot command PX4"),
         LogInfo(
             msg=["A* planner: C++ (cpp_astar_planner). cpp_astar=",

@@ -50,6 +50,7 @@ FLIGHT_RECORD_TOPICS = (
     "/fmu/out/estimator_status_flags",
     "/fmu/out/failsafe_flags",
     "/fmu/out/sensor_combined",
+    "/fmu/out/vehicle_acceleration",
     "/fmu/out/vehicle_attitude",
     "/fmu/out/vehicle_command_ack",
     "/fmu/out/vehicle_control_mode",
@@ -87,6 +88,8 @@ FLIGHT_RECORD_TOPICS = (
     "/planner/follower/carrot",
     "/planner/follower/config",
     "/planner/follower/cross_track",
+    # The low-passed value the recovery gate actually tests.
+    "/planner/follower/cross_track_filtered",
     "/planner/follower/displacement",
     "/planner/follower/goal_reached",
     "/planner/follower/lookahead",
@@ -98,6 +101,14 @@ FLIGHT_RECORD_TOPICS = (
     "/planner/follower/valid",
     "/planner/follower/vio_displacement",
     "/planner/flight/status",
+    # Numeric companions to the status string, so an analysis does not have to
+    # regex prose out of it, plus the adapter's own effective configuration --
+    # corner_blending, the command limits and the climb parameters were
+    # previously invisible in a bag.
+    "/planner/flight/config",
+    "/planner/flight/command_speed",
+    "/planner/flight/path_offset",
+    "/planner/flight/joining",
     "/planner/flight/teleop",
     # Non-commanding C++ clearance shadow. Absent unless cpp_shadow:=true,
     # but keeping them listed makes a parity run self-contained.
@@ -251,11 +262,17 @@ def generate_launch_description():
         DeclareLaunchArgument("replan_during_yaw_align", default_value="false"),
         DeclareLaunchArgument("geofence_radius", default_value="3.0"),
         DeclareLaunchArgument("planner_fault_land_time", default_value="6.0"),
+        # A follower cross-track latch is held, not counted toward a landing,
+        # while the vehicle sheds the lateral drift the climb puts in.
+        DeclareLaunchArgument("route_entry_grace", default_value="3.0"),
         DeclareLaunchArgument("map_pose_topic", default_value="/rtabmap/body_pose"),
         DeclareLaunchArgument("goal_hold_time", default_value="3.0"),
         DeclareLaunchArgument("max_correction_m", default_value="1.0"),
         DeclareLaunchArgument("max_correction_yaw_deg", default_value="10.0"),
-        DeclareLaunchArgument("min_vio_features", default_value="80"),
+        # Flight 20260831T033736Z ran below 200 features for 42% of its samples
+        # in the doorway approach with nothing raised. Hold rather than commit
+        # into a narrow gap when the tracker is starving.
+        DeclareLaunchArgument("min_vio_features", default_value="150"),
         DeclareLaunchArgument("vio_feature_loss_time", default_value="0.25"),
         DeclareLaunchArgument("max_horizontal_error", default_value="0.35"),
         DeclareLaunchArgument("transit_horizontal_error", default_value="0.60"),
@@ -314,6 +331,7 @@ def generate_launch_description():
         "replan_during_yaw_align": typed("replan_during_yaw_align", bool),
         "geofence_radius": typed("geofence_radius", float),
         "planner_fault_land_time": typed("planner_fault_land_time", float),
+        "route_entry_grace": typed("route_entry_grace", float),
         "map_pose_topic": LaunchConfiguration("map_pose_topic"),
         "goal_hold_time": typed("goal_hold_time", float),
         "max_correction_m": typed("max_correction_m", float),
@@ -376,8 +394,16 @@ def generate_launch_description():
         ],
         name="global_planner_flight_recorder",
         output="screen",
-        sigterm_timeout="20",
-        sigkill_timeout="20",
+        # A bag whose metadata.yaml is 0 bytes was SIGKILLed before it could
+        # write the footer -- it needs `ros2 bag reindex <dir> -s mcap` to open
+        # and loses the tail of the flight. Both 20260831T033736Z and
+        # T064828Z ended that way, and the first of those hid four door-frame
+        # impacts that happened three seconds after its last recorded message.
+        # Finalizing competes for cores that RTAB-Map VIO and SLAM already pin,
+        # so the old 20 s was not a generous allowance. Landing takes far longer
+        # than this costs.
+        sigterm_timeout="90",
+        sigkill_timeout="90",
         condition=IfCondition(LaunchConfiguration("record_bag")),
     )
     # Started with the recorder rather than with the flight node, so the CPU /

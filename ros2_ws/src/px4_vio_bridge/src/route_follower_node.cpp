@@ -191,6 +191,10 @@ public:
     cross_track_resume_ = declare_parameter<double>("cross_track_resume", 0.05);
     cross_track_recovery_time_ =
       declare_parameter<double>("cross_track_recovery_time", 1.0);
+    // Applies to the recovery gate only; the fault threshold stays on the raw
+    // projection. See PositionRouteFollower::update().
+    cross_track_filter_time_constant_ =
+      declare_parameter<double>("cross_track_filter_time_constant", 0.30);
     path_start_tolerance_ = declare_parameter<double>("path_start_tolerance", 0.75);
     arrival_tolerance_ = declare_parameter<double>("arrival_tolerance", 0.12);
     arrival_release_tolerance_ =
@@ -241,7 +245,7 @@ public:
     follower_ = std::make_unique<PositionRouteFollower>(
       lookahead_, max_carrot_speed_, max_carrot_acceleration_, max_cross_track_,
       cross_track_resume_, cross_track_recovery_time_, arrival_tolerance_,
-      arrival_release_tolerance_);
+      arrival_release_tolerance_, cross_track_filter_time_constant_);
     last_tick_ = monotonic_seconds();
 
     const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -296,6 +300,8 @@ public:
     remaining_pub_ = create_publisher<std_msgs::msg::Float32>("/planner/follower/remaining", 10);
     cross_track_pub_ =
       create_publisher<std_msgs::msg::Float32>("/planner/follower/cross_track", 10);
+    cross_track_filtered_pub_ = create_publisher<std_msgs::msg::Float32>(
+      "/planner/follower/cross_track_filtered", 10);
     generation_pub_ =
       create_publisher<std_msgs::msg::Int32>("/planner/follower/path_generation", 10);
     markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -337,6 +343,7 @@ private:
       {"max_carrot_acceleration", max_carrot_acceleration_},
       {"max_cross_track", max_cross_track_}, {"cross_track_resume", cross_track_resume_},
       {"cross_track_recovery_time", cross_track_recovery_time_},
+      {"cross_track_filter_time_constant", cross_track_filter_time_constant_},
       {"path_start_tolerance", path_start_tolerance_},
       {"arrival_tolerance", arrival_tolerance_},
       {"arrival_release_tolerance", arrival_release_tolerance_},
@@ -749,6 +756,10 @@ private:
     scalar.data = static_cast<float>(result.path_progress); path_progress_pub_->publish(scalar);
     scalar.data = static_cast<float>(result.remaining); remaining_pub_->publish(scalar);
     scalar.data = static_cast<float>(result.cross_track); cross_track_pub_->publish(scalar);
+    if (const auto & filtered = follower_->cross_track_filtered()) {
+      scalar.data = static_cast<float>(*filtered);
+      cross_track_filtered_pub_->publish(scalar);
+    }
     std_msgs::msg::Int32 generation;
     generation.data = result.generation;
     generation_pub_->publish(generation);
@@ -780,6 +791,7 @@ private:
   double robot_radius_{}, safety_margin_{}, required_clearance_{};
   double max_carrot_speed_{}, max_carrot_acceleration_{}, max_cross_track_{};
   double cross_track_resume_{}, cross_track_recovery_time_{}, path_start_tolerance_{};
+  double cross_track_filter_time_constant_{};
   double arrival_tolerance_{}, arrival_release_tolerance_{};
   double correction_translation_trigger_{}, correction_yaw_trigger_deg_{};
   double correction_filter_time_constant_{}, correction_material_translation_{};
@@ -820,7 +832,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_, config_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr valid_pub_, goal_reached_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr
-    progress_pub_, path_progress_pub_, remaining_pub_, cross_track_pub_;
+    progress_pub_, path_progress_pub_, remaining_pub_, cross_track_pub_,
+    cross_track_filtered_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr generation_pub_, correction_epoch_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
   rclcpp::TimerBase::SharedPtr timer_;

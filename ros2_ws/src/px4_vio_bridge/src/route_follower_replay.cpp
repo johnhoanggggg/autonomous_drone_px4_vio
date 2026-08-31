@@ -77,7 +77,12 @@ int main()
     config.at("cross_track_resume").get<double>(),
     config.at("cross_track_recovery_time").get<double>(),
     config.at("arrival_tolerance").get<double>(),
-    config.at("arrival_release_tolerance").get<double>());
+    config.at("arrival_release_tolerance").get<double>(),
+    // Optional, and negligible by default: the recovery filter is a C++-only
+    // improvement that px4_vio_bridge/path_follower.py does not have, so the
+    // cross-language parity scenarios must be able to switch it off. A replay
+    // that wants flight behaviour passes the flown constant explicitly.
+    config.value("cross_track_filter_time_constant", 1.0e-9));
   json output = json::array();
   for (const auto & step : scenario.at("steps")) {
     const auto op = step.at("op").get<std::string>();

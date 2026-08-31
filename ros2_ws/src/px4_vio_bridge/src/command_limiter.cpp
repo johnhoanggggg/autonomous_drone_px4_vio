@@ -275,10 +275,13 @@ bool PathCommandLimiter::set_path(
   // through the bounded band; snapping directly to projection.point would
   // bypass the speed limit.
   position_ = anchor;
-  if (projection.cross_track > kEpsilon) {
+  if (projection.cross_track > join_tolerance_) {
     join_target_ = projection.point;
     join_limit_ = limit;
-    speed_ = 0.0;
+    // Carry the standing rate into the join. update_join() runs the same
+    // along-path speed machinery, so this is the speed it continues from rather
+    // than a rate it is permitted to jump to.
+    speed_ = std::min(max_speed_, std::hypot(velocity_.first, velocity_.second));
   } else {
     position_ = projection.point;
     speed_ = std::min(max_speed_, std::hypot(velocity_.first, velocity_.second));
@@ -296,22 +299,101 @@ void PathCommandLimiter::install(
   waiting_vertex_.reset();
 }
 
+double PathCommandLimiter::along_path_speed(double along, double dt, bool advance)
+{
+  // The same speed machinery the on-path advance uses, factored out so a join
+  // is braked by corners and by the path end exactly as ordinary motion is.
+  if (!advance) {
+    speed_ = std::max(0.0, speed_ - max_acceleration_ * dt);
+    return speed_;
+  }
+  const double target_progress = next_motion_target(installation_->path->length());
+  const double remaining = std::max(0.0, target_progress - along);
+  if (remaining <= kEpsilon) {
+    speed_ = 0.0;
+    return 0.0;
+  }
+  const double braking_speed = std::max(
+    0.0,
+    -max_acceleration_ * dt +
+    std::sqrt(
+      (max_acceleration_ * dt) * (max_acceleration_ * dt) +
+      2.0 * max_acceleration_ * remaining));
+  double desired_speed = std::min({max_speed_, remaining / dt, braking_speed});
+  if (corner_blending_) {
+    desired_speed = std::min(desired_speed, corner_speed_limit());
+  }
+  const double delta = std::clamp(
+    desired_speed - speed_, -max_acceleration_ * dt, max_acceleration_ * dt);
+  speed_ = std::clamp(speed_ + delta, 0.0, max_speed_);
+  return speed_;
+}
+
+Point2 PathCommandLimiter::path_tangent(double along) const
+{
+  // Finite difference rather than a Polyline accessor: the step is a hundredth
+  // of a grid cell, and a vertex is the only place the two would disagree.
+  const double length = installation_->path->length();
+  const double step = std::min(1.0e-4, std::max(length, 1.0e-6));
+  const double back = std::clamp(along - step, 0.0, length);
+  const double forward = std::clamp(along + step, 0.0, length);
+  const Point2 a = installation_->path->point_at(back);
+  const Point2 b = installation_->path->point_at(forward);
+  const Point2 delta{b.first - a.first, b.second - a.second};
+  const double norm = std::hypot(delta.first, delta.second);
+  if (norm <= kEpsilon) {
+    return {0.0, 0.0};
+  }
+  return {delta.first / norm, delta.second / norm};
+}
+
 Point2 PathCommandLimiter::update_join(double dt, bool advance)
 {
+  // A join is a lane change, not a stop.
+  //
+  // This used to steer the command point at a FROZEN target -- the projection
+  // of the old command onto the new path -- and complete only once the velocity
+  // had decayed to within one tick of zero. Arriving at a fixed point at speed
+  // would overshoot it, so that formulation could not end any other way: every
+  // path replacement decelerated the command to a standstill and then
+  // re-accelerated along the route from rest.
+  //
+  // That is what made the flown route stop-start. Measured over the three
+  // flights of 20260831T064x, the planner replaced the accepted path 1.06-1.19
+  // times a second while the command point needed 0.67 s to get back to
+  // 0.20 m/s, and 20 of 27 stops began within 0.6 s of a replacement. Commanded
+  // speed only reached the ceiling in samples where a path had been left alone
+  // for more than 1.5 s.
+  //
+  // So the target rolls forward instead. The along-path component runs the
+  // ordinary speed machinery -- corner limits, end braking, the acceleration
+  // limit -- and a bounded lateral component closes the offset alongside it.
+  // Both safety properties are unchanged: every tick is still rejected if it
+  // would leave `join_limit_`, and the caller still clearance-checks the
+  // resulting chord and rolls the tick back if it fails.
   const Point2 old_position = *position_;
+  const auto start = installation_->path->project(*position_);
+
+  const double along_speed = along_path_speed(start.along, dt, advance);
+  const Point2 tangent = path_tangent(start.along);
+
+  Point2 desired_velocity{tangent.first * along_speed, tangent.second * along_speed};
+
   const Point2 offset{
-    join_target_->first - position_->first,
-    join_target_->second - position_->second};
+    start.point.first - position_->first, start.point.second - position_->second};
   const double offset_distance = std::hypot(offset.first, offset.second);
-  Point2 desired_velocity{0.0, 0.0};
   if (advance && offset_distance > kEpsilon) {
-    const double speed = std::min(
+    // Close the offset no faster than it can be stopped, and never faster than
+    // it can be closed this tick, so the lateral term cannot overshoot the path.
+    const double lateral_speed = std::min(
       {max_speed_, offset_distance / dt,
         std::sqrt(2.0 * max_acceleration_ * offset_distance)});
     desired_velocity = {
-      offset.first / offset_distance * speed,
-      offset.second / offset_distance * speed};
+      desired_velocity.first + offset.first / offset_distance * lateral_speed,
+      desired_velocity.second + offset.second / offset_distance * lateral_speed};
   }
+  desired_velocity = limit_norm(desired_velocity, max_speed_);
+
   const Point2 change = limit_norm(
     {desired_velocity.first - velocity_.first, desired_velocity.second - velocity_.second},
     max_acceleration_ * dt);
@@ -326,13 +408,12 @@ Point2 PathCommandLimiter::update_join(double dt, bool advance)
     throw std::invalid_argument("path rejoin would leave the projection tolerance band");
   }
   progress_ = projection.along;
-  if (distance(*position_, *join_target_) <= 1.0e-5 &&
-    std::hypot(velocity_.first, velocity_.second) <= max_acceleration_ * dt + kEpsilon)
-  {
-    position_ = join_target_;
-    progress_ = installation_->path->project(*position_).along;
-    velocity_ = {0.0, 0.0};
-    speed_ = 0.0;
+  // Complete on geometry alone. The old velocity condition is what forced the
+  // stop; the command point is already on the path here, and `speed_` carries
+  // the along-path rate straight into the ordinary advance.
+  if (projection.cross_track <= join_tolerance_) {
+    position_ = projection.point;
+    progress_ = projection.along;
     join_target_.reset();
   }
   return *position_;

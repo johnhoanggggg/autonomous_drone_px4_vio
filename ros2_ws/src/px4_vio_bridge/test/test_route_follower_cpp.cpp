@@ -24,7 +24,10 @@ TEST(RouteFollower, LimitsPositionCarrotSpeedAndAcceleration)
 
 TEST(RouteFollower, CrossTrackFaultRequiresFreshPathAndStableRecovery)
 {
-  PositionRouteFollower follower(0.60, 0.10, 0.30, 0.10, 0.05, 0.30);
+  // Filter constant driven to a tick so this covers the ordering rule alone:
+  // fault -> fresh path -> sustained sub-resume -> valid. The lag the
+  // production constant buys is the subject of the next two tests.
+  PositionRouteFollower follower(0.60, 0.10, 0.30, 0.10, 0.05, 0.30, 0.12, 0.20, 1e-6);
   ASSERT_TRUE(follower.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0}));
   EXPECT_EQ(follower.update({1.0, 0.11}, 0.10).status, "CROSS_TRACK_EXCEEDED");
   EXPECT_EQ(
@@ -34,6 +37,65 @@ TEST(RouteFollower, CrossTrackFaultRequiresFreshPathAndStableRecovery)
   EXPECT_EQ(follower.update({1.0, 0.04}, 0.10).status, "CROSS_TRACK_RECOVERING");
   EXPECT_EQ(follower.update({1.0, 0.04}, 0.10).status, "CROSS_TRACK_RECOVERING");
   EXPECT_TRUE(follower.update({1.0, 0.04}, 0.10).valid);
+}
+
+TEST(RouteFollower, CrossTrackFaultThresholdIsNeverFiltered)
+{
+  // The fault is a safety gate and must fire on the tick the excursion happens,
+  // however long the recovery filter is. A lagged fault would let the vehicle
+  // spend a time constant outside its cross-track budget.
+  PositionRouteFollower follower(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 5.0);
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0}));
+  EXPECT_EQ(follower.update({1.0, 0.00}, 0.10).status, "FOLLOWING");
+  const auto faulted = follower.update({1.0, 0.09}, 0.10);
+  EXPECT_EQ(faulted.status, "CROSS_TRACK_EXCEEDED");
+  EXPECT_FALSE(faulted.valid);
+  EXPECT_NEAR(faulted.cross_track, 0.09, 1e-9);
+}
+
+TEST(RouteFollower, CrossTrackRecoverySurvivesSingleNoisySamples)
+{
+  // Regression for flight 20260831T033557Z, which sat 0.4 m short of its goal
+  // from 38.1 s to 49.5 s. Recovery used to test the raw projection, so one
+  // sample above cross_track_resume zeroed the whole accumulated timer -- and
+  // the Pixhawk's median horizontal setpoint error (0.082 m) was above the
+  // 0.060 m gate it was being asked to hold under. The gate could not close,
+  // and the adapter's land countdown ran to 0.2 s of 6.0 s.
+  //
+  // The replacement route stays on y=0, so the pose offsets below are the real
+  // cross-track. Their mean is 0.032 m, inside the 0.040 m resume gate, but
+  // every third sample spikes to 0.055 m -- above the gate, below the 0.080 m
+  // fault. Recovery must still complete.
+  PositionRouteFollower follower(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 0.30);
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0}));
+  ASSERT_EQ(follower.update({1.0, 0.09}, 0.10).status, "CROSS_TRACK_EXCEEDED");
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0}, {2.5, 0.0}}, {1.0, 0.02}));
+
+  bool recovered = false;
+  for (int tick = 0; tick < 60 && !recovered; ++tick) {
+    const double offset = tick % 3 == 2 ? 0.055 : 0.020;
+    const auto result = follower.update({1.0, offset}, 0.10);
+    ASSERT_NE(result.status, "CROSS_TRACK_EXCEEDED") << "re-faulted at tick " << tick;
+    recovered = result.valid;
+  }
+  EXPECT_TRUE(recovered) << "noise alone reopened the recovery gate for ever";
+}
+
+TEST(RouteFollower, CrossTrackRecoveryStillWaitsOutASustainedExcursion)
+{
+  // The filter must not turn the gate into a rubber stamp: a pose that stays
+  // above cross_track_resume never resumes, however long it is held there.
+  PositionRouteFollower follower(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 0.30);
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0}));
+  ASSERT_EQ(follower.update({1.0, 0.09}, 0.10).status, "CROSS_TRACK_EXCEEDED");
+  // A genuinely different route, still on y=0, so the pose below stays 0.070 m
+  // off it -- above cross_track_resume and below max_cross_track.
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0}, {2.5, 0.0}}, {1.0, 0.07}));
+  for (int tick = 0; tick < 60; ++tick) {
+    const auto result = follower.update({1.0, 0.070}, 0.10);
+    ASSERT_FALSE(result.valid) << "resumed at tick " << tick << " while 0.070 m off path";
+    ASSERT_EQ(result.status, "CROSS_TRACK_HOLD");
+  }
 }
 
 TEST(RouteFollower, ArrivalUsesReleaseHysteresisAcrossReplans)

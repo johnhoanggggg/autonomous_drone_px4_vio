@@ -206,3 +206,99 @@ TEST(PathCommandLimiter, NoAdvanceBrakesForwardOnly)
     previous = limiter.position()->first;
   }
 }
+
+namespace
+{
+// A limiter already running at speed along a straight route, with the command
+// point `offset` metres to the side of the replacement that is about to arrive.
+px4_vio_bridge::PathCommandLimiter running_limiter()
+{
+  px4_vio_bridge::PathCommandLimiter limiter(
+    0.20, 0.30, 0.10, 0.05, 0.30, 0.20, 0.01, true, 0.05);
+  limiter.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0});
+  for (int tick = 0; tick < 40; ++tick) {
+    limiter.update({3.0, 0.0}, 0.05, true, limiter.position());
+  }
+  return limiter;
+}
+
+double speed_of(const px4_vio_bridge::PathCommandLimiter & limiter)
+{
+  return std::hypot(limiter.velocity().first, limiter.velocity().second);
+}
+}  // namespace
+
+TEST(PathCommandLimiter, JoinKeepsMovingThroughAReplacementPath)
+{
+  // Regression for the stop-start route measured across 20260831T064152Z,
+  // T064236Z and T064828Z. The planner replaced the accepted path 1.06-1.19
+  // times a second; the old frozen-target join decelerated the command point to
+  // a standstill on each one, so 20 of 27 stops began within 0.6 s of a
+  // replacement and commanded speed only reached the 0.20 m/s ceiling in
+  // samples where a path had gone untouched for over 1.5 s.
+  auto limiter = running_limiter();
+  const double before = speed_of(limiter);
+  ASSERT_GT(before, 0.15) << "fixture failed to reach cruise";
+
+  // A replacement offset by 30 mm -- the median command-point offset measured
+  // at a rebuild on those flights, and one grid cell.
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030}));
+
+  double slowest = before;
+  for (int tick = 0; tick < 12; ++tick) {
+    limiter.update({3.0, 0.030}, 0.05, true, limiter.position());
+    slowest = std::min(slowest, speed_of(limiter));
+  }
+  EXPECT_GT(slowest, 0.5 * before)
+    << "the command point stalled rejoining a 30 mm offset";
+  EXPECT_GT(speed_of(limiter), 0.15) << "did not return to cruise after the join";
+}
+
+TEST(PathCommandLimiter, JoinStillRespectsTheProjectionBand)
+{
+  // The band is the safety property of a join and is not relaxed by rolling it.
+  // max_projection_error 0.10 with a 0.16 m offset must be refused outright.
+  auto limiter = running_limiter();
+  EXPECT_THROW(
+    limiter.set_path({{0.0, 0.160}, {3.0, 0.160}}, {0.0, 0.160}),
+    std::invalid_argument);
+}
+
+TEST(PathCommandLimiter, JoinConvergesOntoTheReplacementPath)
+{
+  auto limiter = running_limiter();
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.060}, {3.0, 0.060}}, {0.0, 0.060}));
+  for (int tick = 0; tick < 40; ++tick) {
+    limiter.update({3.0, 0.060}, 0.05, true, limiter.position());
+  }
+  ASSERT_TRUE(limiter.position().has_value());
+  EXPECT_NEAR(limiter.position()->second, 0.060, 5.0e-3)
+    << "the join never actually reached the new path";
+}
+
+TEST(PathCommandLimiter, JoinBrakesForwardWhenTranslationIsPaused)
+{
+  // A yaw-alignment pause must still brake a join to a stop; the rolling
+  // along-path term is gated on `advance` exactly as ordinary motion is.
+  auto limiter = running_limiter();
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030}));
+  for (int tick = 0; tick < 40; ++tick) {
+    limiter.update({3.0, 0.030}, 0.05, false, limiter.position());
+  }
+  EXPECT_LT(speed_of(limiter), 0.02) << "advance=false did not brake the join";
+}
+
+TEST(PathCommandLimiter, JoinBrakesToTheEndOfAShortReplacement)
+{
+  // End-of-path braking applies during a join: a replacement with almost no
+  // route left must not be entered at cruise.
+  auto limiter = running_limiter();
+  ASSERT_TRUE(limiter.position().has_value());
+  const double x = limiter.position()->first;
+  ASSERT_TRUE(limiter.set_path({{x - 0.05, 0.030}, {x + 0.10, 0.030}}, {x, 0.030}));
+  for (int tick = 0; tick < 40; ++tick) {
+    limiter.update({x + 0.10, 0.030}, 0.05, true, limiter.position());
+  }
+  EXPECT_LT(speed_of(limiter), 0.02) << "did not stop at the end of the route";
+  EXPECT_LT(limiter.position()->first, x + 0.10 + 1.0e-6);
+}

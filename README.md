@@ -113,26 +113,38 @@ ros2 launch px4_vio_bridge global_planner_monitor.launch.py \
   lookahead_step:=0.03 \
   max_carrot_speed:=0.20 \
   max_carrot_acceleration:=0.30 \
-  max_cross_track:=0.15 \
-  cross_track_resume:=0.06 \
-  cross_track_recovery_time:=1.0 \
-  path_retain_tolerance:=0.12 \
+  max_cross_track:=0.08 \
+  cross_track_resume:=0.04 \
+  cross_track_recovery_time:=0.6 \
+  cross_track_filter_time_constant:=0.30 \
+  path_retain_tolerance:=0.04 \
   max_correction_m:=1 \
   max_correction_yaw_deg:=10.0
 ```
 
 `path_retain_tolerance` **must stay below `max_cross_track`**, or the follower
 faults on cross-track before the planner will rebuild the path and the vehicle
-stalls in the gap between them with no new route coming. The launch defaults
-keep a 0.03 m replan-before-fault band; see [Known issues](#known-issues).
+stalls in the gap between them with no new route coming.
+`global_planner_monitor.launch.py` now checks this at launch and refuses to
+start a combination that cannot be flown; see [Known issues](#known-issues).
 
-This is the narrow-hallway profile. It deliberately has no extra collision
-margin: the planner requires 0.25 m from the vehicle centre to an obstacle, the
-physical radius of this airframe. The 0.12 m retained-path band and 0.15 m
-cross-track limit are the configuration that completed tunnel flight
-`20260829T114405Z`; they leave a 0.03 m replan-before-fault band. This trades
-wall-contact margin for route continuity; it is not a collision-free
-configuration.
+This is the narrow-hallway profile, retuned twice on 2026-08-31. The planner
+requires 0.25 m from the vehicle centre to an obstacle, so the minimum plannable
+gap is 0.50 m. `safety_margin 0.05` was tried in between and reverted: at a
+0.30 m lethal radius the neck on `20260831T064828Z` (0.266–0.294 m of clearance)
+is not routable, 44% of that flight's track sat inside the requirement, and it
+stalled short of its goal. Contact therefore stays possible — worst case the
+airframe reaches `max_cross_track` = 0.08 m inside an obstacle, about half the
+0.15 m budget it was flying under when it hit the door frame on
+`20260831T033736Z`.
+
+The cross-track numbers moved together and only make sense together: a 0.08 m
+fault threshold is *below* this airframe's own p90 horizontal setpoint error
+(0.15–0.16 m), so faults get more frequent, not less. What makes that tenable is
+that a fault now costs less — the land countdown is held during the post-climb
+settle (`route_entry_grace`), and the recovery gate reads a low-passed
+cross-track so a single noisy sample can no longer reset it. Do not lower
+`max_cross_track` without those two.
 
 Click a `world` goal with the Foxglove 3D panel's Publish tool on
 `/waypoint/clicked`, and confirm `/planner/follower/valid: true` before terminal 3.
@@ -557,6 +569,7 @@ before the recorder.
 | `/rtabmap/config` | SLAM: `num_features`, `fps`, resolution, grid cell size, ray tracing |
 | `/planner/config` | A* planner: `robot_radius`, `safety_margin`, inflation, timeouts |
 | `/planner/follower/config` | route follower: `lookahead`, `max_cross_track`, correction gates |
+| `/planner/flight/config` | flight adapter: `corner_blending`, command limits, climb and grace timers |
 
 ### Battery in Foxglove
 
@@ -1308,19 +1321,67 @@ that makes contact impossible is:
 safety_margin >= max_cross_track
 ```
 
-which is not met by any configuration flown so far. Raising `safety_margin` costs
-corridor width (`2 * lethal_radius`), so this is a deliberate trade, not a bug to
-silently fix: at `safety_margin 0.0` the block threshold becomes the airframe
-radius itself and the minimum plannable gap is 0.50 m; at `safety_margin 0.20`
-contact becomes impossible but the minimum gap is 0.90 m.
+which the launch defaults (`safety_margin 0.00`, `max_cross_track 0.08`) do not
+meet: the airframe may reach 0.08 m inside an obstacle, down from 0.15 m before.
+Meeting it costs more corridor than this environment has. `global_planner_monitor.launch.py` prints that number at
+startup rather than leaving it implicit. Raising `safety_margin` costs corridor
+width
+(`2 * lethal_radius`), so this is a deliberate trade, not a bug to silently fix:
+at `safety_margin 0.0` the block threshold becomes the airframe radius itself and
+the minimum plannable gap is 0.50 m; at `safety_margin 0.05` it is 0.60 m; at
+`safety_margin 0.20` the minimum gap is 0.90 m. The 0.68 m doorway on
+`20260831T033736Z` is plannable at 0.05 and infeasible at 0.10.
+
+### A replanned path used to stop the command point dead
+
+`PathCommandLimiter::set_path` installs a replacement route either by renumbering
+the arc length (when the geometry ahead is identical, which preserves speed) or
+by *joining* it. The join used to steer the command point at a frozen target —
+the projection of the old command onto the new path — and complete only once its
+velocity had decayed to within a tick of zero. Arriving at a fixed point at speed
+would overshoot it, so that formulation could not end any other way: **every path
+replacement decelerated the command to a standstill, then re-accelerated along
+the route from rest.**
+
+That is what made the flown route stop-start. Measured across
+`20260831T064152Z`, `T064236Z` and `T064828Z`: the planner replaced the accepted
+path **1.06–1.19 times a second**, the command point needs 0.67 s to get back to
+0.20 m/s at `command_acceleration` 0.30, and **20 of 27 stops began within 0.6 s
+of a replacement**. Commanded speed only reached the 0.20 m/s ceiling in samples
+where a path had been left alone for more than 1.5 s — in that bin the 06:48
+flight averaged 0.199 m/s. The airframe could always fly the corridor at full
+speed; it was rarely allowed to.
+
+The join now rolls. The along-path component runs the same speed machinery as
+ordinary motion — corner limits, end braking, the acceleration limit — while a
+bounded lateral term closes the offset alongside it, and the join completes on
+geometry rather than on velocity. Both safety properties are unchanged: a tick is
+still rejected if it would leave `max_projection_error`, and the adapter still
+clearance-checks the resulting chord and rolls the tick back if it fails.
+`PathCommandLimiter.Join*` in `test_planner_flight_cpp.cpp` pins the behaviour.
+
+The legacy Python limiter still has the frozen-target join, so the two
+mid-route-replacement scenarios in `test_planner_flight_parity.py` are skipped
+rather than held to parity. Everything else there still matches to 1e-9.
 
 ### `path_retain_tolerance` inverts the replan/fault ordering
 
 `should_replace_path` rebuilds the accepted path only when cross-track exceeds
 `path_retain_tolerance`, while the follower faults at `max_cross_track`. If the
 retain tolerance is not lower, the vehicle can stall in the band between them:
-faulted, but with no new path coming. The operational launch defaults are 0.12 m
-and 0.15 m respectively.
+faulted, but with no new path coming. The operational launch defaults are 0.04 m
+and 0.08 m respectively, and `global_planner_monitor.launch.py` refuses to start
+if the ordering is violated.
+
+The band also has to be wider than one loop-closure correction, or a correction
+faults where it should have replanned: measured material corrections reached
+118 mm on `20260831T033557Z` and 92 mm on `20260831T033736Z`. The route itself is
+already stored in continuous VIO coordinates and re-rendered under each new
+correction (`PositionRouteFollower::render`), so a correction moves pose and
+route together — measured, those 12 corrections produced cross-track peaks of
+0.076–0.152 m against a p90 baseline of 0.096–0.112 m, not the full step. What a
+correction still costs is `CORRECTION_SETTLING`, which held path acceptance for
+**15.7%** of flight `20260831T033736Z`.
 
 In four flights on 2026-08-28, cross-track never once exceeded 0.35 m — so a
 cross-track excursion has never actually triggered a replan on this vehicle.

@@ -178,6 +178,23 @@ def check(scenario, label):
     assert_same(run_python(scenario), run_cpp(scenario), label)
 
 
+# The C++ PathCommandLimiter rejoins a replacement path as a rolling lane
+# change: the along-path speed machinery keeps running while a bounded lateral
+# term closes the offset. px4_vio_bridge/path_follower.py still has the original
+# frozen-target join, which decelerates the command point to a standstill on
+# every replan -- the thing that made the flown route stop-start. Python is
+# legacy and is not being taught the new behaviour, so the two scenarios that
+# exercise a mid-route replacement are no longer a parity contract. The rolling
+# join is covered by the PathCommandLimiter.Join* gtests instead.
+#
+# Everything else here still matches to 1e-9 and is still worth keeping: route
+# entry, straight running, corner handling, the yaw-alignment pause, entry
+# rejection and the horizontal limiter.
+JOIN_DIVERGES = pytest.mark.skip(
+    reason="C++ uses a rolling join; the legacy Python limiter stops. "
+           "See PathCommandLimiter.Join* in test_planner_flight_cpp.cpp.")
+
+
 def straight_route(corner_blending=False):
     config = dict(DEFAULT_CONFIG, corner_blending=corner_blending)
     steps = [{"op": "set_path", "points": [[0.0, 0.0], [2.0, 0.0]],
@@ -226,6 +243,7 @@ def test_yaw_alignment_pause_matches():
 
 @requires_binary
 @pytest.mark.parametrize("clearance", [True, False])
+@JOIN_DIVERGES
 def test_replanning_matches(clearance):
     """Shared-suffix carry, in-band rejoin and the connector-clearance gate."""
     steps = [{"op": "set_path", "points": [[0.0, 0.0], [2.0, 0.0]],
@@ -271,6 +289,7 @@ def test_horizontal_limiter_matches():
 
 
 @requires_binary
+@JOIN_DIVERGES
 def test_randomized_sequences_match():
     """Fuzz the whole step vocabulary against the Python implementation."""
     rng = random.Random(20260828)

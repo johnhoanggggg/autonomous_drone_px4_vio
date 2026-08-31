@@ -296,20 +296,22 @@ std::string CorrectionReplanGate::pending_detail(double now) const
 PositionRouteFollower::PositionRouteFollower(
   double lookahead, double max_carrot_speed, double max_carrot_acceleration,
   double max_cross_track, double cross_track_resume, double cross_track_recovery_time,
-  double arrival_tolerance, double arrival_release_tolerance)
+  double arrival_tolerance, double arrival_release_tolerance,
+  double cross_track_filter_time_constant)
 : lookahead_(lookahead),
   max_carrot_speed_(max_carrot_speed),
   max_carrot_acceleration_(max_carrot_acceleration),
   max_cross_track_(max_cross_track),
   cross_track_resume_(cross_track_resume),
   cross_track_recovery_time_(cross_track_recovery_time),
+  cross_track_filter_time_constant_(cross_track_filter_time_constant),
   arrival_tolerance_(arrival_tolerance),
   arrival_release_tolerance_(arrival_release_tolerance)
 {
-  const std::array<double, 8> limits{
+  const std::array<double, 9> limits{
     lookahead_, max_carrot_speed_, max_carrot_acceleration_, max_cross_track_,
     cross_track_resume_, cross_track_recovery_time_, arrival_tolerance_,
-    arrival_release_tolerance_};
+    arrival_release_tolerance_, cross_track_filter_time_constant_};
   if (std::any_of(limits.begin(), limits.end(), [](double value) {
       return !std::isfinite(value) || value <= 0.0;
     }))
@@ -364,6 +366,7 @@ void PositionRouteFollower::clear_path()
   fingerprint_.clear();
   path_progress_ = 0.0;
   command_velocity_vio_ = {0.0, 0.0};
+  cross_track_filtered_.reset();
   at_goal_ = false;
 }
 
@@ -373,6 +376,7 @@ void PositionRouteFollower::reset_route_progress()
   cross_track_latched_ = false;
   cross_track_fault_generation_ = 0;
   cross_track_recovery_elapsed_ = 0.0;
+  cross_track_filtered_.reset();
   at_goal_ = false;
   if (path_) {
     path_progress_ = 0.0;
@@ -470,6 +474,28 @@ FollowResult PositionRouteFollower::update(
     };
 
   const auto projection = path_->project(pose);
+  // Cross-track is read two different ways, and mixing them up is the bug this
+  // split exists to prevent.
+  //
+  // The FAULT below tests the raw projection: a safety gate must not lag the
+  // vehicle, and a real excursion has to be caught on the tick it happens.
+  //
+  // The RECOVERY gate tests this low-passed value instead. It used to test the
+  // raw one, and a single sample above `cross_track_resume` zeroed the whole
+  // accumulated recovery timer. That is unclosable when the airframe's own
+  // station-keeping noise straddles the gate: on 20260831T033557Z the Pixhawk's
+  // median horizontal setpoint error was 0.082 m against a resume gate of
+  // 0.060 m, so the vehicle spent 38.1-49.5 s cycling
+  // EXCEEDED -> RECOVERING -> HOLD without ever completing the 1.0 s hold,
+  // frozen 0.4 m short of its goal while the adapter's land countdown ran down
+  // to 0.2 s of 6.0 s remaining. Filtering costs one time constant of lag on
+  // resuming and buys a gate that noise alone cannot reopen.
+  if (!cross_track_filtered_) {
+    cross_track_filtered_ = projection.cross_track;
+  } else {
+    const double alpha = dt / (cross_track_filter_time_constant_ + dt);
+    *cross_track_filtered_ += alpha * (projection.cross_track - *cross_track_filtered_);
+  }
   const double candidate_progress = std::max(path_progress_, projection.along);
   double remaining = std::max(0.0, path_->length() - candidate_progress);
   const Point2 desired = path_->point_at(candidate_progress + effective_lookahead);
@@ -479,6 +505,9 @@ FollowResult PositionRouteFollower::update(
     if (!cross_track_latched_) {
       cross_track_latched_ = true;
       cross_track_fault_generation_ = generation_;
+      // Enter recovery from the excursion that caused it, not from whatever the
+      // filter happened to be carrying, so the gate cannot open early.
+      cross_track_filtered_ = projection.cross_track;
     }
     cross_track_recovery_elapsed_ = 0.0;
     command_velocity = {0.0, 0.0};
@@ -496,7 +525,7 @@ FollowResult PositionRouteFollower::update(
     command_velocity = {0.0, 0.0};
     const bool fresh_path = generation_ > cross_track_fault_generation_;
     std::string status;
-    if (!fresh_path || projection.cross_track > cross_track_resume_) {
+    if (!fresh_path || *cross_track_filtered_ > cross_track_resume_) {
       cross_track_recovery_elapsed_ = 0.0;
       status = fresh_path ? "CROSS_TRACK_HOLD" : "CROSS_TRACK_HOLD_WAITING_FOR_PATH";
     } else {
