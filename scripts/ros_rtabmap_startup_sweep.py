@@ -161,19 +161,14 @@ def stop_launch(process):
         process.wait(timeout=5.0)
 
 
-def launch_command(profile, repo):
+def launch_command(profile):
+    launch_file = ("ros_rtabmap_oak_v3_mono.launch.py"
+                   if profile == "mono"
+                   else "ros_rtabmap_oak_v3.launch.py")
     command = [
         "ros2", "launch", "px4_vio_bridge",
-        "ros_rtabmap_oak_v3.launch.py", "foxglove:=false",
+        launch_file, "foxglove:=false",
     ]
-    if profile == "mono":
-        command.extend([
-            "camera_config:=" + str(
-                repo / "ros2_ws/src/px4_vio_bridge/config/"
-                "oak_v3_rtabmap_mono.yaml"),
-            "image_topic:=/oak/left/image_rect",
-            "camera_info_topic:=/oak/left/camera_info",
-        ])
     return command
 
 
@@ -200,7 +195,7 @@ def main():
             lines = deque(maxlen=80)
             started = time.monotonic()
             process = subprocess.Popen(
-                launch_command(args.profile, repo),
+                launch_command(args.profile),
                 cwd=repo / "ros2_ws",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

@@ -84,18 +84,17 @@ The full ROS graph is therefore structurally equivalent:
 
 The remaining input mismatch was that the ROS launch used rolling-shutter RGB
 while DepthAI RTABMapVIO uses global-shutter CAM_B. The new
-`config/oak_v3_rtabmap_mono.yaml` exposes `/oak/left/image_rect`, aligns depth
-to CAM_B, and the launch now accepts selectable image/depth/camera-info topics.
-An instrumented ten-run sweep passed 10/10. Each attempt required live mono,
-live depth, at least 1% nonzero depth, live IMU, five non-lost odometry samples
-and at least 20 median inliers. All ten crossed the gate in 8.2-11.9 s, with
-91-150 median inliers, 27-48% sampled nonzero depth, and no launch errors.
-Odometry rate in longer runs varied from about 10 to 17 Hz as the single F2M+BA
-thread saturated. A 400-feature trial was slower (~6 Hz), so lowering the
-feature cap is not a CPU fix here. Startup is now a passed gate for this bench
-scene; require a carried loop with no resets before changing the default or
-connecting it to PX4. The JSON is `/tmp/rtabmap_mono_startup_10.json` for this
-boot; reproduce it with `scripts/ros_rtabmap_startup_sweep.py`.
+`config/oak_v3_rtabmap_mono.yaml` exposes `/oak/left/image_rect` and aligns
+depth to CAM_B. `ros_rtabmap_oak_v3_mono.launch.py` selects those inputs and
+uses the more accurate 1000-feature / 3000-feature-map F2M settings. An
+instrumented ten-run sweep of that exact graph passed 10/10. Each attempt
+required live mono, live depth, at least 1% nonzero depth, live IMU, five
+non-lost odometry samples and at least 20 median inliers. All ten crossed the
+gate in 8.24-8.61 s, with 72-99 median inliers, 43.5-51.0% sampled nonzero
+depth, and no launch errors. Startup is now a passed gate for this bench scene;
+require a carried loop with no resets before connecting it to PX4. The JSON is
+`/tmp/rtabmap_mono_tuned_startup_10.json`; reproduce it with
+`scripts/ros_rtabmap_startup_sweep.py`.
 
 For the carried ROS-native run, the raw estimator is `nav_msgs/Odometry`, not
 the hybrid's `PoseStamped`. The loop harness now accepts either message type:
@@ -107,13 +106,20 @@ python3 scripts/loop_closure_test.py --label ros-native-mono --seconds 180 \
   --out /tmp/loop_ros_native_mono.json
 ```
 
-A 30 s stationary control of that exact mono graph passed before attempting
-motion: 288 raw samples at 10.0 Hz, 1.04 mm RMS about the mean, 1.02 mm net
-displacement, 4.10 mm largest step, 0.35 m accumulated sub-frame motion, zero
-lost samples, zero reset-sized jumps, and 197 mean / 169 minimum inliers. The
-start/end five-second means differed by 0.3 mm. This is stable, but its RMS and
-largest step are about twice the same-scene DepthAI reference; moving parity is
-still open. Report: `/tmp/loop_ros_native_mono_stationary_clean.json`.
+Two 30 s stationary controls compared F2M sizes on that mono input. The tuned
+profile improved RMS by 30%, increased mean inliers by 65%, and cost about 13
+CPU percentage points while holding essentially the same rate:
+
+| mono F2M settings | rate | RMS | net | path | max step | mean/min inliers | container CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 600 / 2000 | 10.0 Hz | 1.04 mm | 1.02 mm | 0.35 m | 4.10 mm | 197 / 169 | 105.4% |
+| **1000 / 3000** | **9.5 Hz** | **0.73 mm** | **0.40 mm** | **0.24 m** | **3.49 mm** | **326 / 288** | 118.1% |
+
+Both had zero lost samples and zero reset-sized jumps. The tuned profile's
+start/end five-second means differed by 0.1 mm. This is close to the 0.52 mm
+same-scene DepthAI reference, but moving parity is still open. Reports:
+`/tmp/loop_ros_native_mono_stationary_clean.json` and
+`/tmp/loop_ros_native_mono_1000_3000_stationary.json`.
 
 ## Measured CPU
 
@@ -266,7 +272,8 @@ Commits on `ros-rtabmap-migration`, oldest first:
 
 New code: `src/slam_pose_relay.cpp` + `_node.cpp`,
 `include/px4_vio_bridge/slam_pose_relay.hpp`, `test/test_slam_pose_relay.cpp`
-(8 gtest cases). New launches: `ros_rtabmap_oak_v3.launch.py`. New configs:
+(8 gtest cases). New launches: `ros_rtabmap_oak_v3.launch.py` and
+`ros_rtabmap_oak_v3_mono.launch.py`. New configs:
 `oak_ros_rtabmap_20hz.yaml`, `oak_v3_rtabmap.yaml`. 571 tests pass.
 
 `depthai_ros_driver_v3` is **not installed**. It is unpacked at

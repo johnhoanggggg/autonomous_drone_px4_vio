@@ -697,39 +697,35 @@ Nothing is installed and v2 is untouched, so reverting is
 
 **Global-shutter parity profile (experimental).** The default v3 profile uses
 the rolling-shutter RGB camera, while DepthAI `RTABMapVIO` tracks the
-global-shutter left mono camera. `oak_v3_rtabmap_mono.yaml` keeps the working
-RGBD+IMU topology but publishes CAM_B rectified mono and aligns depth to CAM_B:
+global-shutter left mono camera. The mono launch keeps the working RGBD+IMU
+topology, publishes CAM_B rectified mono, aligns depth to CAM_B, and selects the
+more accurate 1000-feature / 3000-feature-map F2M settings:
 
 ```bash
-ros2 launch px4_vio_bridge ros_rtabmap_oak_v3.launch.py \
-  camera_config:=/home/john/autonomous_drone_px4_vio/ros2_ws/src/px4_vio_bridge/config/oak_v3_rtabmap_mono.yaml \
-  image_topic:=/oak/left/image_rect \
-  camera_info_topic:=/oak/left/camera_info
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_mono.launch.py
 ```
 
 The instrumented startup sweep now passes 10/10. Every attempt required live
 mono, depth and IMU streams, sampled nonzero depth, and five non-lost odometry
-samples with at least 20 median inliers. Starts passed in 8.2-11.9 s with
-91-150 median inliers and 27-48% sampled nonzero depth. Reproduce it with:
+samples with at least 20 median inliers. The tuned graph passed in 8.24-8.61 s
+with 72-99 median inliers, 43.5-51.0% sampled nonzero depth, and no relevant
+errors. Reproduce it with:
 
 ```bash
 python3 scripts/ros_rtabmap_startup_sweep.py --profile mono --attempts 10 \
-  --out /tmp/rtabmap_mono_startup_10.json
+  --out /tmp/rtabmap_mono_tuned_startup_10.json
 ```
 
-In longer runs the raw depth stream remained 20 Hz, IMU about 200 Hz, and
-odometry varied from about 10-17 Hz as its single F2M+BA thread saturated.
-Reducing `vis_max_features` from 600 to 400 made this scene slower (~6 Hz), not
-faster. Startup is passed; keep this experimental until it also completes a
-hand-carried closed loop without a reset.
-
-A clean 30 s stationary control of the mono graph produced 288 raw odometry
-samples at 10.0 Hz, 1.04 mm RMS spread, 1.02 mm net displacement, a 4.10 mm
-largest step, no lost samples, no reset-sized jumps, and 197 mean / 169 minimum
-inliers. The start/end five-second means differed by 0.3 mm. This is stable but
-roughly twice the RMS jitter and worst step of the same-scene DepthAI reference,
-so it passes the stationary safety gate without yet proving moving parity. The
-report is `/tmp/loop_ros_native_mono_stationary_clean.json`.
+In longer runs the raw depth stream remained 20 Hz and IMU about 200 Hz. A 30 s
+A/B control measured 600/2000 F2M at 10.0 Hz, 1.04 mm RMS, 4.10 mm worst step,
+197 mean inliers and 105.4% container CPU. The selected 1000/3000 profile ran at
+9.5 Hz, 0.73 mm RMS, 3.49 mm worst step, 326 mean inliers and 118.1% container
+CPU. Both had zero lost samples and zero reset-sized jumps. The accuracy setting
+therefore costs about 13 CPU points for 30% less RMS jitter and 65% more inliers;
+it is close to the 0.52 mm DepthAI reference while the overall graph remains
+cheaper than the hybrid. Reducing features to 400 was slower (~6 Hz), so that is
+not a useful CPU lever. Startup and stationary gates pass; keep this experimental
+until it completes a hand-carried closed loop without a reset.
 
 This has not flown. It has no PX4 connection, has not been compared against the
 DepthAI-host map on a moving trajectory, and has not yet completed a carried
