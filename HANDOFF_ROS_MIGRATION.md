@@ -384,9 +384,18 @@ Do not replace that direct `SensorData` handoff with a populated
 `rtabmap_msgs/RGBDImage`: Jazzy's `rgbdImageFromROS()` ignores `key_points`.
 The discarded-keypoint prototype showed 239 OAK points but 564 host-detected
 features. In the corrected live graph, asynchronous samples showed 235 OAK
-points, 216 odometry input features and 145 inliers. Stationary output was
-about 8.5 Hz; the shared driver/odometry/SLAM container averaged 122.4% CPU and
-OctoMap 13.6%, at 51 C. This proves the data path, not moving robustness.
+points and 216 odometry input features. The adapter must mirror depthai-core by
+passing locations only; putting OAK feature IDs in `cv::KeyPoint::class_id`
+made the local-map processing substantially slower. Duplicate synchronized
+image stamps are filtered before `OdometryROS` and the standard
+`/diagnostics` input/output status is enabled.
+
+With that correction, a 2000-point local map retained about 125-135 stationary
+inliers but aged to 5-6 Hz and ~141% total CPU. The selected 1000-point default
+retained about 110-117 inliers; at 70 seconds it measured 8.0-8.2 Hz and ~125%
+total CPU. It stayed tracked through a 108-second stationary soak, though frame
+processing still grew to 110-120 ms near the end. This proves the data path,
+not moving robustness or full DepthAI performance parity.
 
 Because the unpacked binary `depthai_ros_msgs_v3` was built against a newer
 Fast-CDR, source `/home/john/depthai_v3_compat_ws/install/setup.bash` after the

@@ -24,7 +24,9 @@ def generate_launch_description():
         "range_max": "4.0",
         "max_marker_voxels": "50000",
         "vis_max_features": "600",
-        "odom_f2m_max_size": "2000",
+        # 2000 retained ~130 stationary inliers but aged to 5-6 Hz and ~141%
+        # total CPU. 1000 retained ~110 while sustaining ~8 Hz at ~125% CPU.
+        "odom_f2m_max_size": "1000",
         "vis_cor_type": "0",
         "odom_bundle_adjustment": "1",
     }

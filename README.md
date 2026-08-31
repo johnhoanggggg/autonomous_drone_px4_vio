@@ -813,12 +813,20 @@ copies the RGB-D images and camera model but does not copy the `RGBDImage`
 `key_points`, so an earlier RGBDImage-only prototype silently made ROS detect
 its own 564 features while the OAK reported about 239. The corrected path
 reported 216 input features in `OdomInfo` while the asynchronous OAK count was
-235, with 145 inliers, proving that the odometry core is using the device
-feature set. A stationary live smoke test measured about 8.5 Hz, 122.4% CPU for
-the shared camera/odometry/SLAM container and 13.6% for OctoMap (136% total), at
-51 C. That is below the 150.6% hybrid stack but above the failed standard mono
-path; moving robustness is the reason for this experiment and is not yet
-proven.
+235, proving that the odometry core is using the device feature set. The direct
+adapter now matches depthai-core's handoff exactly: it passes point locations
+without putting the OAK's persistent IDs in OpenCV `class_id`. Removing those
+IDs cut initial processing from roughly 65-80 ms to 15-35 ms and also filters
+duplicate synchronized image stamps before they reach odometry.
+
+A 2000-point F2M map retained roughly 125-135 stationary inliers but aged to
+5-6 Hz and about 141% total CPU. The tracked launch therefore defaults to a
+1000-point map: at the 70-second checkpoint it produced 8.0-8.2 Hz, roughly
+110-117 inliers and about 125% total CPU. It remained continuously tracked for
+the full 108-second soak, although per-frame work still grew to 110-120 ms near
+the end. `/diagnostics` now reports the synchronized input/output frequency and
+`/rtabmap/oak_feature_count` reports the device feature count. This proves the
+data path, not moving robustness or full performance parity.
 
 The locally unpacked v3 message package was built against a newer Fast-CDR than
 this Pi's system ROS. Do not put a newer Fast-CDR in the overlay's global
