@@ -146,7 +146,7 @@ def biggest_jumps(series, n=5):
     return [{"jump_mm": round(s, 2), "at_s": t} for s, t in steps[:n]]
 
 
-def report(node, hold):
+def report(node, hold, recording_start=None, recording_end=None):
     out = {}
     # When publish_null_when_lost was enabled, RTAB-Map paired a lost OdomInfo
     # with an identity nav_msgs/Odometry at the same stamp. Those are invalid
@@ -163,8 +163,44 @@ def report(node, hold):
 
     if len(raw) > 20:
         span = raw[-1][0] - raw[0][0]
-        start = [p for p in raw if p[0] - raw[0][0] <= hold]
-        end = [p for p in raw if raw[-1][0] - p[0] <= hold]
+        window_start = (recording_start if recording_start is not None
+                        else raw[0][0])
+        window_end = (recording_end if recording_end is not None
+                      else raw[-1][0])
+        recording_span = window_end - window_start
+        start = [p for p in raw
+                 if window_start <= p[0] <= window_start + hold]
+        end = [p for p in raw
+               if window_end - hold <= p[0] <= window_end]
+
+        # A return comparison is only meaningful when the valid pose stream
+        # covers two distinct stationary windows. Previously, a pose stream
+        # that stopped during motion could make both windows select the same
+        # samples and incorrectly report a perfect 0 mm return.
+        endpoint_tolerance = 2.0
+        hold_errors = []
+        if recording_span < 2.0 * hold:
+            hold_errors.append(
+                f"recording is {recording_span:.1f} s; at least "
+                f"{2.0 * hold:.1f} s is required for non-overlapping holds")
+        if not start:
+            hold_errors.append("no valid poses in the starting hold window")
+        elif raw[0][0] - window_start > endpoint_tolerance:
+            hold_errors.append(
+                f"first valid pose arrived {raw[0][0] - window_start:.1f} s "
+                "after recording began")
+        if not end:
+            hold_errors.append("no valid poses in the ending hold window")
+        elif window_end - raw[-1][0] > endpoint_tolerance:
+            hold_errors.append(
+                f"last valid pose was {window_end - raw[-1][0]:.1f} s "
+                "before recording ended")
+
+        return_error = None
+        if not hold_errors:
+            return_error = round(
+                1000.0 * dist(mean_point([p[1:] for p in start]),
+                              mean_point([p[1:] for p in end])), 1)
         travelled = sum(dist(raw[i][1:], raw[i + 1][1:])
                         for i in range(len(raw) - 1))
         raw_points = [p[1:] for p in raw]
@@ -180,12 +216,14 @@ def report(node, hold):
             "max_step_mm": raw_steps[0]["jump_mm"] if raw_steps else 0.0,
             "largest_steps": raw_steps,
             "invalid_null_samples_excluded": invalid_null_samples,
+            "recording_duration_s": round(recording_span, 1),
+            "last_valid_pose_age_s": round(
+                max(0.0, window_end - raw[-1][0]), 2),
             "start_hold_samples": len(start),
             "end_hold_samples": len(end),
-            "return_to_origin_error_mm": (
-                round(1000.0 * dist(mean_point([p[1:] for p in start]),
-                                    mean_point([p[1:] for p in end])), 1)
-                if start and end else None),
+            "hold_comparison_valid": not hold_errors,
+            "hold_comparison_error": "; ".join(hold_errors) or None,
+            "return_to_origin_error_mm": return_error,
         }
     else:
         out["raw_vio_pose_the_one_px4_uses"] = {"samples": len(raw),
@@ -320,7 +358,14 @@ def report(node, hold):
             "excluded from pose metrics; "
             "with publish_null_when_lost=false the pose topic pauses instead. "
             "This still fails the moving flight gate until dropouts are fixed.")
-    r = out["raw_vio_pose_the_one_px4_uses"].get("return_to_origin_error_mm")
+    raw_result = out["raw_vio_pose_the_one_px4_uses"]
+    final_pose_age = raw_result.get("last_valid_pose_age_s", 0.0)
+    if final_pose_age > 0.5:
+        verdict.append(
+            f"The raw pose topic produced no valid pose for the final "
+            f"{final_pose_age:.2f} s of the recording. PX4 would time out "
+            "this external-vision input.")
+    r = raw_result.get("return_to_origin_error_mm")
     if r is not None:
         verdict.append(f"Raw VIO returned to within {r} mm - this is the drift "
                        "PX4 would see, and loop closure cannot remove it.")
@@ -355,14 +400,16 @@ def main():
     node = LoopClosureTest(args)
     print(f"Recording {args.seconds:.0f} s. Hold still ~{args.hold_seconds:.0f} s, "
           "carry a closed loop, return to the marked start, hold still again.")
-    end = time.monotonic() + args.seconds
+    recording_start = time.monotonic()
+    end = recording_start + args.seconds
     try:
         while rclpy.ok() and time.monotonic() < end:
             rclpy.spin_once(node, timeout_sec=0.05)
     except KeyboardInterrupt:
         print("\nstopped early")
 
-    result = report(node, args.hold_seconds)
+    recording_end = time.monotonic()
+    result = report(node, args.hold_seconds, recording_start, recording_end)
     if args.label:
         result = {"label": args.label, **result}
     text = json.dumps(result, indent=2)

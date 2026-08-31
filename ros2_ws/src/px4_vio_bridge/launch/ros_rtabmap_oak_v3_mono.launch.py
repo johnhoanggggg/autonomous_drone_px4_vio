@@ -24,6 +24,12 @@ def generate_launch_description():
         "max_marker_voxels": "50000",
         "vis_max_features": "1000",
         "odom_f2m_max_size": "3000",
+        # Keep both correspondence paths selectable from this wrapper. The
+        # accurate profile uses descriptor matching + bundle adjustment;
+        # optical flow is the faster motion-robust fallback and requires BA
+        # to be disabled.
+        "vis_cor_type": "0",
+        "odom_bundle_adjustment": "1",
     }
     arguments = [
         DeclareLaunchArgument(name, default_value=value)
@@ -46,9 +52,14 @@ def generate_launch_description():
         }.items(),
     )
     return LaunchDescription(arguments + [
-        LogInfo(msg=(
-            "Global-shutter CAM_B parity profile: 1000 visual features, "
-            "3000-feature F2M map, no PX4 output."
-        )),
+        LogInfo(msg=[
+            "Global-shutter CAM_B profile: features=",
+            LaunchConfiguration("vis_max_features"),
+            ", F2M map=", LaunchConfiguration("odom_f2m_max_size"),
+            ", correspondence type=", LaunchConfiguration("vis_cor_type"),
+            ", bundle adjustment=",
+            LaunchConfiguration("odom_bundle_adjustment"),
+            ", no PX4 output.",
+        ]),
         base_launch,
     ])

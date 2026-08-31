@@ -744,6 +744,42 @@ detections. Loss now appears as a pose-output pause instead of a teleport, which
 is safer but still fails the moving gate when it lasts about 1.1 s. A corrected
 full 180 s carry is required next.
 
+A subsequent 60 s run made the moving failure unambiguous. It tracked the first
+19.1 s at 8.7 Hz with no reset-sized valid-pose jump, then registration failed
+as the carry began. `OdomInfo` reported 184/351 lost updates (52.4%) in one
+36.69 s episode, the pose topic never supplied a usable final stationary
+window, and the mapper detected no closure. The old harness incorrectly called
+the overlapping first/last valid samples a 0 mm return. It now anchors both
+hold windows to the actual recording interval, reports the age of the last
+valid pose, and refuses a return-error result unless both non-overlapping holds
+are covered.
+
+The next controlled test reduces descriptor work while retaining bundle
+adjustment. Use 10 s holds for a 60 s screening run so there is 40 s available
+for the same slow, textured route:
+
+```bash
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_mono.launch.py \
+  vis_max_features:=600 odom_f2m_max_size:=2000
+
+python3 scripts/loop_closure_test.py \
+  --label ros-native-mono-600 --seconds 60 --hold-seconds 10 \
+  --raw-odom-topic /rtabmap/vio_odometry --info-topic /rtabmap/info \
+  --out /tmp/loop_ros_native_mono_600.json
+```
+
+If that still loses tracking, repeat the identical route with optical flow and
+bundle adjustment off. This sacrifices stationary precision but separates a
+descriptor-registration failure from a frame-rate failure and more closely
+matches the continuously tracked correspondences supplied to DepthAI's host
+node by the OAK hardware:
+
+```bash
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_mono.launch.py \
+  vis_max_features:=600 odom_f2m_max_size:=2000 \
+  vis_cor_type:=1 odom_bundle_adjustment:=0
+```
+
 This has not flown. It has no PX4 connection, has not been compared against the
 DepthAI-host map on a moving trajectory, and has not yet completed a carried
 loop without tracking loss.
