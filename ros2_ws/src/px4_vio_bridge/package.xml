@@ -9,17 +9,22 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>
 
+  <depend>cv_bridge</depend>
+  <depend>depthai_ros_msgs_v3</depend>
   <depend>geometry_msgs</depend>
+  <depend>message_filters</depend>
   <depend>nav_msgs</depend>
   <build_depend>nlohmann-json3-dev</build_depend>
   <depend>octomap</depend>
   <depend>octomap_msgs</depend>
   <depend>px4_msgs</depend>
   <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
   <depend>rclpy</depend>
   <depend>rtabmap</depend>
   <depend>rtabmap_conversions</depend>
   <depend>rtabmap_msgs</depend>
+  <depend>rtabmap_odom</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>tf2</depend>
@@ -31,7 +36,6 @@
   <exec_depend>depthai_ros_driver</exec_depend>
   <exec_depend>foxglove_bridge</exec_depend>
   <exec_depend>image_proc</exec_depend>
-  <exec_depend>rtabmap_odom</exec_depend>
   <exec_depend>rtabmap_slam</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>

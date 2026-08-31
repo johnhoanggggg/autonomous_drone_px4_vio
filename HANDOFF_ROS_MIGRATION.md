@@ -363,13 +363,53 @@ an output pause approaching 1.1 s is still disqualifying. Repeat the full
 180-second loop with the corrected launch/harness, then address any remaining
 loss episodes.
 
+## OAK-tracked ROS odometry path, 2026-08-31
+
+Both host-detected mono variants then failed a 60-second moving screen: the
+600/2000 descriptor profile stopped producing valid poses for the final 32.85
+seconds, and the optical-flow/no-BA profile lost for 31.05 seconds before
+recovering with a 516 mm discontinuity. This motivated a closer parity path.
+
+`ros_rtabmap_oak_v3_tracked.launch.py` runs `StereoDepth` and `FeatureTracker`
+on the OAK, but no DepthAI VIO or SLAM. The new
+`px4_vio_bridge::OakTrackedOdometry` component derives from ROS RTAB-Map's
+`OdometryROS`, so ROS still owns IMU interpolation, TF, reset behavior and the
+standard odometry/info outputs. It synchronizes rectified CAM_B, CAM_B-aligned
+depth, camera calibration and the RVC2 Harris/KLT output, constructs
+`rtabmap::SensorData`, calls `setFeatures()` with the device points, and then
+uses the ordinary RTAB-Map F2M core. ROS `rtabmap_slam` and the OctoMap adapter
+are unchanged.
+
+Do not replace that direct `SensorData` handoff with a populated
+`rtabmap_msgs/RGBDImage`: Jazzy's `rgbdImageFromROS()` ignores `key_points`.
+The discarded-keypoint prototype showed 239 OAK points but 564 host-detected
+features. In the corrected live graph, asynchronous samples showed 235 OAK
+points, 216 odometry input features and 145 inliers. Stationary output was
+about 8.5 Hz; the shared driver/odometry/SLAM container averaged 122.4% CPU and
+OctoMap 13.6%, at 51 C. This proves the data path, not moving robustness.
+
+Because the unpacked binary `depthai_ros_msgs_v3` was built against a newer
+Fast-CDR, source `/home/john/depthai_v3_compat_ws/install/setup.bash` after the
+v3 overlay and before the project workspace. Never overlay the newer Fast-CDR
+itself; doing so made the system Fast DDS stack crash. The next required carry
+is:
+
+```bash
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_tracked.launch.py
+
+python3 scripts/loop_closure_test.py \
+  --label ros-oak-tracked --seconds 60 --hold-seconds 10 \
+  --raw-odom-topic /rtabmap/vio_odometry --info-topic /rtabmap/info \
+  --out /tmp/loop_ros_oak_tracked.json
+```
+
 ## Open gates before flight
 
-1. **Mono VIO stability under motion.** The first 60 s carry lost tracking for
-   2.7% of status updates in three episodes. Its large apparent jumps were null
-   identity messages rather than true resets and are now suppressed, but a
-   roughly 1.1 s pose-output pause is still not flight-safe. Repeat for the full
-   180 s, then eliminate the dropouts.
+1. **OAK-tracked ROS VIO stability under motion.** Both host-detected mono
+   profiles fail for roughly half of a 60 s carry. The direct OAK-feature path
+   is live and proven to use device features, but only stationary so far. Run
+   the 60 s screen above; require no loss episode or reset-sized discontinuity
+   before extending it to 180 s.
 2. Re-run the loop-closure test once the VIO holds tracking, and confirm the
    ROS mapper accepts closures when the trajectory is consistent. The
    corrected-pose path and `cpp_slam_pose_relay`'s non-identity branch remain

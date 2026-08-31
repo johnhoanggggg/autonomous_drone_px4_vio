@@ -3,22 +3,43 @@ project(px4_vio_bridge)
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(depthai_ros_msgs_v3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(message_filters REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(octomap REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(RTABMap REQUIRED COMPONENTS core)
 find_package(rtabmap_conversions REQUIRED)
 find_package(rtabmap_msgs REQUIRED)
+find_package(rtabmap_odom REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
 ament_python_install_package(${PROJECT_NAME})
+
+add_library(oak_tracked_rgbd_component SHARED
+  src/oak_tracked_rgbd_component.cpp
+)
+target_compile_features(oak_tracked_rgbd_component PUBLIC cxx_std_17)
+ament_target_dependencies(oak_tracked_rgbd_component
+  cv_bridge depthai_ros_msgs_v3 message_filters rclcpp rclcpp_components
+  rtabmap_conversions rtabmap_odom sensor_msgs std_msgs
+)
+target_link_libraries(oak_tracked_rgbd_component
+  rtabmap::core rtabmap_conversions::rtabmap_conversions
+  rtabmap_odom::rtabmap_odom
+)
+rclcpp_components_register_nodes(oak_tracked_rgbd_component
+  "px4_vio_bridge::OakTrackedOdometry"
+)
 
 # ROS-free flight geometry: the exact counterpart of grid_planner.py's
 # clearance test, path_follower.py's polyline and planner_flight.py's command
@@ -170,6 +191,7 @@ ament_target_dependencies(cpp_flight_adapter
 )
 
 install(TARGETS
+  oak_tracked_rgbd_component
   planner_flight_cpp
   slam_pose_relay_cpp
   cpp_slam_pose_relay

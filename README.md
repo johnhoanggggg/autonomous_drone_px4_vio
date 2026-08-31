@@ -796,9 +796,66 @@ normally but its first recovered pose was 516 mm from the last pre-loss pose.
 There was no automatic-reset message: that step can be the physical motion that
 went unobserved during the outage rather than an odometry reset, but PX4 would
 still receive it as one discontinuity. Neither standard ROS-native visual front
-end is flight-eligible on the tested route. Validate the intended production
-fallback next: DepthAI's hardware-tracked VIO feeding the single ROS mapper and
-OctoMap (`rtabmap_slam_px4_3d.launch.py`, with its DepthAI SLAM disabled).
+end is flight-eligible on the tested route.
+
+**OAK feature detection with ROS odometry is now a real third path.**
+`ros_rtabmap_oak_v3_tracked.launch.py` enables the RVC2 `FeatureTracker` on the
+rectified global-shutter left camera, but it does not instantiate DepthAI
+`RTABMapVIO` or `RTABMapSLAM`. A composable node derives from ROS RTAB-Map's
+`OdometryROS`, retains its IMU interpolation, TF, reset services and standard
+`/rtabmap/vio_odometry` plus `/rtabmap/vio_odom_info` outputs, and constructs
+`rtabmap::SensorData` with the OAK's tracked Harris locations before calling the
+ordinary F2M odometry core. ROS `rtabmap_slam` still owns graph SLAM and the
+OctoMap adapter still owns 3D occupancy.
+
+This direct component is necessary. The Jazzy `rgbdImageFromROS()` conversion
+copies the RGB-D images and camera model but does not copy the `RGBDImage`
+`key_points`, so an earlier RGBDImage-only prototype silently made ROS detect
+its own 564 features while the OAK reported about 239. The corrected path
+reported 216 input features in `OdomInfo` while the asynchronous OAK count was
+235, with 145 inliers, proving that the odometry core is using the device
+feature set. A stationary live smoke test measured about 8.5 Hz, 122.4% CPU for
+the shared camera/odometry/SLAM container and 13.6% for OctoMap (136% total), at
+51 C. That is below the 150.6% hybrid stack but above the failed standard mono
+path; moving robustness is the reason for this experiment and is not yet
+proven.
+
+The locally unpacked v3 message package was built against a newer Fast-CDR than
+this Pi's system ROS. Do not put a newer Fast-CDR in the overlay's global
+`LD_LIBRARY_PATH`: it destabilizes Fast DDS. The compatible message-only build
+at `/home/john/depthai_v3_compat_ws` was rebuilt against the installed Jazzy
+libraries and must be sourced after the v3 overlay and before this workspace:
+
+```bash
+cd /home/john/autonomous_drone_px4_vio/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source /home/john/ros2_ws/install/setup.bash
+export AMENT_PREFIX_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy:$AMENT_PREFIX_PATH
+export LD_LIBRARY_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib:\
+/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+export PYTHONPATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/python3.12/site-packages:$PYTHONPATH
+source /home/john/depthai_v3_compat_ws/install/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_tracked.launch.py
+```
+
+For the next moving screen, use the same slow, textured route and 10-second
+holds as the two failed mono tests:
+
+```bash
+python3 scripts/loop_closure_test.py \
+  --label ros-oak-tracked --seconds 60 --hold-seconds 10 \
+  --raw-odom-topic /rtabmap/vio_odometry --info-topic /rtabmap/info \
+  --out /tmp/loop_ros_oak_tracked.json
+```
+
+Pass criteria remain no tracking-loss episode, no reset-sized valid-pose jump,
+a valid ending hold and a usable return error. Until this carry passes, the
+production fallback remains DepthAI's hardware-tracked VIO feeding the single
+ROS mapper and OctoMap (`rtabmap_slam_px4_3d.launch.py`, with DepthAI SLAM
+disabled).
 
 This has not flown. It has no PX4 connection, has not been compared against the
 DepthAI-host map on a moving trajectory, and has not yet completed a carried

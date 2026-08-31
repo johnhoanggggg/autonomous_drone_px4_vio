@@ -19,7 +19,7 @@ Nothing here publishes to /fmu/in/*.
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import LoadComposableNodes, Node
@@ -50,6 +50,9 @@ def generate_launch_description():
         ),
         # v3 fuses the IMU correctly, so unlike the v2 launch this defaults on.
         DeclareLaunchArgument("use_imu", default_value="true"),
+        # Use keypoints detected/tracked by the OAK's RVC2 while keeping the
+        # ROS OdometryROS/F2M core. No DepthAI RTABMapVIO node is created.
+        DeclareLaunchArgument("use_oak_features", default_value="false"),
         DeclareLaunchArgument("imu_topic", default_value="/oak/imu/data"),
         # Keep these selectable so the same ROS odometry/SLAM graph can be
         # compared on either the rolling-shutter RGB camera or the
@@ -104,48 +107,53 @@ def generate_launch_description():
         ("rgb/camera_info", LaunchConfiguration("camera_info_topic")),
     ]
 
+    odometry_parameters = {
+        "frame_id": "oak",
+        "odom_frame_id": "rtabmap_odom",
+        "publish_tf": True,
+        # A null odometry message is an identity pose. Publishing it on a
+        # brief tracking loss looks like a teleport to the origin to an
+        # unsynchronised consumer. Pause pose output instead; OdomInfo and
+        # diagnostics still report the loss, so a future PX4 adapter can
+        # fail stale rather than forward an invalid pose.
+        "publish_null_when_lost": False,
+        "wait_imu_to_init": typed("use_imu", bool),
+        "always_check_imu_tf": typed("use_imu", bool),
+        "qos": typed("sensor_qos", int),
+        "expected_update_rate": typed("odometry_rate_hz", float),
+        "max_update_rate": typed("odometry_rate_hz", float),
+        # RTAB-Map core parameters are declared as strings; passing them as
+        # numbers makes the node abort at startup.
+        "Odom/Strategy": "0",
+        # Preserve the odometry frame through a temporary registration
+        # failure. The default is zero too, but make this flight-critical
+        # behavior explicit.
+        "Odom/ResetCountdown": "0",
+        "Vis/MaxFeatures": core_string("vis_max_features"),
+        "Vis/CorType": core_string("vis_cor_type"),
+        "OdomF2M/MaxSize": core_string("odom_f2m_max_size"),
+        "OdomF2M/BundleAdjustment": core_string("odom_bundle_adjustment"),
+    }
+    odometry_remappings = [
+        ("imu", LaunchConfiguration("imu_topic")),
+        ("odom", "/rtabmap/vio_odometry"),
+        ("odom_info", "/rtabmap/vio_odom_info"),
+    ]
+
     odometry = ComposableNode(
         package="rtabmap_odom",
         plugin="rtabmap_odom::RGBDOdometry",
         namespace="rtabmap",
         name="rgbd_odometry",
-        parameters=[{
-            "frame_id": "oak",
-            "odom_frame_id": "rtabmap_odom",
-            "publish_tf": True,
-            # A null odometry message is an identity pose. Publishing it on a
-            # brief tracking loss looks like a teleport to the origin to an
-            # unsynchronised consumer. Pause pose output instead; OdomInfo and
-            # diagnostics still report the loss, so a future PX4 adapter can
-            # fail stale rather than forward an invalid pose.
-            "publish_null_when_lost": False,
-            "wait_imu_to_init": typed("use_imu", bool),
-            "always_check_imu_tf": typed("use_imu", bool),
+        parameters=[odometry_parameters | {
             "approx_sync": True,
             "approx_sync_max_interval": typed("sync_max_interval", float),
             "topic_queue_size": 10,
             "sync_queue_size": 10,
-            "qos": typed("sensor_qos", int),
             "qos_camera_info": typed("sensor_qos", int),
-            "expected_update_rate": typed("odometry_rate_hz", float),
-            "max_update_rate": typed("odometry_rate_hz", float),
-            # RTAB-Map core parameters are declared as strings; passing them as
-            # numbers makes the node abort at startup.
-            "Odom/Strategy": "0",
-            # Preserve the odometry frame through a temporary registration
-            # failure. The default is zero too, but make this flight-critical
-            # behavior explicit.
-            "Odom/ResetCountdown": "0",
-            "Vis/MaxFeatures": core_string("vis_max_features"),
-            "Vis/CorType": core_string("vis_cor_type"),
-            "OdomF2M/MaxSize": core_string("odom_f2m_max_size"),
-            "OdomF2M/BundleAdjustment": core_string("odom_bundle_adjustment"),
+            "subscribe_rgbd": False,
         }],
-        remappings=sensor_remappings + [
-            ("imu", LaunchConfiguration("imu_topic")),
-            ("odom", "/rtabmap/vio_odometry"),
-            ("odom_info", "/rtabmap/vio_odom_info"),
-        ],
+        remappings=sensor_remappings + odometry_remappings,
     )
 
     mapper = ComposableNode(
@@ -195,9 +203,37 @@ def generate_launch_description():
         ],
     )
 
-    ros_mapping_components = LoadComposableNodes(
+    standard_odometry = LoadComposableNodes(
         target_container="/oak_container",
-        composable_node_descriptions=[odometry, mapper],
+        condition=UnlessCondition(LaunchConfiguration("use_oak_features")),
+        composable_node_descriptions=[odometry],
+    )
+
+    tracked_odometry = LoadComposableNodes(
+        target_container="/oak_container",
+        condition=IfCondition(LaunchConfiguration("use_oak_features")),
+        composable_node_descriptions=[ComposableNode(
+            package="px4_vio_bridge",
+            plugin="px4_vio_bridge::OakTrackedOdometry",
+            namespace="rtabmap",
+            name="oak_tracked_odometry",
+            parameters=[odometry_parameters | {
+                "image_topic": LaunchConfiguration("image_topic"),
+                "depth_topic": LaunchConfiguration("depth_topic"),
+                "camera_info_topic": LaunchConfiguration("camera_info_topic"),
+                "features_topic": (
+                    "/oak/left_rect_feature_tracker/tracked_features"
+                ),
+                "input_queue_size": 10,
+                "input_max_interval": typed("sync_max_interval", float),
+            }],
+            remappings=odometry_remappings,
+        )],
+    )
+
+    mapper_component = LoadComposableNodes(
+        target_container="/oak_container",
+        composable_node_descriptions=[mapper],
     )
 
     octomap = Node(
@@ -251,7 +287,9 @@ def generate_launch_description():
             "Requires the v3 driver on AMENT_PREFIX_PATH; see the module docstring."
         )),
         camera,
-        ros_mapping_components,
+        standard_odometry,
+        tracked_odometry,
+        mapper_component,
         octomap,
         foxglove,
     ])
