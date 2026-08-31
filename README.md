@@ -789,6 +789,17 @@ automatic-reset failure. Reducing descriptor count helps throughput but does
 not solve moving robustness. The optical-flow/no-BA comparison above is now
 the next required run.
 
+Optical flow with bundle adjustment disabled also failed, but differently. It
+was fast while healthy, lost tracking as motion began for 31.05 s, then resumed
+when the camera returned to a recognizable starting view. The raw stream ended
+normally but its first recovered pose was 516 mm from the last pre-loss pose.
+There was no automatic-reset message: that step can be the physical motion that
+went unobserved during the outage rather than an odometry reset, but PX4 would
+still receive it as one discontinuity. Neither standard ROS-native visual front
+end is flight-eligible on the tested route. Validate the intended production
+fallback next: DepthAI's hardware-tracked VIO feeding the single ROS mapper and
+OctoMap (`rtabmap_slam_px4_3d.launch.py`, with its DepthAI SLAM disabled).
+
 This has not flown. It has no PX4 connection, has not been compared against the
 DepthAI-host map on a moving trajectory, and has not yet completed a carried
 loop without tracking loss.

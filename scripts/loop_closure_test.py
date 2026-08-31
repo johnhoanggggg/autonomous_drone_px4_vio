@@ -146,6 +146,31 @@ def biggest_jumps(series, n=5):
     return [{"jump_mm": round(s, 2), "at_s": t} for s, t in steps[:n]]
 
 
+def pose_output_stats(series, gap_threshold=0.5):
+    """Describe estimator throughput without counting long outages as work."""
+    intervals = [
+        (series[i + 1][0] - series[i][0], series[i + 1][0] - series[0][0])
+        for i in range(len(series) - 1)
+    ]
+    active = [duration for duration, _ in intervals
+              if duration < gap_threshold]
+    gaps = [(duration, at_s) for duration, at_s in intervals
+            if duration >= gap_threshold]
+    active_duration = sum(active)
+    return {
+        "active_rate_hz": round(len(active) / active_duration, 1)
+        if active_duration else 0.0,
+        "gap_threshold_s": gap_threshold,
+        "output_gap_count": len(gaps),
+        "longest_output_gap_s": round(
+            max((duration for duration, _ in gaps), default=0.0), 2),
+        "output_gap_events": [
+            {"at_s": round(at_s, 1), "duration_s": round(duration, 2)}
+            for duration, at_s in gaps[:20]
+        ],
+    }
+
+
 def report(node, hold, recording_start=None, recording_end=None):
     out = {}
     # When publish_null_when_lost was enabled, RTAB-Map paired a lost OdomInfo
@@ -177,24 +202,26 @@ def report(node, hold, recording_start=None, recording_end=None):
         # covers two distinct stationary windows. Previously, a pose stream
         # that stopped during motion could make both windows select the same
         # samples and incorrectly report a perfect 0 mm return.
-        endpoint_tolerance = 2.0
         hold_errors = []
         if recording_span < 2.0 * hold:
             hold_errors.append(
                 f"recording is {recording_span:.1f} s; at least "
                 f"{2.0 * hold:.1f} s is required for non-overlapping holds")
+        start_coverage = start[-1][0] - start[0][0] if len(start) > 1 else 0.0
+        end_coverage = end[-1][0] - end[0][0] if len(end) > 1 else 0.0
+        minimum_hold_coverage = 0.5 * hold
         if not start:
             hold_errors.append("no valid poses in the starting hold window")
-        elif raw[0][0] - window_start > endpoint_tolerance:
+        elif start_coverage < minimum_hold_coverage:
             hold_errors.append(
-                f"first valid pose arrived {raw[0][0] - window_start:.1f} s "
-                "after recording began")
+                f"starting hold has only {start_coverage:.1f} s of valid "
+                f"coverage; at least {minimum_hold_coverage:.1f} s is required")
         if not end:
             hold_errors.append("no valid poses in the ending hold window")
-        elif window_end - raw[-1][0] > endpoint_tolerance:
+        elif end_coverage < minimum_hold_coverage:
             hold_errors.append(
-                f"last valid pose was {window_end - raw[-1][0]:.1f} s "
-                "before recording ended")
+                f"ending hold has only {end_coverage:.1f} s of valid coverage; "
+                f"at least {minimum_hold_coverage:.1f} s is required")
 
         return_error = None
         if not hold_errors:
@@ -205,6 +232,7 @@ def report(node, hold, recording_start=None, recording_end=None):
                         for i in range(len(raw) - 1))
         raw_points = [p[1:] for p in raw]
         raw_steps = biggest_jumps(raw)
+        output_stats = pose_output_stats(raw)
         out["raw_vio_pose_the_one_px4_uses"] = {
             "samples": len(raw),
             "duration_s": round(span, 1),
@@ -219,8 +247,11 @@ def report(node, hold, recording_start=None, recording_end=None):
             "recording_duration_s": round(recording_span, 1),
             "last_valid_pose_age_s": round(
                 max(0.0, window_end - raw[-1][0]), 2),
+            **output_stats,
             "start_hold_samples": len(start),
             "end_hold_samples": len(end),
+            "start_hold_coverage_s": round(start_coverage, 2),
+            "end_hold_coverage_s": round(end_coverage, 2),
             "hold_comparison_valid": not hold_errors,
             "hold_comparison_error": "; ".join(hold_errors) or None,
             "return_to_origin_error_mm": return_error,
@@ -265,24 +296,29 @@ def report(node, hold, recording_start=None, recording_end=None):
                 updates, key=lambda u: -u["delta_mm"])[:5],
         }
 
-    # A VIO reset snaps the pose toward the origin. It teleports the odom
-    # frame, which is what makes loop closures fail RTAB-Map's geometric
-    # consistency check, so count them explicitly.
+    # Count raw-pose discontinuities explicitly. A large step can be an odom
+    # reset, but when it follows a long output gap it may instead be all motion
+    # that went unobserved during the outage arriving in one update. Either is
+    # unsafe for PX4, but the pose samples alone cannot distinguish them.
     if len(raw) > 2:
         resets = []
         for i in range(len(raw) - 1):
             step = dist(raw[i][1:], raw[i + 1][1:])
+            preceding_gap = raw[i + 1][0] - raw[i][0]
             near_origin = math.sqrt(sum(v * v for v in raw[i + 1][1:])) < 0.05
             if step > 0.25:
                 resets.append({"at_s": round(raw[i + 1][0] - raw[0][0], 1),
                                "jump_mm": round(1000.0 * step, 1),
+                               "preceding_output_gap_s": round(preceding_gap, 2),
+                               "after_output_gap": preceding_gap >= 0.5,
                                "landed_near_origin": bool(near_origin)})
         out["vio_resets_and_jumps"] = {
             "count": len(resets),
             "events": resets[:10],
-            "note": ("Steps over 250 mm in the RAW pose. These teleport the "
-                     "odom frame and are the usual reason loop closures get "
-                     "rejected for graph error. PX4 sees these directly."),
+            "note": ("Steps over 250 mm in the RAW pose. A step after an "
+                     "output gap may be unobserved physical motion rather than "
+                     "an estimator reset, but PX4 sees either discontinuity "
+                     "directly."),
         }
 
     if len(corr) > 2:
@@ -351,10 +387,14 @@ def report(node, hold, recording_start=None, recording_end=None):
                        "path is still unexercised.")
     rs = out.get("vio_resets_and_jumps", {}).get("count", 0)
     if rs:
+        after_gaps = sum(
+            1 for event in out["vio_resets_and_jumps"]["events"]
+            if event.get("after_output_gap"))
         verdict.append(
-            f"{rs} large jumps in the RAW pose. VIO tracking was lost during "
-            "the run. Loop closures will be rejected for graph error until "
-            "this is fixed, and PX4 would see these steps directly.")
+            f"{rs} large discontinuities in the RAW pose ({after_gaps} after "
+            "an output gap). PX4 would see these steps directly; the pose "
+            "samples alone cannot identify them as resets versus unobserved "
+            "motion during tracking loss.")
     if lost_fraction:
         loss = out["odometry_while_moving"]
         verdict.append(
@@ -371,6 +411,12 @@ def report(node, hold, recording_start=None, recording_end=None):
             f"The raw pose topic produced no valid pose for the final "
             f"{final_pose_age:.2f} s of the recording. PX4 would time out "
             "this external-vision input.")
+    longest_pose_gap = raw_result.get("longest_output_gap_s", 0.0)
+    if longest_pose_gap > 0.5:
+        verdict.append(
+            f"The raw pose stream had an internal output gap of "
+            f"{longest_pose_gap:.2f} s. This independently fails the PX4 "
+            "continuity gate even on stacks without OdomInfo diagnostics.")
     r = raw_result.get("return_to_origin_error_mm")
     if r is not None:
         verdict.append(f"Raw VIO returned to within {r} mm - this is the drift "
