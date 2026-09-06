@@ -467,6 +467,22 @@ Yaw follows the commanded path heading, so the airframe — and the forward-faci
 camera the VIO depends on — points along the route. Translation pauses above
 `yaw_align_error_deg` (40) and resumes below `yaw_resume_error_deg` (15).
 
+The C++ adapter (`cpp_mode:=true`) now chooses that heading from a non-mutating
+preview of the **accepted path command**, including bounded joins and corner
+waits, rather than the upstream follower displacement. It can select the next
+heading while stopped for alignment without advancing the actual command.
+Clearance/geofence rejection restores both the command and its yaw decision.
+`/planner/flight/config` identifies this as
+`"yaw_direction_source":"constrained_command_preview"`.
+The legacy Python adapter is unchanged. This is built and regression-tested,
+not yet flight-validated; see [heading handoff](HANDOFF_YAW_TRACKING.md).
+
+For a separate enclosed-space experiment, `corner_blending:=false` selects the
+existing stop-at-corners behavior. It is not enabled by this change. Validate
+the new heading behavior props-off with `auto_arm:=false` before flight, and do
+not interpret command alignment as a guarantee of actual course: position
+feedback, yaw slew and inertia still matter.
+
 ## Observability
 
 ### Process load — `/perf/*`

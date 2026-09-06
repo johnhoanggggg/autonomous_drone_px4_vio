@@ -302,3 +302,276 @@ TEST(PathCommandLimiter, JoinBrakesToTheEndOfAShortReplacement)
   EXPECT_LT(speed_of(limiter), 0.02) << "did not stop at the end of the route";
   EXPECT_LT(limiter.position()->first, x + 0.10 + 1.0e-6);
 }
+
+TEST(CommandHeading, PreviewStartsFromRestWithoutAdvancingTheCommand)
+{
+  PathCommandLimiter limiter;
+  limiter.set_path({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}}, {0.0, 0.0});
+  const auto before = limiter.snapshot();
+  // Follower aims diagonally across the corner; the accepted command goes east.
+  const auto direction = limiter.preview_direction({1.0, 1.0}, 0.05, {0.0, 0.0}, 0.15);
+  ASSERT_TRUE(direction);
+  EXPECT_NEAR(direction->first, 1.0, 1e-12);
+  EXPECT_NEAR(direction->second, 0.0, 1e-12);
+  EXPECT_EQ(limiter.snapshot().position, before.position);
+  EXPECT_EQ(limiter.snapshot().velocity, before.velocity);
+  EXPECT_EQ(limiter.snapshot().progress, before.progress);
+  EXPECT_EQ(limiter.snapshot().speed, before.speed);
+  // A yaw hold does not hide the heading needed to release the hold.
+  for (int i = 0; i < 10; ++i) {
+    limiter.update({1.0, 1.0}, 0.05, false, Point2{0.0, 0.0});
+    EXPECT_EQ(limiter.preview_direction({1.0, 1.0}, 0.05, {0.0, 0.0}, 0.15), direction);
+  }
+  EXPECT_EQ(limiter.position(), before.position);
+  limiter.update({1.0, 1.0}, 0.05, true, Point2{0.0, 0.0});
+  EXPECT_GT(limiter.position()->first, 0.0);
+}
+
+TEST(PathCommandLimiter, JoinMergesInsideTheCappedAngleAndStillFinishes)
+{
+  // Regression for the corner weave on 20260906T120129Z / T120238Z. The three
+  // original bounds let the lateral term reach cruise speed, so a replacement a
+  // few centimetres to the side was commanded as a 45-degree dart. Every
+  // commanded velocity must now stay within the merge cap of the route.
+  for (const double offset : {0.02, 0.035, 0.05}) {
+    auto limiter = running_limiter();
+    ASSERT_TRUE(limiter.set_path({{0.0, offset}, {3.0, offset}}, {0.0, offset}))
+      << "offset " << offset;
+    ASSERT_TRUE(limiter.joining()) << "offset " << offset;
+    double worst = 0.0;
+    int ticks = 0;
+    for (; ticks < 200 && limiter.joining(); ++ticks) {
+      limiter.update({3.0, offset}, 0.05, true, limiter.position());
+      const auto v = limiter.velocity();
+      if (std::hypot(v.first, v.second) > 1.0e-6) {
+        worst = std::max(worst, std::abs(std::atan2(v.second, v.first)));
+      }
+    }
+    EXPECT_LT(worst, 16.0 * M_PI / 180.0)
+      << "offset " << offset << " commanded " << worst * 180.0 / M_PI << " deg off route";
+    EXPECT_FALSE(limiter.joining()) << "offset " << offset << " never finished merging";
+    EXPECT_LT(ticks * 0.05, 4.0) << "offset " << offset << " merge took too long";
+  }
+}
+
+TEST(PathCommandLimiter, JoinEscalatesToCloseALargeOffsetInBoundedTime)
+{
+  // 20260906T124409Z: a hard replan left the command 0.168 m off the new path.
+  // The angle bound alone needed about three seconds, the follower tripped at
+  // 0.9 s, and the fault froze the merge with the offset standing. An offset
+  // this large is a real replan, not a re-anchor, and has to close promptly.
+  // The flown projection tolerance is 0.05 m, and it is what the escalation is
+  // measured against, so this runs the launch configuration rather than the
+  // looser 0.10 m the shared fixture uses.
+  px4_vio_bridge::PathCommandLimiter limiter(
+    0.20, 0.30, 0.05, 0.05, 0.30, 0.20, 0.01, true, 0.05);
+  limiter.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0});
+  for (int tick = 0; tick < 40; ++tick) {
+    limiter.update({3.0, 0.0}, 0.05, true, limiter.position());
+  }
+  const auto clearance = [](const Point2 &, const Point2 &) {return true;};
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.170}, {3.0, 0.170}}, {0.0, 0.170}, clearance));
+  ASSERT_TRUE(limiter.joining());
+  double worst = 0.0;
+  double under_follower_limit = -1.0;
+  int ticks = 0;
+  for (; ticks < 200 && limiter.joining(); ++ticks) {
+    limiter.update({3.0, 0.170}, 0.05, true, limiter.position());
+    const auto v = limiter.velocity();
+    if (std::hypot(v.first, v.second) > 1.0e-6) {
+      worst = std::max(worst, std::abs(std::atan2(v.second, v.first)));
+    }
+    // The follower's own max_cross_track is 0.08 m, and tripping it is what
+    // latched the fault that froze the merge and landed the aircraft. Getting
+    // back inside it quickly matters more than when the last 3 mm closes.
+    if (under_follower_limit < 0.0 &&
+      std::abs(limiter.position()->second - 0.170) < 0.08)
+    {
+      under_follower_limit = (ticks + 1) * 0.05;
+    }
+  }
+  EXPECT_FALSE(limiter.joining()) << "a large offset never closed";
+  EXPECT_GT(under_follower_limit, 0.0);
+  // The along-path and lateral terms share one `max_speed_` budget, so the norm
+  // limit shrinks both, and the velocity still has to rotate under the
+  // acceleration limit -- the merge is slower than the bound alone implies:
+  // 1.05 s measured here, against about 3 s from the flat bound.
+  // The flight tripped at 0.9 s, so this shortens the exposure rather than
+  // removing it: what turned that trip into a landing is that a latched fault
+  // stops the limiter being ticked at all, which this does not address.
+  EXPECT_LT(under_follower_limit, 1.2)
+    << "still outside the follower's cross-track limit after "
+    << under_follower_limit << " s";
+  EXPECT_LT(ticks * 0.05, 3.0) << "took " << ticks * 0.05 << " s to merge";
+  EXPECT_GT(worst, 16.0 * M_PI / 180.0) << "the time bound never escalated past the angle bound";
+  EXPECT_LT(worst, 50.0 * M_PI / 180.0) << "escalated further than the old uncapped merge";
+}
+
+TEST(PathCommandLimiter, JoinFinishesWithNoAlongPathMotionLeft)
+{
+  // The cap scales with the along-path rate, so the floor is what closes a
+  // rejoin opened where there is no route left to travel.
+  auto limiter = running_limiter();
+  ASSERT_TRUE(limiter.position().has_value());
+  const double x = limiter.position()->first;
+  ASSERT_TRUE(limiter.set_path({{x - 0.05, 0.030}, {x + 0.02, 0.030}}, {x, 0.030}));
+  ASSERT_TRUE(limiter.joining());
+  for (int tick = 0; tick < 400 && limiter.joining(); ++tick) {
+    limiter.update({x + 0.02, 0.030}, 0.05, true, limiter.position());
+  }
+  EXPECT_FALSE(limiter.joining()) << "a rejoin with no along-path motion never completed";
+}
+
+TEST(CommandHeading, PreviewFollowsTheRouteNotTheJoinAndLeavesAllJoinStateIntact)
+{
+  auto limiter = running_limiter();
+  limiter.set_path({{0.0, 0.060}, {3.0, 0.060}}, {0.0, 0.060});
+  ASSERT_TRUE(limiter.joining());
+  const auto before = limiter.snapshot();
+  const auto direction = limiter.preview_direction({3.0, 0.060}, 0.05, *limiter.position(), 0.15);
+  ASSERT_TRUE(direction);
+  const auto after = limiter.snapshot();
+  EXPECT_EQ(after.installation, before.installation);
+  EXPECT_EQ(after.position, before.position);
+  EXPECT_EQ(after.velocity, before.velocity);
+  EXPECT_EQ(after.progress, before.progress);
+  EXPECT_EQ(after.speed, before.speed);
+  EXPECT_EQ(after.join_target, before.join_target);
+  EXPECT_EQ(after.join_limit, before.join_limit);
+  EXPECT_EQ(after.waiting_vertex, before.waiting_vertex);
+  // The route is east. The lane change north is a 6 cm correction the command
+  // point makes on its way, and it must not be flown as a heading.
+  EXPECT_NEAR(direction->first, 1.0, 1e-12);
+  EXPECT_NEAR(direction->second, 0.0, 1e-12);
+  limiter.update({3.0, 0.060}, 0.05, true, before.position);
+  EXPECT_GT(limiter.velocity().second, 1.0e-3)
+    << "this tick is supposed to contain the lateral term the heading ignores";
+}
+
+TEST(CommandHeading, HeadingSurvivesBrakingThenAReplacementDuringAlignment)
+{
+  // The 2026-09-06 stall: 20260906T113239Z spent 39.5 s of a 42.5 s route in
+  // YAW_ALIGN and netted 0.295 m. Alignment brakes the command point; the next
+  // replacement opens a join; the one-tick velocity out of rest is then the
+  // acceleration direction, which the lateral term dominates. Heading swung to
+  // ~85 degrees off the route, which restarted the alignment that had just
+  // released, on a route that never turned.
+  // Above `suffix_tolerance` (0.01 m here), or the replacement is treated as
+  // the same geometry renumbered and never opens a join at all.
+  for (const double offset : {0.02, 0.03, 0.10}) {
+    auto limiter = running_limiter();
+    const auto moving = limiter.preview_direction({3.0, 0.0}, 0.05, *limiter.position(), 0.15);
+    ASSERT_TRUE(moving) << "offset " << offset;
+    EXPECT_NEAR(moving->first, 1.0, 1e-12) << "offset " << offset;
+
+    // Alignment pauses translation. Brake to a standstill on the same route.
+    for (int tick = 0; tick < 40; ++tick) {
+      limiter.update({3.0, 0.0}, 0.05, false, limiter.position());
+    }
+    ASSERT_LT(speed_of(limiter), 1.0e-6) << "offset " << offset;
+
+    // The planner republishes, shifted sideways by less than the drone is wide.
+    ASSERT_TRUE(limiter.set_path({{0.0, offset}, {3.0, offset}}, {0.0, offset}));
+    ASSERT_TRUE(limiter.joining()) << "offset " << offset;
+    const auto stopped = limiter.preview_direction(
+      {3.0, offset}, 0.05, *limiter.position(), 0.15);
+    ASSERT_TRUE(stopped) << "offset " << offset;
+    EXPECT_NEAR(stopped->first, 1.0, 1e-12) << "offset " << offset;
+    EXPECT_NEAR(stopped->second, 0.0, 1e-12) << "offset " << offset;
+  }
+}
+
+TEST(CommandHeading, RepeatedReplacementsWhileHeldCannotWalkTheHeading)
+{
+  // The alignment loop ran for 12 entries over 42 s, so one tick is not enough
+  // coverage: hold translation and keep replacing the path, as the planner does
+  // at about 1 Hz, and the commanded heading must stay on the route.
+  auto limiter = running_limiter();
+  double worst = 0.0;
+  for (int cycle = 0; cycle < 20; ++cycle) {
+    const double offset = (cycle % 2 == 0 ? 1.0 : -1.0) * 0.02 * (1 + cycle % 3);
+    ASSERT_TRUE(limiter.set_path({{0.0, offset}, {3.0, offset}}, {0.0, offset}))
+      << "cycle " << cycle;
+    for (int tick = 0; tick < 5; ++tick) {
+      const auto reference = *limiter.position();
+      const auto direction = limiter.preview_direction({3.0, offset}, 0.05, reference, 0.15);
+      ASSERT_TRUE(direction) << "cycle " << cycle;
+      worst = std::max(worst, std::abs(std::atan2(direction->second, direction->first)));
+      limiter.update({3.0, offset}, 0.05, false, reference);
+    }
+  }
+  EXPECT_LT(worst, 1.0e-9) << "heading walked off an unchanged eastbound route";
+}
+
+TEST(CommandHeading, RejectedReplacementKeepsHeadingOnAcceptedPath)
+{
+  auto limiter = running_limiter();
+  EXPECT_THROW(limiter.set_path({{0.0, 1.0}, {0.0, 3.0}}, {0.0, 1.0}), std::invalid_argument);
+  const auto direction = limiter.preview_direction({3.0, 1.0}, 0.05, *limiter.position(), 0.15);
+  ASSERT_TRUE(direction);
+  EXPECT_NEAR(direction->first, 1.0, 1e-12);
+  EXPECT_NEAR(direction->second, 0.0, 1e-12);
+}
+
+TEST(CommandHeading, PreviewDoesNotPreventBrakingDuringYawHold)
+{
+  auto limiter = running_limiter();
+  limiter.set_path({{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030});
+  auto without_preview = limiter;
+  for (int tick = 0; tick < 40; ++tick) {
+    const auto reference = *limiter.position();
+    (void)limiter.preview_direction({3.0, 0.030}, 0.05, reference, 0.15);
+    limiter.update({3.0, 0.030}, 0.05, false, reference);
+    without_preview.update({3.0, 0.030}, 0.05, false, reference);
+    EXPECT_EQ(limiter.position(), without_preview.position());
+    EXPECT_EQ(limiter.velocity(), without_preview.velocity());
+  }
+  EXPECT_LT(speed_of(limiter), 0.02);
+}
+
+TEST(CommandHeading, CornerWaitFacesIncomingThenOutgoingLegWithoutConsumingWait)
+{
+  PathCommandLimiter limiter;
+  limiter.set_path({{0.0, 0.0}, {0.2, 0.0}, {0.2, 0.5}}, {0.0, 0.0});
+  for (int i = 0; i < 200 && !limiter.waiting_vertex(); ++i) {
+    limiter.update({0.2, 0.5}, 0.05, true, Point2{0.0, 0.0});
+  }
+  ASSERT_TRUE(limiter.waiting_vertex());
+  auto direction = limiter.preview_direction({0.2, 0.5}, 0.05, {0.0, 0.0}, 0.15);
+  ASSERT_TRUE(direction);
+  EXPECT_NEAR(direction->first, 1.0, 1e-12);
+  direction = limiter.preview_direction({0.2, 0.5}, 0.05, {0.2, 0.0}, 0.15);
+  ASSERT_TRUE(direction);
+  EXPECT_NEAR(direction->first, 0.0, 1e-12);
+  EXPECT_NEAR(direction->second, 1.0, 1e-12);
+  EXPECT_TRUE(limiter.waiting_vertex());
+  EXPECT_NEAR(limiter.position()->second, 0.0, 1e-12);
+}
+
+TEST(CommandHeading, AtGoalRetainsHeadingAndFailedPreviewCannotMutateState)
+{
+  PathCommandLimiter limiter;
+  limiter.set_path({{0.0, 0.0}, {1.0, 0.0}}, {0.0, 0.0});
+  const auto before = limiter.snapshot();
+  EXPECT_FALSE(limiter.preview_direction({0.0, 0.0}, 0.05, {0.0, 0.0}, 0.15));
+  EXPECT_THROW(
+    (void)limiter.preview_direction({1.0, 0.0}, -0.05, {0.0, 0.0}, 0.15), std::invalid_argument);
+  EXPECT_THROW(
+    (void)limiter.preview_direction({1.0, 0.0}, 0.05, {0.0, 0.0}, 0.0), std::invalid_argument);
+  EXPECT_EQ(limiter.snapshot().position, before.position);
+  EXPECT_EQ(limiter.snapshot().progress, before.progress);
+}
+
+TEST(CommandHeading, MapCorrectionIsRemovedBeforeNedHeading)
+{
+  PathCommandLimiter limiter;
+  // East in VIO has been rotated north in the map by a +90 degree correction.
+  limiter.set_path({{0.0, 0.0}, {0.0, 1.0}}, {0.0, 0.0});
+  const auto direction = limiter.preview_direction({0.0, 1.0}, 0.05, {0.0, 0.0}, 0.15);
+  ASSERT_TRUE(direction);
+  const auto vio = px4_vio_bridge::map_displacement_to_vio(*direction, M_PI / 2.0);
+  const auto heading = px4_vio_bridge::ned_track_heading(
+    px4_vio_bridge::vio_enu_displacement_to_ned(vio), 1.0e-6);
+  ASSERT_TRUE(heading);
+  EXPECT_NEAR(*heading, M_PI / 2.0, 1e-12);
+}

@@ -90,6 +90,15 @@ public:
     // counts as an escape, or one proposes a chord the other vetoes.
     escape_minimum_improvement_ =
       declare_parameter<double>("escape_minimum_improvement", 0.01);
+    // A fault hold pins the aircraft where it stands, which is the one thing
+    // that must not happen when what it is standing in is a clearance
+    // violation. 20260906T131950Z held between 0.119 m and 0.241 m of an
+    // obstacle needing 0.250 m for four and a half seconds, 0.69 m short of its
+    // goal, and landed on the fault timer. `fault_escape_step` is how far each
+    // probe reaches; `fault_escape_limit` is the total travel a hold may spend
+    // escaping before it gives up and simply holds.
+    fault_escape_step_ = declare_parameter<double>("fault_escape_step", 0.05);
+    fault_escape_limit_ = declare_parameter<double>("fault_escape_limit", 0.50);
     goal_hold_time_ = declare_parameter<double>("goal_hold_time", 3.0);
     max_follower_displacement_ =
       declare_parameter<double>("max_follower_displacement", 1.0);
@@ -727,6 +736,8 @@ private:
   {
     nlohmann::json config;
     config["implementation"] = "cpp";
+    config["fault_escape_step"] = fault_escape_step_;
+    config["fault_escape_limit"] = fault_escape_limit_;
     config["command_speed"] = limiter_->max_speed();
     config["command_acceleration"] = limiter_->max_acceleration();
     config["corner_blending"] = corner_blending_;
@@ -743,6 +754,7 @@ private:
     config["route_command_grace"] = route_command_grace_;
     config["goal_hold_time"] = goal_hold_time_;
     config["yaw_track"] = yaw_track_;
+    config["yaw_direction_source"] = "constrained_command_preview";
     config["yaw_align_error_deg"] = degrees(yaw_align_error_);
     config["yaw_resume_error_deg"] = degrees(yaw_resume_error_);
     config["horizontal_feedforward"] = horizontal_feedforward_;
@@ -791,6 +803,65 @@ private:
     }
   }
 
+  /// Walk the held command out of a clearance violation.
+  ///
+  /// A fault hold otherwise pins the aircraft exactly where it stands, and when
+  /// what it is standing in is a clearance violation that is the one place it
+  /// must not stay: 20260906T131950Z spent four and a half seconds between
+  /// 0.119 m and 0.241 m of an obstacle needing 0.250 m, and landed on the
+  /// fault timer 0.69 m from its goal, because nothing was allowed to move it.
+  ///
+  /// This does not resume the route. It re-picks a short step out of the
+  /// violation from the vehicle's own pose every tick, and only ever a step the
+  /// ordinary escape rule admits -- no point closer to an occupied cell than
+  /// the pose already is, and a material gain at the endpoint. Travel is capped
+  /// at `fault_escape_limit_` from where the hold began, the step is still
+  /// speed- and acceleration-limited by the published-command limiter, and the
+  /// land countdown keeps running: this buys the escape a chance to work, it
+  /// does not excuse the fault.
+  bool escape_clearance_while_held()
+  {
+    fault_escape_clearance_.reset();
+    if (state_ != State::Route || !is_armed() || !map_pose_ || !correction_ || !pos_) {
+      return false;
+    }
+    if (!x0_ || !y0_ || !std::isfinite(pos_->x) || !std::isfinite(pos_->y)) {
+      return false;
+    }
+    if (!grid_ || !follower_required_clearance_ || !follower_occupied_threshold_) {
+      return false;
+    }
+    if (fault_escape_step_ <= 0.0 || fault_escape_limit_ <= 0.0) {
+      return false;
+    }
+    const auto clearance = pose_clearance();
+    if (!clearance || *clearance >= *follower_required_clearance_) {
+      return false;
+    }
+    fault_escape_clearance_ = *clearance;
+    if (!limiter_->position() || !fault_hold_origin_) {
+      return false;
+    }
+    if (distance(*limiter_->position(), *fault_hold_origin_) >= fault_escape_limit_) {
+      return false;
+    }
+    const auto target_map = best_clearance_escape_step(
+      clearance_probe(), *map_pose_, fault_escape_step_, escape_limits(), *clearance);
+    if (!target_map) {
+      return false;
+    }
+    const Point2 map_step{
+      target_map->first - map_pose_->first, target_map->second - map_pose_->second};
+    const auto ned_step = vio_enu_displacement_to_ned(
+      map_displacement_to_vio(map_step, (*correction_)[3]));
+    const Point2 target_ned = clamp_to_disc(
+      {static_cast<double>(pos_->x) + ned_step.first,
+        static_cast<double>(pos_->y) + ned_step.second},
+      {*x0_, *y0_}, geofence_radius_);
+    limiter_->update(target_ned, dt_);
+    return true;
+  }
+
   void latch_fault_hold(const PlannerFault & fault)
   {
     const double now = monotonic_time();
@@ -798,8 +869,10 @@ private:
       if (pos_ && std::isfinite(pos_->x) && std::isfinite(pos_->y)) {
         limiter_->reset({static_cast<double>(pos_->x), static_cast<double>(pos_->y)});
       }
+      fault_hold_origin_ = limiter_->position();
       holding_for_fault_ = true;
     }
+    const bool escaping = escape_clearance_while_held();
     // Never let an unvalidated route command advance internally while the
     // published command is holding. A recovery restarts from actual pose.
     route_limiter_->clear();
@@ -817,14 +890,20 @@ private:
       planner_fault_since_ = now;
     }
     const double elapsed = now - *planner_fault_since_;
+    std::string escape_text;
+    if (fault_escape_clearance_) {
+      escape_text = format(
+        " clearance=%.3f/%.3fm%s", *fault_escape_clearance_, *follower_required_clearance_,
+        escaping ? " escaping" : " no admissible escape");
+    }
     publish_route_status(
-      suppressed ?
+      (suppressed ?
       format(
         "HOLD planner fault: %s; land countdown held while the route settles",
         fault.reason.c_str()) :
       format(
         "HOLD planner fault: %s; land in %.1fs", fault.reason.c_str(),
-        std::max(0.0, planner_fault_land_time_ - elapsed)),
+        std::max(0.0, planner_fault_land_time_ - elapsed))) + escape_text,
       "HOLD");
     if (is_armed() && !suppressed && elapsed >= planner_fault_land_time_) {
       trigger_landing("planner fault persisted: " + fault.reason);
@@ -857,6 +936,8 @@ private:
     planner_fault_since_.reset();
     planner_fault_reason_text_.clear();
     holding_for_fault_ = false;
+    fault_hold_origin_.reset();
+    fault_escape_clearance_.reset();
   }
 
   std::optional<std::string> hold_route_command(const std::string & reason)
@@ -903,14 +984,14 @@ private:
     return wrap_pi(*yaw_target_ - static_cast<double>(pos_->heading));
   }
 
-  void update_yaw_target(const Point2 & ned_displacement)
+  void update_yaw_target(std::optional<double> heading)
   {
     if (!yaw_track_) {
       return;
     }
     yaw_target_ = track_yaw_target(
       yaw_target_,
-      ned_track_heading(ned_displacement, yaw_track_min_displacement_),
+      heading,
       yaw_track_deadband_);
     if (yaw_align_error_ <= 0.0) {
       yaw_holding_ = false;
@@ -999,8 +1080,6 @@ private:
   /// and the last validated setpoint both stand.
   std::pair<std::optional<std::string>, std::optional<std::string>> update_route_command()
   {
-    const auto ned_displacement = vio_enu_displacement_to_ned(*vio_displacement_);
-    update_yaw_target(ned_displacement);
     std::optional<std::string> deferral;
 
     const auto clearance_check = [this](const Point2 & start, const Point2 & end) {
@@ -1011,11 +1090,9 @@ private:
     // paused, the vehicle drifts as it pivots, and each republished route comes
     // out shifted from the command that is standing still. Keep the accepted
     // path until the nose is back on the leg.
-    if (yaw_holding_ && !replan_during_yaw_align_) {
-      if (!route_limiter_->path()) {
-        return {std::nullopt, std::string("waiting for yaw alignment before route entry")};
-      }
-    } else {
+    // First entry needs an installed path to preview even if a prior hold
+    // latched yaw alignment. During subsequent turns retain the accepted path.
+    if (!yaw_holding_ || replan_during_yaw_align_ || !route_limiter_->path()) {
       try {
         route_limiter_->set_path(path_points_, *map_pose_, clearance_check);
       } catch (const std::exception & error) {
@@ -1033,6 +1110,13 @@ private:
     }
 
     const auto restore_point = route_limiter_->snapshot();
+    const auto previous_yaw_target = yaw_target_;
+    const bool previous_yaw_holding = yaw_holding_;
+    const auto restore_command = [&]() {
+        route_limiter_->restore(restore_point);
+        yaw_target_ = previous_yaw_target;
+        yaw_holding_ = previous_yaw_holding;
+      };
     Point2 final_map{};
     try {
       const auto map_displacement =
@@ -1040,10 +1124,28 @@ private:
       const Point2 desired_map{
         map_pose_->first + map_displacement.first,
         map_pose_->second + map_displacement.second};
+      if (yaw_track_) {
+        // Preview with advance=true even during a yaw hold: the stopped
+        // limiter must reveal the direction that will resume after alignment.
+        // Use the accepted path's join/corner geometry, not the follower carrot
+        // which may be on a deferred replacement or beyond the current corner.
+        // preview_direction() reports the route tangent rather than the tick's
+        // command velocity, so a replacement installed while stopped cannot
+        // hand the nose the join's few-centimetre lateral correction and
+        // restart the alignment it just finished.
+        const auto direction = route_limiter_->preview_direction(
+          desired_map, dt_, *map_pose_, yaw_track_min_displacement_);
+        std::optional<double> heading;
+        if (direction) {
+          const auto vio_direction = map_displacement_to_vio(*direction, (*correction_)[3]);
+          heading = ned_track_heading(vio_enu_displacement_to_ned(vio_direction), 1.0e-6);
+        }
+        update_yaw_target(heading);
+      }
       final_map = route_limiter_->update(
         desired_map, dt_, !yaw_holding_, map_pose_);
     } catch (const std::exception & error) {
-      route_limiter_->restore(restore_point);
+      restore_command();
       return {
         std::nullopt,
         std::string("path-constrained command rejected: ") + error.what()};
@@ -1053,7 +1155,7 @@ private:
     // point and swept segment that PX4 will receive must be safe. Rewinding
     // leaves last tick's cleared command on the wire.
     if (!command_chord_permitted(*map_pose_, final_map)) {
-      route_limiter_->restore(restore_point);
+      restore_command();
       const auto clearance = pose_clearance();
       return {
         std::nullopt,
@@ -1073,7 +1175,7 @@ private:
     if (distance(final_ned, {*x0_, *y0_}) > geofence_radius_) {
       // The vehicle itself is still inside; holding the last command is the
       // recovery. An actual breach is caught by geofence_breached().
-      route_limiter_->restore(restore_point);
+      restore_command();
       return {
         std::nullopt,
         std::string("path-constrained command lies outside flight geofence")};
@@ -1160,6 +1262,11 @@ private:
   double map_timeout_{}, map_pose_timeout_{};
   double planner_fault_land_time_{}, goal_hold_time_{}, route_entry_grace_{};
   double escape_minimum_improvement_{};
+  double fault_escape_step_{};
+  double fault_escape_limit_{};
+  /// Where the current fault hold began, so escape travel can be bounded.
+  std::optional<Point2> fault_hold_origin_;
+  std::optional<double> fault_escape_clearance_;
   double max_follower_displacement_{}, max_correction_m_{}, max_correction_yaw_{};
   bool horizontal_feedforward_{};
   double route_command_grace_{};

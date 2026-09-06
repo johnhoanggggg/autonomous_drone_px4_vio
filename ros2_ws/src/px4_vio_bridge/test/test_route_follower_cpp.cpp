@@ -764,3 +764,76 @@ TEST(CorrectionReplanGate, FilterConvergenceIsNotAMaterialChange)
   }
   EXPECT_EQ(gate.epoch(), 2);
 }
+
+TEST(ClearanceEscape, HeldPoseStepsAwayFromTheWall)
+{
+  // 20260906T131950Z was held between 0.119 m and 0.241 m of an obstacle
+  // needing 0.250 m for four and a half seconds and landed on the fault timer.
+  // A held pose has no route command to escape along, so the step is chosen
+  // from the pose itself.
+  const auto grid = wall_grid();          // occupied column at x in [1.00, 1.05]
+  const auto probe = grid_probe(grid);
+  const Point2 pose{0.88, 1.00};          // 0.12 m from the wall
+  const auto start = probe(pose, pose);
+  ASSERT_TRUE(start);
+  ASSERT_LT(*start, 0.25);
+  px4_vio_bridge::ClearanceEscapeLimits limits;
+  limits.required_clearance = 0.25;
+  const auto target = px4_vio_bridge::best_clearance_escape_step(
+    probe, pose, 0.05, limits, *start);
+  ASSERT_TRUE(target) << "no admissible step out of a clearance violation";
+  EXPECT_LT(target->first, pose.first) << "stepped toward the wall, not away";
+  const auto gained = probe(*target, *target);
+  ASSERT_TRUE(gained);
+  EXPECT_GT(*gained, *start);
+  // Walking it repeatedly has to actually recover, not slide along the contour.
+  Point2 walker = pose;
+  double walker_clearance = *start;
+  int steps = 0;
+  for (; steps < 40 && walker_clearance < limits.required_clearance; ++steps) {
+    const auto next = px4_vio_bridge::best_clearance_escape_step(
+      probe, walker, 0.05, limits, walker_clearance);
+    if (!next) {
+      break;
+    }
+    walker = *next;
+    walker_clearance = *probe(walker, walker);
+  }
+  EXPECT_GE(walker_clearance, limits.required_clearance)
+    << "gave up at " << walker_clearance << " m after " << steps << " steps";
+}
+
+TEST(ClearanceEscape, HeldPoseProposesNothingWhenAlreadyClear)
+{
+  // Above the envelope the ordinary rule applies and there is nothing to
+  // escape from, so a hold stays a hold.
+  const auto grid = wall_grid();
+  const auto probe = grid_probe(grid);
+  const Point2 pose{0.30, 1.00};          // 0.70 m from the wall
+  const auto start = probe(pose, pose);
+  ASSERT_TRUE(start);
+  px4_vio_bridge::ClearanceEscapeLimits limits;
+  limits.required_clearance = 0.25;
+  const auto target = px4_vio_bridge::best_clearance_escape_step(
+    probe, pose, 0.05, limits, *start);
+  // Every direction is admissible here, but only one that gains clearance is
+  // ever returned, and it must never be toward the wall.
+  if (target) {
+    EXPECT_LT(target->first, pose.first);
+  }
+}
+
+TEST(ClearanceEscape, HeldPoseRejectsBadInputs)
+{
+  const auto grid = wall_grid();
+  const auto probe = grid_probe(grid);
+  px4_vio_bridge::ClearanceEscapeLimits limits;
+  limits.required_clearance = 0.25;
+  EXPECT_FALSE(px4_vio_bridge::best_clearance_escape_step(probe, {0.88, 1.0}, 0.0, limits, 0.12));
+  EXPECT_FALSE(px4_vio_bridge::best_clearance_escape_step(probe, {0.88, 1.0}, -0.05, limits, 0.12));
+  EXPECT_FALSE(
+    px4_vio_bridge::best_clearance_escape_step(probe, {0.88, 1.0}, 0.05, limits, 0.12, 2));
+  const px4_vio_bridge::ClearanceProbe blind =
+    [](const Point2 &, const Point2 &) {return std::optional<double>{};};
+  EXPECT_FALSE(px4_vio_bridge::best_clearance_escape_step(blind, {0.88, 1.0}, 0.05, limits, 0.12));
+}

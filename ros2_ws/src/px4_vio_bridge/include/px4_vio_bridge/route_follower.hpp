@@ -107,6 +107,20 @@ bool command_chord_admissible(
   ChordRole role = ChordRole::Target,
   double * end_clearance = nullptr);
 
+/// Best short step out of a clearance violation, for a vehicle that is being
+/// held and so has no route command to escape along.
+///
+/// Tries `directions` evenly spaced headings at `step` metres and returns the
+/// admissible one whose endpoint gains the most clearance. Admissibility is the
+/// ordinary escape rule -- no point of the chord may be closer to an occupied
+/// cell than the pose already is, and the endpoint must improve materially --
+/// so this can only ever propose a step away from the obstacle. No value when
+/// nothing improves, which is the caller's cue to keep holding.
+std::optional<Point2> best_clearance_escape_step(
+  const ClearanceProbe & probe, const Point2 & pose, double step,
+  const ClearanceEscapeLimits & limits, double start_clearance,
+  int directions = 16);
+
 /// Farthest admissible lookahead in [min_lookahead, lookahead], stepping down
 /// by `lookahead_step`. No value means hold: neither a normal chord nor an
 /// escape exists.

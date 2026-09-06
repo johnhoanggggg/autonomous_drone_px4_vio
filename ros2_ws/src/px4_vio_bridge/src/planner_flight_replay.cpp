@@ -47,6 +47,9 @@ json dump_path(const PathCommandLimiter & limiter)
   state["velocity"] = json::array({limiter.velocity().first, limiter.velocity().second});
   state["waiting_vertex"] = limiter.waiting_vertex()
     ? json(*limiter.waiting_vertex()) : json(nullptr);
+  // Not compared by the Python parity test, which reads named fields only.
+  // replay_command_heading.py needs it to know when a lane change is active.
+  state["joining"] = limiter.joining();
   state["has_path"] = limiter.path() != nullptr;
   return state;
 }
@@ -98,6 +101,12 @@ int main()
       if (op == "set_path") {
         result["changed"] = path_limiter.set_path(
           points_of(step.at("points")), point_of(step.at("reference")), clearance_check);
+      } else if (op == "preview_direction") {
+        const auto direction = path_limiter.preview_direction(
+          point_of(step.at("desired")), step.at("dt").get<double>(),
+          point_of(step.at("reference")), step.value("min_position_distance", 0.15));
+        result["direction"] = direction
+          ? json::array({direction->first, direction->second}) : json(nullptr);
       } else if (op == "update") {
         path_limiter.update(
           point_of(step.at("desired")),

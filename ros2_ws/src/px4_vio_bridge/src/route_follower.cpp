@@ -91,6 +91,33 @@ bool command_chord_admissible(
   return *endpoint + limits.tolerance >= goal;
 }
 
+std::optional<Point2> best_clearance_escape_step(
+  const ClearanceProbe & probe, const Point2 & pose, double step,
+  const ClearanceEscapeLimits & limits, double start_clearance, int directions)
+{
+  if (!probe || !finite(pose) || !std::isfinite(step) || step <= 0.0 || directions < 3) {
+    return std::nullopt;
+  }
+  std::optional<Point2> best;
+  double best_clearance = start_clearance;
+  for (int index = 0; index < directions; ++index) {
+    const double angle = 2.0 * M_PI * static_cast<double>(index) /
+      static_cast<double>(directions);
+    const Point2 target{pose.first + step * std::cos(angle), pose.second + step * std::sin(angle)};
+    double end_clearance = 0.0;
+    if (!command_chord_admissible(
+        probe, pose, target, limits, start_clearance, ChordRole::Target, &end_clearance))
+    {
+      continue;
+    }
+    if (end_clearance > best_clearance + limits.tolerance) {
+      best_clearance = end_clearance;
+      best = target;
+    }
+  }
+  return best;
+}
+
 std::optional<LookaheadSelection> select_safe_lookahead(
   const Polyline & path, const Point2 & pose, const ClearanceProbe & probe,
   const ClearanceEscapeLimits & limits,

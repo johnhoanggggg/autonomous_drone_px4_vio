@@ -101,6 +101,20 @@ public:
     bool advance = true,
     const std::optional<Point2> & reference_point = std::nullopt);
 
+  /// Direction the accepted route is travelled in next, without committing any
+  /// progress, join or corner state. Unit vector in the path frame.
+  ///
+  /// This is path geometry, not the one-tick command velocity. From rest that
+  /// velocity is acceleration-limited, so update_join()'s lateral term
+  /// dominates its along-path term and a few centimetres of lane change would
+  /// be flown as a right-angle turn -- the 2026-09-06 stall.
+  /// When the previewed tick commands no along-path motion at all, face an
+  /// existing position target only if it is far enough from the vehicle;
+  /// otherwise retain the caller's previous heading.
+  [[nodiscard]] std::optional<Point2> preview_direction(
+    const Point2 & desired_point, double dt, const Point2 & reference_point,
+    double min_position_distance) const;
+
   [[nodiscard]] const std::shared_ptr<const PathInstallation> & installation() const
   {
     return installation_;
@@ -128,6 +142,10 @@ private:
   /// lane change is braked by corners and the path end exactly as motion is.
   double along_path_speed(double along, double dt, bool advance);
   [[nodiscard]] Point2 path_tangent(double along) const;
+  /// Unit tangent of the leg the command point is about to travel. Forward
+  /// difference, so at a vertex this is the outgoing leg rather than the
+  /// bisector a central difference would return.
+  [[nodiscard]] std::optional<Point2> advance_tangent() const;
   [[nodiscard]] double next_motion_target(double desired_progress) const;
   [[nodiscard]] double corner_speed(double turn) const;
   [[nodiscard]] double corner_speed_limit() const;
@@ -143,6 +161,18 @@ private:
   /// placed on the path. A tenth of a grid cell: small enough that snapping is
   /// below the map's own resolution, large enough that the join terminates.
   double join_tolerance_{0.003};
+  /// Largest lateral closing rate a rejoin may add, as a multiple of the
+  /// along-path rate: tan(15 degrees), so the commanded velocity stays within
+  /// 15 degrees of the route while a replacement is being merged onto.
+  double join_lateral_ratio_{0.2679};
+  /// Lateral rate allowed regardless of the ratio, so a rejoin still completes
+  /// when the along-path rate is zero. A crawl next to the 0.20 m/s cruise.
+  double join_lateral_floor_{0.02};
+  /// Beyond `max_projection_error_` of offset the merge angle widens in
+  /// proportion, so an offset too large for the flat bound to clear before the
+  /// follower's cross-track limit trips cannot stand. Inside that tolerance --
+  /// which covers the re-anchoring offsets the bound exists for, median 0.022 m
+  /// and 0.048 m on 20260906T120129Z and T120238Z -- nothing changes.
   bool corner_blending_;
   double junction_deviation_;
 

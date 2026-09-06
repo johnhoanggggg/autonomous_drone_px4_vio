@@ -385,9 +385,52 @@ Point2 PathCommandLimiter::update_join(double dt, bool advance)
   if (advance && offset_distance > kEpsilon) {
     // Close the offset no faster than it can be stopped, and never faster than
     // it can be closed this tick, so the lateral term cannot overshoot the path.
+    //
+    // Then cap it against the along-path rate, because those three bounds alone
+    // let the lateral term reach cruise speed: at 0.30 m/s^2 anything past
+    // ~7 cm saturates `sqrt(2*a*offset)` at the full 0.20 m/s, and an equal
+    // along-path term puts the commanded velocity 45 degrees off the route at
+    // full speed. The planner republishes about twice a second anchored on the
+    // vehicle, so a rejoin is not the occasional lane change this was written
+    // for -- it was open for 36-57% of the route on 20260906T120129Z and
+    // T120238Z, and the drone spent that time crabbing to the outside of every
+    // bend (median 18 and 27 degrees off route, worst 85) until cross-track
+    // tripped the follower and translation was held.
+    //
+    // `join_lateral_ratio_` bounds the merge angle instead. The floor is only
+    // for the terminal case -- a rejoin opened where the route has no travel
+    // left to scale against -- because a floor applied whenever the along-path
+    // rate is merely small would dominate the direction coming out of a brake,
+    // where one tick of acceleration is all the along-path rate there is.
+    // One flat angle is not enough either. 20260906T124409Z auto-landed on it:
+    // a hard replan left the command 0.168 m off the new path, 15 degrees of a
+    // 0.20 m/s cruise needed about three seconds to close that, the follower's
+    // 0.08 m cross-track limit tripped after 0.9 s, and a latched fault stops
+    // update_route_command() being called at all -- so the merge froze with the
+    // offset standing. Six seconds later the adapter landed. T124502Z reached
+    // 0.211 m, past the connector limit, where no replacement joins at all.
+    //
+    // So widen the angle in proportion to how far past `max_projection_error_`
+    // the offset has got. Inside that tolerance the offset is the few
+    // centimetres of re-anchoring the bound exists for and the merge stays at
+    // `join_lateral_ratio_`; beyond it the command is somewhere a replacement
+    // can no longer be joined from, and closing that is worth a wider angle.
+    //
+    // The escalation stays proportional to the along-path rate, deliberately.
+    // An absolute rate -- a merge-time bound -- was tried first and put the
+    // replayed 90th percentile back at 22-75 degrees, because a rate that does
+    // not scale with travel dominates the direction exactly where the
+    // along-path rate is small, which is the failure this whole bound exists to
+    // prevent.
+    const double escalation = max_projection_error_ > kEpsilon
+      ? std::max(1.0, offset_distance / max_projection_error_)
+      : 1.0;
+    const double lateral_limit = along_speed > kEpsilon
+      ? along_speed * join_lateral_ratio_ * escalation
+      : join_lateral_floor_;
     const double lateral_speed = std::min(
       {max_speed_, offset_distance / dt,
-        std::sqrt(2.0 * max_acceleration_ * offset_distance)});
+        std::sqrt(2.0 * max_acceleration_ * offset_distance), lateral_limit});
     desired_velocity = {
       desired_velocity.first + offset.first / offset_distance * lateral_speed,
       desired_velocity.second + offset.second / offset_distance * lateral_speed};
@@ -568,6 +611,78 @@ Point2 PathCommandLimiter::update(
     (position_->first - old_position.first) / dt,
     (position_->second - old_position.second) / dt};
   return *position_;
+}
+
+std::optional<Point2> PathCommandLimiter::advance_tangent() const
+{
+  if (!installation_) {
+    return std::nullopt;
+  }
+  const double length = installation_->path->length();
+  const double step = std::min(1.0e-4, length);
+  if (step <= kEpsilon) {
+    return std::nullopt;
+  }
+  // Forward difference from the previewed progress. A central difference would
+  // straddle a vertex and return the bisector; the command point is about to
+  // travel the outgoing leg, so that is the leg the nose has to face.
+  const double back = std::clamp(progress_, 0.0, length - step);
+  const Point2 a = installation_->path->point_at(back);
+  const Point2 b = installation_->path->point_at(back + step);
+  const Point2 delta{b.first - a.first, b.second - a.second};
+  const double norm = std::hypot(delta.first, delta.second);
+  if (norm <= kEpsilon) {
+    return std::nullopt;
+  }
+  return Point2{delta.first / norm, delta.second / norm};
+}
+
+std::optional<Point2> PathCommandLimiter::preview_direction(
+  const Point2 & desired_point, double dt, const Point2 & reference_point,
+  double min_position_distance) const
+{
+  if (!finite(reference_point) || !std::isfinite(min_position_distance) ||
+    min_position_distance <= 0.0)
+  {
+    throw std::invalid_argument("heading reference and positive distance must be finite");
+  }
+  // The installation is immutable and shared. The copy owns all mutable
+  // progress/join/corner state, including changes made before an exception.
+  auto preview = *this;
+  const auto next = preview.update(desired_point, dt, true, reference_point);
+
+  // Heading comes from the route, not from this tick's command velocity.
+  //
+  // The velocity of a single advancing tick is only the route direction while
+  // the command point is already moving along the path. Out of a yaw-alignment
+  // brake it is the ACCELERATION direction: along-path gets `a*dt` (0.015 m/s
+  // at the flown 0.30 m/s^2 and 20 Hz) while update_join()'s lateral term gets
+  // up to `sqrt(2*a*offset)` (0.134 m/s at 3 cm), so a lane change narrower
+  // than the drone reads as a right-angle turn. `join_tolerance_` is 3 mm and
+  // the planner replaces the path about once a second, so on 2026-09-06 nearly
+  // every replacement during an alignment re-pointed yaw sideways and the
+  // alignment kept restarting: 39.5 s of a 42.5 s route, 0.295 m flown.
+  //
+  // The tangent ahead of the previewed progress is where translation actually
+  // resumes, and it does not depend on the current speed, so braking, joining
+  // and releasing all report the same heading.
+  const bool advancing =
+    preview.speed_ > kEpsilon || preview.progress_ > progress_ + kEpsilon;
+  if (advancing) {
+    if (const auto tangent = preview.advance_tangent()) {
+      return tangent;
+    }
+  }
+  // Nothing along-path is being commanded -- at the goal, or held off a corner
+  // the vehicle has not reached. Face a standing position target if it is far
+  // enough to be meaningful, otherwise keep the caller's previous heading.
+  const Point2 offset{
+    next.first - reference_point.first, next.second - reference_point.second};
+  const double magnitude = std::hypot(offset.first, offset.second);
+  if (magnitude < min_position_distance) {
+    return std::nullopt;
+  }
+  return Point2{offset.first / magnitude, offset.second / magnitude};
 }
 
 Point2 clamp_to_disc(const Point2 & point, const Point2 & center, double radius)

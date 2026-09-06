@@ -272,8 +272,18 @@ def generate_launch_description():
         # Flight 20260831T033736Z ran below 200 features for 42% of its samples
         # in the doorway approach with nothing raised. Hold rather than commit
         # into a narrow gap when the tracker is starving.
-        DeclareLaunchArgument("min_vio_features", default_value="150"),
+        #
+        # Lowered 150 -> 75 on 2026-09-06. At 150 this landed 20260906T113122Z
+        # 5.7 s into a route that was tracking well (heading/course median 3.4
+        # deg, VIO 13.3 Hz with a 0.103 s worst gap) on `latest=146` -- a 3%
+        # dip below the threshold, not a tracking failure.
+        DeclareLaunchArgument("min_vio_features", default_value="75"),
         DeclareLaunchArgument("vio_feature_loss_time", default_value="0.25"),
+        # A fault hold pins the aircraft where it stands. 20260906T131950Z was
+        # held inside its own clearance envelope for 4.5 s and landed on the
+        # fault timer; these let the hold walk out of that, bounded.
+        DeclareLaunchArgument("fault_escape_step", default_value="0.05"),
+        DeclareLaunchArgument("fault_escape_limit", default_value="0.50"),
         DeclareLaunchArgument("max_horizontal_error", default_value="0.35"),
         DeclareLaunchArgument("transit_horizontal_error", default_value="0.60"),
         DeclareLaunchArgument("pre_route_max_horizontal_error", default_value="0.15"),
@@ -337,6 +347,8 @@ def generate_launch_description():
         "max_correction_m": typed("max_correction_m", float),
         "max_correction_yaw_deg": typed("max_correction_yaw_deg", float),
         "min_vio_features": typed("min_vio_features", int),
+        "fault_escape_step": typed("fault_escape_step", float),
+        "fault_escape_limit": typed("fault_escape_limit", float),
         "vio_feature_loss_time": typed("vio_feature_loss_time", float),
         "max_horizontal_error": typed("max_horizontal_error", float),
         "transit_horizontal_error": typed("transit_horizontal_error", float),
