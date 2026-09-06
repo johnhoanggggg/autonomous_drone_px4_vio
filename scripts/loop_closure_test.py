@@ -446,10 +446,61 @@ def main():
     ap.add_argument("--label", default="",
                     help="Tag for the report, e.g. 'hybrid' or 'depthai'.")
     ap.add_argument("--out", default="")
+    ap.add_argument(
+        "--startup-timeout", type=float, default=10.0,
+        help=("Wait this many seconds for the first raw pose before starting "
+              "the timed test. Exit early if the estimator is not publishing."),
+    )
     args = ap.parse_args()
 
     rclpy.init()
     node = LoopClosureTest(args)
+    raw_topic = args.raw_odom_topic or args.raw_pose_topic
+    print(f"Waiting up to {args.startup_timeout:.0f} s for {raw_topic}. "
+          "Keep the drone still.")
+    startup_deadline = time.monotonic() + args.startup_timeout
+    try:
+        while (rclpy.ok() and not node.raw
+               and time.monotonic() < startup_deadline):
+            rclpy.spin_once(node, timeout_sec=0.05)
+    except KeyboardInterrupt:
+        print("\nstopped before recording")
+
+    if not node.raw:
+        publisher_count = node.count_publishers(raw_topic)
+        result = {
+            "raw_vio_pose_the_one_px4_uses": {
+                "samples": 0,
+                "error": (
+                    f"no messages received on {raw_topic} during the "
+                    f"{args.startup_timeout:.1f} s startup preflight"),
+                "publisher_count": publisher_count,
+            },
+            "loop_closures": {
+                "count": 0,
+                "global_count": 0,
+                "proximity_count": 0,
+                "events": [],
+            },
+            "verdict": [
+                "NO RAW ODOMETRY RECEIVED. This is a launch, ROS domain, "
+                "topic, or dead-publisher problem; it is not a route-texture "
+                "or loop-closure result. Start exactly one estimator stack "
+                "and verify the raw topic is moving before repeating."
+            ],
+        }
+        if args.label:
+            result = {"label": args.label, **result}
+        text = json.dumps(result, indent=2)
+        print(text)
+        if args.out:
+            with open(args.out, "w") as fh:
+                fh.write(text + "\n")
+            print(f"written to {args.out}")
+        node.destroy_node()
+        rclpy.shutdown()
+        raise SystemExit(2)
+
     print(f"Recording {args.seconds:.0f} s. Hold still ~{args.hold_seconds:.0f} s, "
           "carry a closed loop, return to the marked start, hold still again.")
     recording_start = time.monotonic()

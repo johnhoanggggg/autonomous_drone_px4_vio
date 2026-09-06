@@ -1,0 +1,16 @@
+diff --git a/depthai_ros_driver/src/param_handlers/feature_tracker_param_handler.cpp b/depthai_ros_driver/src/param_handlers/feature_tracker_param_handler.cpp
+index b3ae625..b41080b 100644
+--- a/depthai_ros_driver/src/param_handlers/feature_tracker_param_handler.cpp
++++ b/depthai_ros_driver/src/param_handlers/feature_tracker_param_handler.cpp
+@@ -22,6 +22,11 @@ void FeatureTrackerParamHandler::declareParams(std::shared_ptr<dai::node::Featur
+ 
+     };
+     auto config = featureTracker->initialConfig;
++    config->setCornerDetector(dai::FeatureTrackerConfig::CornerDetector::Type::HARRIS);
++    config->setNumTargetFeatures(declareAndLogParam<int>("i_num_target_features", 320));
++    config->setMotionEstimator(declareAndLogParam<bool>("i_enable_motion_estimator", true));
++    config->featureMaintainer.minimumDistanceBetweenFeatures =
++        declareAndLogParam<double>("i_min_distance_between_features", 50.0);
+     config->motionEstimator.type = (motionEstMap.at(declareAndLogParam<std::string>("i_motion_estimator", "LUCAS_KANADE_OPTICAL_FLOW")));
+     featureTracker->initialConfig = config;
+ }

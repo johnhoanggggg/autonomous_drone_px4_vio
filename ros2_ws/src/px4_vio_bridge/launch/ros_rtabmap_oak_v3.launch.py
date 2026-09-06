@@ -267,8 +267,9 @@ def generate_launch_description():
             "port": LaunchConfiguration("foxglove_port"),
             "topic_whitelist": (
                 "['^/tf(_static)?$', "
-                "'^/oak/(rgb/(image_raw(/compressed)?|camera_info)|stereo/image_raw|imu/data)$', "
-                "'^/rtabmap/(vio_odometry|vio_odom_info|mapPath|localization_pose|info|"
+                "'^/oak/(left/(image_rect(/compressed)?|camera_info)|stereo/image_raw|"
+                "left_rect_feature_tracker/tracked_features|imu/data)$', "
+                "'^/rtabmap/(vio_odometry|vio_odom_info|oak_feature_count|mapPath|localization_pose|info|"
                 "octomap_(ground_|obstacle_)?markers|octomap_metadata)$']"
             ),
             "service_whitelist": "['^$']",

@@ -10,22 +10,17 @@
       i_enable_ir: false
     pipeline_gen:
       i_nn_type: none
-      i_pipeline_type: rgbd
+      # Depth creates StereoDepth plus IMU without starting the unused RGB
+      # camera/encoder path. This saves host USB and device-side work.
+      i_pipeline_type: depth
       i_enable_imu: true
-    rgb:
-      i_synced: true
-      i_fps: 20.0
-      i_resolution: "1080P"
-      i_width: 640
-      i_height: 360
-      i_set_isp_scale: true
     left:
-      i_fps: 20.0
+      i_fps: 30.0
       i_resolution: "480P"
       i_width: 640
       i_height: 400
     right:
-      i_fps: 20.0
+      i_fps: 30.0
       i_resolution: "480P"
       i_width: 640
       i_height: 400
@@ -38,7 +33,7 @@
       # This attaches FeatureTracker to StereoDepth.rectifiedLeft, not to the
       # unrectified sensor image, so feature coordinates match image/depth.
       i_left_rect_enable_feature_tracker: true
-      i_fps: 20.0
+      i_fps: 30.0
       i_width: 640
       i_height: 400
       i_set_input_size: true
@@ -47,6 +42,10 @@
       i_subpixel: true
       i_left_right_check: true
     left_rect_feature_tracker:
+      # Match the known-good DepthAI-host RTABMapVIO front end.
+      i_num_target_features: 400
+      i_enable_motion_estimator: true
+      i_min_distance_between_features: 49.0
       i_motion_estimator: LUCAS_KANADE_OPTICAL_FLOW
       i_num_shaves: 1
       i_num_memory_slices: 2

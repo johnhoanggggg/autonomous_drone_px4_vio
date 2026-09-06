@@ -828,6 +828,16 @@ the end. `/diagnostics` now reports the synchronized input/output frequency and
 `/rtabmap/oak_feature_count` reports the device feature count. This proves the
 data path, not moving robustness or full performance parity.
 
+The 30 FPS/depth-only/400-target parity profile improved the best stationary
+run. In a 172-second soak it kept valid odometry throughout with about 163-176
+inliers and 16-21 ms odometry work per ordinary frame. Measured rates were
+about 29.4 Hz for OAK tracks, 27 Hz for rectified image and depth, 199 Hz for
+IMU, and 25.9 Hz for odometry. The component container plus OctoMap adapter
+initially used about 88.5% of one Pi core in total. A second fresh run was less
+repeatable: it aged to about 90-110 ms, roughly 9-10 Hz and 125% CPU after three
+minutes while remaining tracked. The source-side feature path is better, but
+long-run performance variance and moving robustness are still open gates.
+
 The locally unpacked v3 message package was built against a newer Fast-CDR than
 this Pi's system ROS. Do not put a newer Fast-CDR in the overlay's global
 `LD_LIBRARY_PATH`: it destabilizes Fast DDS. The compatible message-only build
@@ -843,11 +853,21 @@ export LD_LIBRARY_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib:\
 /home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
 export PYTHONPATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/python3.12/site-packages:$PYTHONPATH
 source /home/john/depthai_v3_compat_ws/install/setup.bash
+source /home/john/depthai_v3_feature_ws/install/setup.bash
 source install/setup.bash
 export ROS_DOMAIN_ID=42
 
 ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_tracked.launch.py
 ```
+
+The final overlay is a source build of the exact `v3.2.1-jazzy` driver. The
+binary driver does not expose the OAK FeatureTracker's target count, motion
+estimator switch or minimum feature spacing. The small reproducible source
+change is kept in
+`patches/depthai_ros_driver_v3_feature_tracker_params.patch`. The tracked
+profile uses 400 Harris/KLT tracks with 49-pixel squared minimum spacing at
+30 FPS, matching the known-good DepthAI-host front end, and uses the driver's
+depth-only pipeline so the unused RGB camera path is not started.
 
 For the next moving screen, use the same slow, textured route and 10-second
 holds as the two failed mono tests:
@@ -869,14 +889,15 @@ This has not flown. It has no PX4 connection, has not been compared against the
 DepthAI-host map on a moving trajectory, and has not yet completed a carried
 loop without tracking loss.
 
-##### Topologies that do not work on this driver
+##### OAK-D-Lite v3 pipeline details
 
-`i_pipeline_type: depth` publishes the device-rectified mono pair and depth but
-never starts the IMU. `i_pipeline_type: stereo` starts the IMU but not depth.
-Only `RGBD` brings up depth and IMU together. `i_resolution: "400"` is rejected
-by the OAK-D-Lite's OV7251 ("Resolution 400 not supported ... Using default
-resolution 480P"); the vendor `isaac_vslam.yaml` value targets a different
-sensor.
+On the exact `v3.2.1-jazzy` source used here, `i_pipeline_type: depth` creates
+StereoDepth and the IMU without creating the RGB camera. `stereo` creates the
+mono cameras and IMU but no depth output. The earlier binary-profile note that
+only `RGBD` could provide both depth and IMU was incorrect; the live depth-only
+smoke test delivered both. `i_resolution: "400"` is rejected by the
+OAK-D-Lite's OV7251 ("Resolution 400 not supported ... Using default resolution
+480P"); the vendor `isaac_vslam.yaml` value targets a different sensor.
 
 ```bash
 cd /home/john/autonomous_drone_px4_vio/ros2_ws
