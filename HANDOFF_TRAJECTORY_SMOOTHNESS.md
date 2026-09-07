@@ -1,0 +1,160 @@
+# Trajectory smoothness and wall strikes — handoff, 2026-09-07
+
+> **Superseded diagnosis / follow-up:** Read
+> [HOVER_TURN_20260907.md](HOVER_TURN_20260907.md) for the subsequent open-area
+> test: a fixed-position hold reproduced poor rate tracking and growing yaw
+> compensation, with low recorded loaded voltage. The new control topics are
+> now captured and analyzed. Then read
+> [WALL_STRIKES_20260907.md](WALL_STRIKES_20260907.md). Onboard logs show
+> 0.419 m/s actual speed against only 0.141 m/s PX4 demand at the peak; the
+> proposed 0.3 m/s cap would not bind this event. The offboard acceleration
+> limit and instantaneous-yaw-freeze claims below are also corrected there.
+> A tested early yaw slowdown is now built (610 tests, no failures); the
+> control-response/hold-drift issue still needs physical validation. PX4 gains
+> and speed limits remain unchanged. Three missing control topics were added
+> to SD logging for the next PX4 boot. The historical handoff follows intact.
+
+Branch `enclosed-spaces-tuning`. Everything below is C++ (`cpp_mode:=true`);
+`planner_flight.py` is legacy and is deliberately NOT kept in step — the C++
+join has diverged from it and the parity test still passes because its scenarios
+do not reach the diverged branch.
+
+## State of the tree
+
+`334b28a "more confident flying"` carries the heading fix, the join cap and its
+escalation, `min_vio_features` 75, and the escape-while-held. **Uncommitted** is
+the follower-dropout ride-out: `follower_latch_grace` / `degraded_speed`, the
+`speed_cap` argument on `PathCommandLimiter::update()`, the `DEGRADED` status,
+their launch arguments, three regressions, and the last section of
+`CORNER_WEAVE_20260906.md`.
+
+`colcon test`: **607 tests, 0 errors, 0 failures, 3 skips.**
+
+Build and test from the WORKSPACE ROOT (`ros2_ws/`). Running colcon from
+`src/px4_vio_bridge` half-succeeds and reports a stale 504-test result — that
+cost me three wasted cycles.
+
+## What changed, and what each change is actually worth
+
+Read `CORNER_WEAVE_20260906.md` for the full derivation; this is the summary.
+
+| change | evidence it works |
+|---|---|
+| heading from the route tangent, not the tick's velocity (`preview_direction`) | at-rest preview NED 90.0° at every offset, was 6.4° at 3 cm |
+| join lateral capped to `tan15° × along_speed` | in flight, joining median 30° → **15.0°**, >20° share 42% → 2.7% |
+| escalation past `max_projection_error_` | command offset median 0.035 → 0.000–0.004 m |
+| `min_vio_features` 150 → 75 | 135902Z and 140117Z spent 0.68 s and 0.42 s under 150 (watchdog trips at 0.25 s) and would both have landed; neither spent 0.15 s under 100 |
+| escape-while-held | **never triggered in flight.** Unexercised |
+| follower ride-out (`DEGRADED`) | 8 ride-outs in 20260907T080022Z; not yet measured against stop counts |
+
+Two failed designs, recorded so they are not retried:
+
+- **A merge-*time* bound** (`lateral ≥ offset / 1 s`) instead of the escalation.
+  An absolute rate dominates the direction wherever the along-path rate is
+  small, which is the failure the bound exists to prevent. Replayed p90 went
+  straight back to 22–75°.
+- **An unscoped lateral floor** (`max(floor, ratio × along)`). Out of a brake
+  one tick of acceleration is the whole along-path rate, so a 0.02 m/s floor
+  reads as 53° = atan(0.02/0.015). The floor is now used only when
+  `along_speed` is exactly zero.
+
+## The open problem: it hits the right wall
+
+Two strikes, in `20260907T080337Z` (|a_xy| 6.2 m/s², t=22.45) and
+`20260907T080022Z` (4.6 m/s², t=26.62). The 080337Z one is fully resolved:
+
+| t | lat vs path | heading | course | cmd dir | nose−course | speed |
+|---|---|---|---|---|---|---|
+| 21.45 | +0.043 | 108° | 110° | 107° | +2° | 0.26 |
+| 22.11 | −0.008 | 111° | 170° | 116° | +59° | 0.40 |
+| 22.21 | −0.021 | 112° | 173° | 124° | +61° | 0.41 ← YAW_ALIGN |
+| 22.41 | −0.055 | 116° | −180° | 139° | +64° | 0.40 |
+| 22.51 | −0.065 | 119° | +70° | 142° | −49° | 0.22 ← impact |
+
+1. **Twice the commanded speed.** 0.42 m/s against 0.20. Read over NSH:
+   `MPC_XY_VEL_MAX` 1.0, `MPC_ACC_HOR_MAX` 5.0, `MPC_XY_P` 0.95,
+   `MPC_XY_VEL_P_ACC` 1.8 / `_I_ACC` 0.4 / `_D_ACC` 0.2, `MPC_JERK_AUTO` 4.0.
+   PX4 may use 5× the cruise and 17× the acceleration to chase the setpoint.
+   At the planner's 0.30 m/s², 0.42 m/s needs 0.29 m to stop; the corridor gives
+   0.30–0.46 m.
+2. **Yaw cannot keep up with the bend.** Course rotates ~70° in a second, yaw
+   slews at 20°/s, so the nose ends 64° off the direction of travel.
+3. **The freeze is late and abrupt.** YAW_ALIGN triggers at 40° of error and cuts
+   translation to zero, which removes steering without removing momentum. Lateral
+   goes +0.021 → −0.065 m across the freeze: it slides right, into the wall.
+
+Ruled out with data: trim (roll mean −0.27°/−0.33°), the planner routing near the
+wall (lateral error unbiased, 49%/45% of samples each side, never worse than
+7 cm), and map jumps (the correction was constant through the whole event).
+
+**Unresolved link.** The actual course over-rotates well past the commanded
+direction (173° vs 124° at 22.21). Best inference is that PX4 tracks the
+position setpoint, not the feedforward: the vehicle had fallen behind, the
+setpoint went round the corner, and the position-error vector rotates the course
+faster than the feedforward direction. **This is reasoning, not measurement.**
+Confirm it by comparing demanded against achieved acceleration through a bend
+before acting on it.
+
+## What to do next, in this order
+
+1. **Cap PX4 to something near the mission.** `MPC_XY_VEL_MAX` 1.0 → ~0.3 and
+   `MPC_ACC_HOR_MAX` 5.0 → ~1.0, over `scripts/nsh.py` (needs
+   `.venv-mavlink/bin/python3`, pymavlink is not in the system env). **Not
+   applied — the user has not approved it.** It also clamps position-mode flying
+   generally, which is the trade to raise with them. This is the prerequisite for
+   step 2 being safe.
+2. **Stop freezing translation dead for a yaw alignment.** Either raise the slew
+   from 20°/s or let translation continue at a low cap — the `speed_cap`
+   argument added for the ride-out is the mechanism, already tested. Do not do
+   this before step 1: freezing is what contained the 0.4 m/s momentum, badly,
+   and removing it without capping speed makes corners faster, not safer.
+3. **Measure the ride-out.** It has flown but its effect on stop count and median
+   speed is unmeasured. Baseline to beat: 135902Z and 140117Z had 25 and 19 stops
+   in 32.8 s and 26.5 s, median speed 0.147 and 0.122 against 0.206 and 0.193
+   while in ROUTE.
+4. Left alone deliberately: the ~2 Hz re-anchoring that opens most joins,
+   `junction_deviation` (no corner under ~90° brakes at all), and the fact that a
+   latched fault still clears the route limiter.
+
+## Safety envelope changes made today
+
+- A follower dropout no longer holds immediately: worst case from dropout to
+  landing is now `follower_latch_grace + planner_fault_land_time` = **7.5 s**,
+  where it was 6.0 s. Set `follower_latch_grace` to 0 to restore the old
+  behaviour exactly.
+- A fault hold may now move the aircraft, bounded: only in ROUTE, armed, only
+  below the required clearance, ≤ 0.50 m of travel, inside the geofence, through
+  the existing chord-admissibility rule, land countdown still running.
+
+## Reproducing the analysis
+
+```bash
+source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
+# geometry replay of the heading/join behaviour over recorded flights
+python3 scripts/replay_command_heading.py ros2_ws/flight_logs/offboard_global_2026090{6,7}T*Z
+# occupancy + trajectory render; writes overview.png into the bag folder
+python3 scripts/render_flight_map.py <bag>/<bag>_0.mcap -o <bag> --supersample 1
+```
+
+Pass the `.mcap` path, not the directory, for any bag whose `metadata.yaml` is
+truncated (a killed flight) — `render_flight_map.py` reads the directory and
+fails on those, while `analyze_flight.resolve()` handles both.
+
+The ad-hoc measurement scripts (side clearance, drift decomposition, phase
+timing) were written to the session scratchpad and are gone. They are small;
+`scripts/analyze_yaw_tracking.py` and `scripts/analyze_flight.py` are the
+reusable pieces, and `RecentSamples(...).at(stamp, max_age)` is the causal
+receipt-time pairing every one of these analyses uses.
+
+## Traps
+
+- `/planner/follower/vio_displacement` **keeps publishing at 10 Hz through a
+  follower dropout**, contradicting the comment in `planner_health_reason()`
+  that says it stops. Dropouts ran 1.0–2.8 s across eight measured episodes; the
+  staleness checks never bound them.
+- Corner blending means `junction_deviation` 0.05 with 0.30 m/s² lets everything
+  under ~90° through at full cruise. Corner braking effectively does not exist.
+- `join_tolerance_` is 3 mm, so nearly every republished path opens a rejoin.
+  `suffix_tolerance` (0.01) is what decides whether a shifted path counts as the
+  same geometry instead — offsets below it never open a join at all, which
+  invalidates any test that tries to exercise a 5 mm join.

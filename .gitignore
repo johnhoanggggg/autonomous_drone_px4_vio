@@ -60,3 +60,15 @@ tools/
 .idea/
 .DS_Store
 *~
+
+# Generated analysis artifacts under reports/. scripts/analyze_*.py and
+# scripts/render_flight_map.py rebuild all of these from the bags and ULogs in
+# ros2_ws/flight_logs/, so they are outputs, not sources. The CSVs are the bulk
+# of it (a single control-response dump is 1.3 MB). The figures the reports
+# actually link to ARE tracked -- ignoring those would break the images in the
+# committed markdown -- so this deliberately does not match *.png at the
+# reports/ root. Per-flight map renders live in their own maps_<time>/ dirs and
+# nothing links to them.
+reports/*.csv
+reports/*.json
+reports/maps_*/
