@@ -171,7 +171,7 @@ def pose_output_stats(series, gap_threshold=0.5):
     }
 
 
-def report(node, hold, recording_start=None, recording_end=None):
+def report(node, hold, recording_start=None, recording_end=None, max_hold_span=0.05):
     out = {}
     # When publish_null_when_lost was enabled, RTAB-Map paired a lost OdomInfo
     # with an identity nav_msgs/Odometry at the same stamp. Those are invalid
@@ -223,6 +223,23 @@ def report(node, hold, recording_start=None, recording_end=None):
                 f"ending hold has only {end_coverage:.1f} s of valid coverage; "
                 f"at least {minimum_hold_coverage:.1f} s is required")
 
+        # Coverage alone does not establish a hold: a camera still being
+        # carried at the end previously produced a plausible "return error".
+        # Use the diagonal of the position bounds, without assuming that the
+        # start/end means themselves must be close (that is what we measure).
+        hold_spans = {}
+        for name, samples in (("start", start), ("end", end)):
+            span_m = math.sqrt(sum(
+                (max(p[axis] for p in samples) - min(p[axis] for p in samples)) ** 2
+                for axis in (1, 2, 3))) if samples else None
+            hold_spans[name] = span_m
+            if span_m is not None and span_m > max_hold_span:
+                hold_errors.append(
+                    f"{name} hold position span is {span_m:.3f} m; "
+                    f"maximum is {max_hold_span:.3f} m (motion or unstable odometry)")
+        if window_end - raw[-1][0] > 0.5:
+            hold_errors.append("valid pose output is stale at the end of the recording")
+
         return_error = None
         if not hold_errors:
             return_error = round(
@@ -252,6 +269,9 @@ def report(node, hold, recording_start=None, recording_end=None):
             "end_hold_samples": len(end),
             "start_hold_coverage_s": round(start_coverage, 2),
             "end_hold_coverage_s": round(end_coverage, 2),
+            "max_hold_span_m": max_hold_span,
+            "start_hold_span_m": hold_spans["start"],
+            "end_hold_span_m": hold_spans["end"],
             "hold_comparison_valid": not hold_errors,
             "hold_comparison_error": "; ".join(hold_errors) or None,
             "return_to_origin_error_mm": return_error,
@@ -431,6 +451,8 @@ def main():
     ap.add_argument("--hold-seconds", type=float, default=20.0,
                     help="Stationary window at each end used for the "
                          "return-to-origin comparison.")
+    ap.add_argument("--max-hold-span", type=float, default=0.05,
+                    help="Maximum position span in metres within each stationary hold.")
     ap.add_argument("--raw-pose-topic", default="/rtabmap/vio_pose")
     ap.add_argument(
         "--raw-odom-topic", default="",
@@ -452,6 +474,8 @@ def main():
               "the timed test. Exit early if the estimator is not publishing."),
     )
     args = ap.parse_args()
+    if not math.isfinite(args.max_hold_span) or args.max_hold_span <= 0:
+        ap.error("max-hold-span must be finite and positive")
 
     rclpy.init()
     node = LoopClosureTest(args)
@@ -512,7 +536,7 @@ def main():
         print("\nstopped early")
 
     recording_end = time.monotonic()
-    result = report(node, args.hold_seconds, recording_start, recording_end)
+    result = report(node, args.hold_seconds, recording_start, recording_end, args.max_hold_span)
     if args.label:
         result = {"label": args.label, **result}
     text = json.dumps(result, indent=2)

@@ -47,15 +47,20 @@ public:
       "features_topic", "/oak/left_rect_feature_tracker/tracked_features");
     const auto queue_size = static_cast<std::uint32_t>(
       std::max<std::int64_t>(2, declare_parameter<int>("input_queue_size", 10)));
-    const auto max_interval = declare_parameter<double>("input_max_interval", 0.05);
+    // The driver uses independently based clocks for tracks and images, so
+    // stamps can differ by sub-microseconds. Allow that offset, but never a
+    // neighboring 30 Hz frame: its keypoints describe different image pixels.
+    const auto max_interval = declare_parameter<double>("input_max_interval", 0.001);
 
     feature_count_pub_ = create_publisher<std_msgs::msg::Int32>(
       "/rtabmap/oak_feature_count", rclcpp::SensorDataQoS().keep_last(2));
 
-    image_sub_.subscribe(this, image_topic, rmw_qos_profile_sensor_data);
-    depth_sub_.subscribe(this, depth_topic, rmw_qos_profile_sensor_data);
-    camera_info_sub_.subscribe(this, camera_info_topic, rmw_qos_profile_sensor_data);
-    features_sub_.subscribe(this, features_topic, rmw_qos_profile_sensor_data);
+    rclcpp::SubscriptionOptions subscription_options;
+    subscription_options.callback_group = dataCallbackGroup_;
+    image_sub_.subscribe(this, image_topic, rmw_qos_profile_sensor_data, subscription_options);
+    depth_sub_.subscribe(this, depth_topic, rmw_qos_profile_sensor_data, subscription_options);
+    camera_info_sub_.subscribe(this, camera_info_topic, rmw_qos_profile_sensor_data, subscription_options);
+    features_sub_.subscribe(this, features_topic, rmw_qos_profile_sensor_data, subscription_options);
 
     sync_ = std::make_shared<Synchronizer>(
       SyncPolicy(queue_size), image_sub_, depth_sub_, camera_info_sub_, features_sub_);
@@ -93,6 +98,9 @@ private:
     const CameraInfo::ConstSharedPtr & camera_info,
     const TrackedFeatures::ConstSharedPtr & features)
   {
+    if(isPaused()) {
+      return;
+    }
     // ApproximateTime can emit the same image twice when a newer feature or
     // depth sample gives it another valid tuple. Odometry requires strictly
     // increasing image stamps, so discard duplicate/out-of-order tuples before
@@ -102,14 +110,21 @@ private:
     if(last_input_stamp_.nanoseconds() != 0 && stamp <= last_input_stamp_) {
       return;
     }
-    last_input_stamp_ = stamp;
-    tick(stamp);
+    // OdometryROS transforms IMU measurements into frameId(). The camera
+    // model MUST use that same body frame, as standard RGBDOdometry does.
+    // The conversion's default identity silently treated optical coordinates
+    // as body coordinates, making visual and inertial rotations disagree.
+    const auto local_transform = rtabmap_conversions::getTransform(
+      frameId(), image->header.frame_id, stamp, tfBuffer(), waitForTransform());
+    if(local_transform.isNull()) {
+      return;
+    }
 
     // processData() may hand this frame to OdometryROS's worker thread. Use
     // owned CvImage buffers rather than views into ROS message storage.
     const auto image_cv = cv_bridge::toCvCopy(image, image->encoding);
     const auto depth_cv = cv_bridge::toCvCopy(depth, depth->encoding);
-    auto camera_model = rtabmap_conversions::cameraModelFromROS(*camera_info);
+    auto camera_model = rtabmap_conversions::cameraModelFromROS(*camera_info, local_transform);
     rtabmap::SensorData data(
       image_cv->image,
       depth_cv->image,
@@ -130,6 +145,8 @@ private:
     // and local-map bookkeeping from this point onward.
     data.setFeatures(keypoints, std::vector<cv::Point3f>(), cv::Mat());
 
+    last_input_stamp_ = stamp;
+    tick(stamp);
     std_msgs::msg::Int32 count;
     count.data = static_cast<std::int32_t>(keypoints.size());
     feature_count_pub_->publish(count);

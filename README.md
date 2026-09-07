@@ -869,6 +869,14 @@ profile uses 400 Harris/KLT tracks with 49-pixel squared minimum spacing at
 30 FPS, matching the known-good DepthAI-host front end, and uses the driver's
 depth-only pipeline so the unused RGB camera path is not started.
 
+The September 7 continuation fixes a missing body-to-camera transform in this
+adapter. Earlier tracked runs used an identity camera extrinsic while the IMU
+was transformed into the body frame, so they did not establish frame parity.
+A raw-input bag workflow now supports repeating a motion recording against
+subsequent estimator changes. See [the migration handoff](HANDOFF_ROS_MIGRATION.md)
+for recording and camera-free replay commands. The replay mode uses the bag's
+static calibration and excludes its old odometry and dynamic TF.
+
 For the next moving screen, use the same slow, textured route and 10-second
 holds as the two failed mono tests:
 

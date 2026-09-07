@@ -10,6 +10,66 @@ startup gate 10/10, but it has not passed the moving-trajectory gate.
 Branch: `ros-rtabmap-migration`. Nothing on this branch publishes to `/fmu/in/*`
 except the pre-existing `vio_to_px4_odometry`, whose input is unchanged.
 
+## Continuation, 2026-09-07: camera frame fix and repeatable bags
+
+The tracked adapter had a concrete input-frame defect:
+`cameraModelFromROS(*camera_info)` defaults to an **identity** local transform,
+while `OdometryROS` transforms the IMU into `frame_id=oak`. Thus the visual
+camera model used optical axes as body axes and omitted the camera lever arm.
+Standard ROS RGBDOdometry explicitly looks up body-to-camera TF. The tracked
+adapter now does the same, rejects a tuple if its transform is unavailable,
+and uses OdometryROS's data callback group and pause state. This invalidates any
+claim that the previous adapter already had full visual/IMU frame parity.
+
+A stationary raw-input and original-output bag survived the Pi reboot:
+`/home/john/ros_parity_stationary_before_20260907`. It contains 33.4 seconds,
+1002 rectified images, 1002 feature messages, 1003 depth images, 6750 IMU
+messages, static calibration TF and 935 original odometry/status samples.
+The 30-second live window before the fix measured 28.0 Hz, 2.25 mm RMS,
+2.76 mm net displacement, 7.26 mm maximum step and zero lost updates. These
+are today's scene, not the scene used for the older submillimetre references.
+The temporary live report was lost on reboot; the original messages remain
+in the bag. `input_audit.json` in that directory records sensor stamp checks.
+
+The new `scripts/ros_rtabmap_bag.py` records raw sensor inputs plus baseline
+outputs and validates that every required input is present. Playback uses an
+explicit sensor/static-TF allowlist, excluding old odometry, dynamic `/tf`,
+mapper outputs and diagnostics so the fresh estimator cannot consume or be
+confused with the old result. The launch accepts `start_camera:=false` and
+`use_sim_time:=true`, creating the component container without a camera driver.
+The recording QoS explicitly retains latched `/tf_static`.
+
+Use the environment block in README (including the compatible v3 messages and
+source-built feature driver). From the repository root:
+
+```bash
+# Terminal 1: live source, estimator and mapper
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_tracked.launch.py foxglove:=false
+
+# Terminal 2: record a fresh bag; existing directories are never overwritten
+python3 scripts/ros_rtabmap_bag.py record /home/john/ros_parity_carry_01 --seconds 90
+# Wait for sensor subscriptions, hold still 10 s, carry a slow closed loop,
+# return to the marked position/orientation, and hold still through the end.
+python3 scripts/ros_rtabmap_bag.py inspect /home/john/ros_parity_carry_01
+
+# Stop the live launch with Ctrl-C before replay.
+# Terminal 1: estimator only, using the bag's calibration and simulated time
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_tracked.launch.py \
+  start_camera:=false use_sim_time:=true foxglove:=false
+
+# Terminal 2: sensor inputs only; restart the estimator for each new replay
+python3 scripts/ros_rtabmap_bag.py play /home/john/ros_parity_carry_01
+```
+
+A slower replay (`--rate 0.5`) can separate compute overruns from tracking
+failure, but its wall-clock output rate is not a live-performance benchmark.
+The current loop harness uses wall time, so use 1x playback for its existing
+metrics. Record a fresh output bag or subscribe to the new odometry/status
+while replaying for comparison. Input presence alone does not prove a lossless
+capture. This ROS bag cannot yet be fed directly to DepthAI's host node; that
+requires a separate DepthAI replay adapter. Moving robustness and DepthAI
+motion/map parity remain open, and the ROS launch still has no PX4 output.
+
 ## Terminology correction that matters
 
 `RTABMapVIO`, `RTABMapSLAM` and `BasaltVIO` are **`ThreadedHostNode`** — they run

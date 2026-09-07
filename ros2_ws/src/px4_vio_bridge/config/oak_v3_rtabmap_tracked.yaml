@@ -40,7 +40,10 @@
       i_input_width: 640
       i_input_height: 400
       i_subpixel: true
-      i_left_right_check: true
+      i_lr_check: true
+      # depthai-core 3.5 StereoDepthConfig defaults to confidence 55. The
+      # driver's override of 15 was a remaining difference from the reference.
+      i_stereo_conf_threshold: 55
     left_rect_feature_tracker:
       # Match the known-good DepthAI-host RTABMapVIO front end.
       i_num_target_features: 400
@@ -53,6 +56,9 @@
       i_batch_report_threshold: 1
       i_max_batch_reports: 10
       i_enable_rotation: false
+      # Match the sensor reports requested by the DepthAI RTABMapVIO graph.
+      i_acc_mode: ACCELEROMETER_RAW
+      i_gyro_mode: GYROSCOPE_RAW
       i_acc_freq: 200
       i_gyro_freq: 200
       i_message_type: IMU

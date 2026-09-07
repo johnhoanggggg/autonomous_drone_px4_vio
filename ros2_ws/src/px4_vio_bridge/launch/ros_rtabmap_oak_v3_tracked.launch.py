@@ -17,6 +17,8 @@ def generate_launch_description():
     forwarded_defaults = {
         "foxglove": "true",
         "foxglove_port": "8765",
+        "start_camera": "true",
+        "use_sim_time": "false",
         "odometry_rate_hz": "20.0",
         "mapping_rate_hz": "1.0",
         "voxel_size": "0.05",

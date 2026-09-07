@@ -1,0 +1,7 @@
+# Record latched calibration even when recording starts after camera startup,
+# and retain it for replay subscribers. Images/IMU use publisher-adapted QoS.
+/tf_static:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: transient_local

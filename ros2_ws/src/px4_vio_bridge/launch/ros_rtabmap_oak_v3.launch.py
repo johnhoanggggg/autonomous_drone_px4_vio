@@ -22,7 +22,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogI
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import LoadComposableNodes, Node
+from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -40,6 +40,8 @@ def generate_launch_description():
     arguments = [
         DeclareLaunchArgument("foxglove", default_value="true"),
         DeclareLaunchArgument("foxglove_port", default_value="8765"),
+        DeclareLaunchArgument("start_camera", default_value="true"),
+        DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument(
             "camera_config",
             default_value=PathJoinSubstitution([
@@ -79,6 +81,7 @@ def generate_launch_description():
         DeclareLaunchArgument("odom_f2m_max_size", default_value="2000"),
         DeclareLaunchArgument("odom_bundle_adjustment", default_value="1"),
         DeclareLaunchArgument("sync_max_interval", default_value="0.05"),
+        DeclareLaunchArgument("oak_feature_sync_max_interval", default_value="0.001"),
         DeclareLaunchArgument("sensor_qos", default_value="2"),
     ]
 
@@ -90,12 +93,24 @@ def generate_launch_description():
                 "driver.launch.py",
             ])
         ),
+        condition=IfCondition(LaunchConfiguration("start_camera")),
         launch_arguments={
             "name": "oak",
             "camera_model": "OAK-D-LITE",
             "params_file": LaunchConfiguration("camera_config"),
             "use_rviz": "false",
         }.items(),
+    )
+
+    # Bag replay supplies the sensor topics and calibrated static TF. Keep
+    # odometry and mapping composed together without opening the OAK device.
+    replay_container = ComposableNodeContainer(
+        condition=UnlessCondition(LaunchConfiguration("start_camera")),
+        package="rclcpp_components",
+        executable="component_container",
+        name="oak_container",
+        namespace="",
+        output="screen",
     )
 
     # The default camera profile publishes depth in the colour optical frame.
@@ -108,6 +123,7 @@ def generate_launch_description():
     ]
 
     odometry_parameters = {
+        "use_sim_time": typed("use_sim_time", bool),
         "frame_id": "oak",
         "odom_frame_id": "rtabmap_odom",
         "publish_tf": True,
@@ -162,6 +178,7 @@ def generate_launch_description():
         namespace="rtabmap",
         name="rtabmap",
         parameters=[{
+            "use_sim_time": typed("use_sim_time", bool),
             "subscribe_depth": True,
             "subscribe_rgb": False,
             "subscribe_rgbd": False,
@@ -225,7 +242,7 @@ def generate_launch_description():
                     "/oak/left_rect_feature_tracker/tracked_features"
                 ),
                 "input_queue_size": 10,
-                "input_max_interval": typed("sync_max_interval", float),
+                "input_max_interval": typed("oak_feature_sync_max_interval", float),
             }],
             remappings=odometry_remappings,
         )],
@@ -243,6 +260,7 @@ def generate_launch_description():
         output="screen",
         emulate_tty=True,
         parameters=[{
+            "use_sim_time": typed("use_sim_time", bool),
             "map_data_topic": "/rtabmap/mapData",
             "frame_id": "world",
             "octomap_topic": "/rtabmap/octomap",
@@ -288,6 +306,7 @@ def generate_launch_description():
             "Requires the v3 driver on AMENT_PREFIX_PATH; see the module docstring."
         )),
         camera,
+        replay_container,
         standard_odometry,
         tracked_odometry,
         mapper_component,
