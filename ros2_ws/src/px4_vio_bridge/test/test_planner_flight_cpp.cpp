@@ -575,3 +575,101 @@ TEST(CommandHeading, MapCorrectionIsRemovedBeforeNedHeading)
   ASSERT_TRUE(heading);
   EXPECT_NEAR(*heading, M_PI / 2.0, 1e-12);
 }
+
+TEST(PathCommandLimiter, SpeedCapLowersTheCeilingWithoutChangingTheTrajectory)
+{
+  // The ride-out crawls the accepted path instead of stopping for a follower
+  // blink. A capped tick must be the ordinary tick at a lower ceiling: same
+  // path, same direction, just slower.
+  auto capped = running_limiter();
+  auto normal = running_limiter();
+  for (int tick = 0; tick < 40; ++tick) {
+    capped.update({3.0, 0.0}, 0.05, true, capped.position(), 0.06);
+    normal.update({3.0, 0.0}, 0.05, true, normal.position());
+    EXPECT_LE(speed_of(capped), 0.06 + 1.0e-9) << "cap exceeded at tick " << tick;
+    EXPECT_NEAR(capped.position()->second, 0.0, 1.0e-9) << "left the route";
+  }
+  EXPECT_LT(capped.position()->first, normal.position()->first)
+    << "the capped command should be behind the uncapped one";
+  EXPECT_GT(capped.position()->first, 0.0) << "the cap stopped the command instead of slowing it";
+  // Releasing the cap returns to cruise rather than restarting from rest.
+  const double resumed_from = speed_of(capped);
+  capped.update({3.0, 0.0}, 0.05, true, capped.position());
+  EXPECT_GT(speed_of(capped), resumed_from);
+}
+
+TEST(PathCommandLimiter, SpeedCapAlsoBoundsARejoin)
+{
+  auto limiter = running_limiter();
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030}));
+  ASSERT_TRUE(limiter.joining());
+  for (int tick = 0; tick < 40 && limiter.joining(); ++tick) {
+    limiter.update({3.0, 0.030}, 0.05, true, limiter.position(), 0.06);
+    EXPECT_LE(speed_of(limiter), 0.06 + 1.0e-9) << "rejoin outran the cap at tick " << tick;
+  }
+}
+
+TEST(PathCommandLimiter, SpeedCapRejectsNonsense)
+{
+  auto limiter = running_limiter();
+  EXPECT_THROW(
+    limiter.update({3.0, 0.0}, 0.05, true, limiter.position(), -0.01), std::invalid_argument);
+  EXPECT_THROW(
+    limiter.update(
+      {3.0, 0.0}, 0.05, true, limiter.position(),
+      std::numeric_limits<double>::quiet_NaN()), std::invalid_argument);
+}
+
+TEST(YawTranslation, BeginsBrakingBeforeTheHoldWithoutSteppingSpeed)
+{
+  auto limiter = running_limiter();
+  const double resume = M_PI / 12.0, hold = M_PI * 40.0 / 180.0;
+  for (int tick = 0; tick < 20; ++tick) {
+    const auto previous = limiter.velocity();
+    const auto cap = px4_vio_bridge::yaw_translation_speed_cap(
+      M_PI * 30.0 / 180.0, resume, hold, 0.2, previous, 0.3, 0.05);
+    ASSERT_TRUE(cap);
+    limiter.update({3.0, 0.0}, 0.05, true, limiter.position(), cap);
+    EXPECT_LE(std::hypot(limiter.velocity().first - previous.first,
+      limiter.velocity().second - previous.second), 0.015 + 1e-9);
+    EXPECT_NEAR(limiter.position()->second, 0.0, 1e-12);
+  }
+  // 30 degrees lies 60% of the way from 15 to 40: 40% cruise remains.
+  EXPECT_NEAR(speed_of(limiter), 0.08, 1e-9);
+  const auto cap = px4_vio_bridge::yaw_translation_speed_cap(
+    resume, resume, hold, 0.2, limiter.velocity(), 0.3, 0.05);
+  EXPECT_FALSE(cap);
+  limiter.update({3.0, 0.0}, 0.05, true, limiter.position(), cap);
+  EXPECT_NEAR(speed_of(limiter), 0.095, 1e-9);
+}
+
+TEST(YawTranslation, SymmetricAndDisabledWhenHeadingOrAlignmentIsUnavailable)
+{
+  using px4_vio_bridge::yaw_translation_speed_cap;
+  const Point2 stopped{0.0, 0.0};
+  EXPECT_EQ(yaw_translation_speed_cap(0.5, 0.2, 0.7, 0.2, stopped, 0.3, 0.05),
+    yaw_translation_speed_cap(-0.5, 0.2, 0.7, 0.2, stopped, 0.3, 0.05));
+  EXPECT_FALSE(yaw_translation_speed_cap(std::nullopt, 0.2, 0.7, 0.2, stopped, 0.3, 0.05));
+  EXPECT_FALSE(yaw_translation_speed_cap(0.5, 0.0, 0.0, 0.2, stopped, 0.3, 0.05));
+  EXPECT_FALSE(yaw_translation_speed_cap(0.5, 0.2, 0.2, 0.2, stopped, 0.3, 0.05));
+  EXPECT_THROW(yaw_translation_speed_cap(std::nan(""), 0.2, 0.7, 0.2, stopped, 0.3, 0.05),
+    std::invalid_argument);
+}
+
+TEST(YawTranslation, KeepsExistingHoldAndStricterFollowerCap)
+{
+  auto limiter = running_limiter();
+  for (int tick = 0; tick < 20; ++tick) {
+    auto cap = px4_vio_bridge::yaw_translation_speed_cap(
+      0.6, 0.2, 0.7, 0.2, limiter.velocity(), 0.3, 0.05);
+    ASSERT_TRUE(cap);
+    limiter.update({3.0, 0.0}, 0.05, true, limiter.position(), std::min(*cap, 0.06));
+    EXPECT_LE(speed_of(limiter), 0.06 + 1e-9);
+  }
+  for (int tick = 0; tick < 20; ++tick) {
+    const auto cap = px4_vio_bridge::yaw_translation_speed_cap(
+      0.8, 0.2, 0.7, 0.2, limiter.velocity(), 0.3, 0.05);
+    limiter.update({3.0, 0.0}, 0.05, false, limiter.position(), cap);
+  }
+  EXPECT_NEAR(speed_of(limiter), 0.0, 1e-9);
+}

@@ -97,6 +97,20 @@ public:
     // goal, and landed on the fault timer. `fault_escape_step` is how far each
     // probe reaches; `fault_escape_limit` is the total travel a hold may spend
     // escaping before it gives up and simply holds.
+    // A follower dropout is usually a blink. Measured over 20260906T135902Z and
+    // T140117Z, eight episodes ran 1.00-2.80 s (median 1.15 and 1.65), and the
+    // response to every one of them was a full stop plus a cleared route: the
+    // command point restarts from zero and spends 0.67 s at 0.30 m/s^2 just
+    // getting back to cruise. Those two flights spent 14% and 27% of their
+    // route in that hold and stopped 25 and 19 times, while the lateral error
+    // that triggered it had a median of 1.5 cm.
+    //
+    // So ride a short dropout out at a crawl instead of stopping for it. The
+    // accepted path, the clearance gate and every other health check still
+    // apply; only the follower's own validity is given this grace, and when it
+    // runs out the hold latches exactly as before.
+    follower_latch_grace_ = declare_parameter<double>("follower_latch_grace", 1.5);
+    degraded_speed_ = declare_parameter<double>("degraded_speed", 0.06);
     fault_escape_step_ = declare_parameter<double>("fault_escape_step", 0.05);
     fault_escape_limit_ = declare_parameter<double>("fault_escape_limit", 0.50);
     goal_hold_time_ = declare_parameter<double>("goal_hold_time", 3.0);
@@ -131,6 +145,7 @@ public:
     pre_route_max_horizontal_error_ =
       declare_parameter<double>("pre_route_max_horizontal_error", 0.15);
     yaw_track_ = declare_parameter<bool>("yaw_follows_heading", true);
+    yaw_slowdown_ = declare_parameter<bool>("yaw_slowdown", true);
     yaw_track_min_displacement_ =
       declare_parameter<double>("yaw_track_min_displacement", 0.15);
     yaw_track_deadband_ =
@@ -368,8 +383,40 @@ protected:
     }
 
     route_command_holding_ = false;
+    degraded_ride_out_ = false;
+    std::optional<double> speed_cap;
+    if (follower_valid_) {
+      follower_latch_since_.reset();
+    } else if (fault && fault->kind == FaultKind::FollowerLatch) {
+      // Ride out a blink rather than stopping for it. Only the follower's own
+      // validity is waived: everything else is re-checked, so a stale pose, a
+      // starved tracker or a missing publisher still latches this tick. The
+      // command crawls on the ALREADY ACCEPTED path -- no replacement is
+      // installed while the follower that would justify it is down -- and every
+      // chord still passes the post-limiter clearance gate.
+      //
+      // The land countdown does not run while riding out, so the worst case
+      // from a dropout to a landing becomes `follower_latch_grace` plus
+      // `planner_fault_land_time` rather than the land time alone.
+      const double now = monotonic_time();
+      if (!follower_latch_since_) {
+        follower_latch_since_ = now;
+      }
+      if (follower_latch_grace_ > 0.0 && degraded_speed_ > 0.0 &&
+        now - *follower_latch_since_ < follower_latch_grace_ &&
+        route_limiter_->path() != nullptr)
+      {
+        if (const auto other = planner_health_reason(true)) {
+          fault = *other;
+        } else {
+          fault.reset();
+          speed_cap = degraded_speed_;
+          degraded_ride_out_ = true;
+        }
+      }
+    }
     if (!fault) {
-      const auto [command_fault, deferral] = update_route_command();
+      const auto [command_fault, deferral] = update_route_command(speed_cap);
       if (command_fault) {
         fault = PlannerFault{*command_fault};
       } else if (deferral) {
@@ -596,7 +643,7 @@ private:
     FaultKind kind{FaultKind::Hard};
   };
 
-  std::optional<PlannerFault> planner_health_reason()
+  std::optional<PlannerFault> planner_health_reason(bool ignore_follower_validity = false)
   {
     const double now = monotonic_time();
     const std::pair<const char *, const char *> required[] = {
@@ -621,7 +668,7 @@ private:
     // Report invalidity before the remaining staleness checks. An invalid
     // follower stops publishing displacement and goal state, so those go stale a
     // fraction of a second later and would otherwise overwrite the real reason.
-    if (!follower_valid_) {
+    if (!follower_valid_ && !ignore_follower_validity) {
       return PlannerFault{"follower validity is false", FaultKind::FollowerLatch};
     }
     if (!goal_received_ || now - *goal_received_ > follower_timeout_) {
@@ -736,6 +783,8 @@ private:
   {
     nlohmann::json config;
     config["implementation"] = "cpp";
+    config["follower_latch_grace"] = follower_latch_grace_;
+    config["degraded_speed"] = degraded_speed_;
     config["fault_escape_step"] = fault_escape_step_;
     config["fault_escape_limit"] = fault_escape_limit_;
     config["command_speed"] = limiter_->max_speed();
@@ -756,6 +805,7 @@ private:
     config["yaw_track"] = yaw_track_;
     config["yaw_direction_source"] = "constrained_command_preview";
     config["yaw_align_error_deg"] = degrees(yaw_align_error_);
+    config["yaw_slowdown"] = yaw_slowdown_;
     config["yaw_resume_error_deg"] = degrees(yaw_resume_error_);
     config["horizontal_feedforward"] = horizontal_feedforward_;
     config["replan_during_yaw_align"] = replan_during_yaw_align_;
@@ -1078,7 +1128,8 @@ private:
   /// Returns (fault, deferral). `fault` lands the aircraft on the usual timer.
   /// `deferral` is a transient the accepted route survives: the installed path
   /// and the last validated setpoint both stand.
-  std::pair<std::optional<std::string>, std::optional<std::string>> update_route_command()
+  std::pair<std::optional<std::string>, std::optional<std::string>> update_route_command(
+    std::optional<double> speed_cap = std::nullopt)
   {
     std::optional<std::string> deferral;
 
@@ -1092,7 +1143,9 @@ private:
     // path until the nose is back on the leg.
     // First entry needs an installed path to preview even if a prior hold
     // latched yaw alignment. During subsequent turns retain the accepted path.
-    if (!yaw_holding_ || replan_during_yaw_align_ || !route_limiter_->path()) {
+    // A ride-out keeps the accepted path: the follower that would justify a
+    // replacement is exactly what is down.
+    if (!speed_cap && (!yaw_holding_ || replan_during_yaw_align_ || !route_limiter_->path())) {
       try {
         route_limiter_->set_path(path_points_, *map_pose_, clearance_check);
       } catch (const std::exception & error) {
@@ -1142,8 +1195,20 @@ private:
         }
         update_yaw_target(heading);
       }
+      // Brake before the 40-degree hold, while the accepted path can still
+      // steer the command. Do not use this cap to freeze path replacement:
+      // only the follower ride-out above lacks a valid replacement source.
+      if (yaw_slowdown_) {
+        const auto yaw_cap = yaw_translation_speed_cap(
+          yaw_track_error(), yaw_resume_error_, yaw_align_error_,
+          route_limiter_->max_speed(), route_limiter_->velocity(),
+          route_limiter_->max_acceleration(), dt_);
+        if (yaw_cap) {
+          speed_cap = speed_cap ? std::min(*speed_cap, *yaw_cap) : *yaw_cap;
+        }
+      }
       final_map = route_limiter_->update(
-        desired_map, dt_, !yaw_holding_, map_pose_);
+        desired_map, dt_, !yaw_holding_, map_pose_, speed_cap);
     } catch (const std::exception & error) {
       restore_command();
       return {
@@ -1212,6 +1277,9 @@ private:
 
   std::string route_status_kind() const
   {
+    if (degraded_ride_out_) {
+      return "DEGRADED";
+    }
     if (yaw_holding_) {
       return "YAW_ALIGN";
     }
@@ -1223,6 +1291,13 @@ private:
 
   std::string route_status_text() const
   {
+    if (degraded_ride_out_) {
+      const double held = follower_latch_since_ ?
+        monotonic_time() - *follower_latch_since_ : 0.0;
+      return format(
+        "DEGRADED follower down %.1f/%.1fs; crawling the accepted path at %.2fm/s",
+        held, follower_latch_grace_, degraded_speed_) + yaw_status_text();
+    }
     if (yaw_holding_) {
       return "YAW_ALIGN translation paused while turning;" + yaw_status_text();
     }
@@ -1262,6 +1337,11 @@ private:
   double map_timeout_{}, map_pose_timeout_{};
   double planner_fault_land_time_{}, goal_hold_time_{}, route_entry_grace_{};
   double escape_minimum_improvement_{};
+  double follower_latch_grace_{};
+  double degraded_speed_{};
+  /// When the current follower dropout began. Cleared the moment it is valid.
+  std::optional<double> follower_latch_since_;
+  bool degraded_ride_out_{false};
   double fault_escape_step_{};
   double fault_escape_limit_{};
   /// Where the current fault hold began, so escape travel can be bounded.
@@ -1278,6 +1358,7 @@ private:
   bool yaw_track_{};
   double yaw_track_min_displacement_{}, yaw_track_deadband_{};
   double yaw_align_error_{}, yaw_resume_error_{};
+  bool yaw_slowdown_{};
 
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr command_speed_pub_, path_offset_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr joining_pub_;

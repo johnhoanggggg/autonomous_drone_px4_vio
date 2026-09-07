@@ -13,6 +13,31 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kEpsilon = 1.0e-9;
 }  // namespace
 
+std::optional<double> yaw_translation_speed_cap(
+  std::optional<double> error, double resume_error, double hold_error,
+  double max_speed, const Point2 & velocity, double acceleration, double dt)
+{
+  if (!error || hold_error <= 0.0 || hold_error <= resume_error) {
+    return std::nullopt;
+  }
+  if (!std::isfinite(*error) || !std::isfinite(resume_error) ||
+    !std::isfinite(hold_error) || resume_error < 0.0 ||
+    !std::isfinite(max_speed) || max_speed <= 0.0 || !finite(velocity) ||
+    !std::isfinite(acceleration) || acceleration <= 0.0 ||
+    !std::isfinite(dt) || dt <= 0.0)
+  {
+    throw std::invalid_argument("invalid yaw translation speed inputs");
+  }
+  if (std::abs(*error) <= resume_error) {
+    return std::nullopt;
+  }
+  const double scale = std::clamp(
+    (hold_error - std::abs(*error)) / (hold_error - resume_error), 0.0, 1.0);
+  const double braking_ceiling = std::max(
+    0.0, std::hypot(velocity.first, velocity.second) - acceleration * dt);
+  return std::min(max_speed, std::max(max_speed * scale, braking_ceiling));
+}
+
 // --- HorizontalCommandLimiter ---------------------------------------------
 
 HorizontalCommandLimiter::HorizontalCommandLimiter(
@@ -299,7 +324,18 @@ void PathCommandLimiter::install(
   waiting_vertex_.reset();
 }
 
-double PathCommandLimiter::along_path_speed(double along, double dt, bool advance)
+double PathCommandLimiter::speed_ceiling(std::optional<double> speed_cap) const
+{
+  if (!speed_cap) {
+    return max_speed_;
+  }
+  if (!std::isfinite(*speed_cap) || *speed_cap < 0.0) {
+    throw std::invalid_argument("speed cap must be finite and non-negative");
+  }
+  return std::min(max_speed_, *speed_cap);
+}
+
+double PathCommandLimiter::along_path_speed(double along, double dt, bool advance, double ceiling)
 {
   // The same speed machinery the on-path advance uses, factored out so a join
   // is braked by corners and by the path end exactly as ordinary motion is.
@@ -319,13 +355,13 @@ double PathCommandLimiter::along_path_speed(double along, double dt, bool advanc
     std::sqrt(
       (max_acceleration_ * dt) * (max_acceleration_ * dt) +
       2.0 * max_acceleration_ * remaining));
-  double desired_speed = std::min({max_speed_, remaining / dt, braking_speed});
+  double desired_speed = std::min({ceiling, remaining / dt, braking_speed});
   if (corner_blending_) {
     desired_speed = std::min(desired_speed, corner_speed_limit());
   }
   const double delta = std::clamp(
     desired_speed - speed_, -max_acceleration_ * dt, max_acceleration_ * dt);
-  speed_ = std::clamp(speed_ + delta, 0.0, max_speed_);
+  speed_ = std::clamp(speed_ + delta, 0.0, ceiling);
   return speed_;
 }
 
@@ -347,7 +383,7 @@ Point2 PathCommandLimiter::path_tangent(double along) const
   return {delta.first / norm, delta.second / norm};
 }
 
-Point2 PathCommandLimiter::update_join(double dt, bool advance)
+Point2 PathCommandLimiter::update_join(double dt, bool advance, double ceiling)
 {
   // A join is a lane change, not a stop.
   //
@@ -374,7 +410,7 @@ Point2 PathCommandLimiter::update_join(double dt, bool advance)
   const Point2 old_position = *position_;
   const auto start = installation_->path->project(*position_);
 
-  const double along_speed = along_path_speed(start.along, dt, advance);
+  const double along_speed = along_path_speed(start.along, dt, advance, ceiling);
   const Point2 tangent = path_tangent(start.along);
 
   Point2 desired_velocity{tangent.first * along_speed, tangent.second * along_speed};
@@ -429,19 +465,19 @@ Point2 PathCommandLimiter::update_join(double dt, bool advance)
       ? along_speed * join_lateral_ratio_ * escalation
       : join_lateral_floor_;
     const double lateral_speed = std::min(
-      {max_speed_, offset_distance / dt,
+      {ceiling, offset_distance / dt,
         std::sqrt(2.0 * max_acceleration_ * offset_distance), lateral_limit});
     desired_velocity = {
       desired_velocity.first + offset.first / offset_distance * lateral_speed,
       desired_velocity.second + offset.second / offset_distance * lateral_speed};
   }
-  desired_velocity = limit_norm(desired_velocity, max_speed_);
+  desired_velocity = limit_norm(desired_velocity, ceiling);
 
   const Point2 change = limit_norm(
     {desired_velocity.first - velocity_.first, desired_velocity.second - velocity_.second},
     max_acceleration_ * dt);
   velocity_ = limit_norm(
-    {velocity_.first + change.first, velocity_.second + change.second}, max_speed_);
+    {velocity_.first + change.first, velocity_.second + change.second}, ceiling);
   position_ = Point2{
     position_->first + velocity_.first * dt,
     position_->second + velocity_.second * dt};
@@ -527,7 +563,7 @@ double PathCommandLimiter::corner_speed_limit() const
 
 Point2 PathCommandLimiter::update(
   const Point2 & desired_point, double dt, bool advance,
-  const std::optional<Point2> & reference_point)
+  const std::optional<Point2> & reference_point, std::optional<double> speed_cap)
 {
   if (!installation_ || !position_) {
     throw std::runtime_error("no path command has been initialized");
@@ -535,10 +571,11 @@ Point2 PathCommandLimiter::update(
   if (!finite(desired_point) || !std::isfinite(dt) || dt <= 0.0) {
     throw std::invalid_argument("desired point and dt must be finite, with positive dt");
   }
+  const double ceiling = speed_ceiling(speed_cap);
 
   const Point2 old_position = *position_;
   if (join_target_) {
-    return update_join(dt, advance);
+    return update_join(dt, advance, ceiling);
   }
   if (waiting_vertex_) {
     const Point2 vertex = installation_->path->point_at(*waiting_vertex_);
@@ -584,13 +621,13 @@ Point2 PathCommandLimiter::update(
         std::sqrt(
           (max_acceleration_ * dt) * (max_acceleration_ * dt) +
           2.0 * max_acceleration_ * remaining));
-      double desired_speed = std::min({max_speed_, remaining / dt, braking_speed});
+      double desired_speed = std::min({ceiling, remaining / dt, braking_speed});
       if (corner_blending_) {
         desired_speed = std::min(desired_speed, corner_speed_limit());
       }
       const double delta = std::clamp(
         desired_speed - speed_, -max_acceleration_ * dt, max_acceleration_ * dt);
-      speed_ = std::clamp(speed_ + delta, 0.0, max_speed_);
+      speed_ = std::clamp(speed_ + delta, 0.0, ceiling);
       const double step = std::min(remaining, speed_ * dt);
       progress_ += step;
       if (remaining - step <= kEpsilon) {

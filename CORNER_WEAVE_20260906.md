@@ -362,3 +362,84 @@ sample, and no hold status carried a `clearance=` line. Pose clearance never fel
 below the requirement, so `escape_clearance_while_held()` correctly did nothing.
 **It remains unexercised in flight.** Its holds were cross-track and
 correction-settling, which it deliberately does not act on.
+
+---
+
+# Smoothness: ride out a follower blink instead of stopping — 2026-09-06
+
+## What the two goal flights say the wobble actually is
+
+Lateral error from the planned path is already small: median 1.5–1.7 cm, p90
+4.3–5.3 cm, max 11 cm, with path churn between replans at a 0.000 m median.
+Neither flight shows a contact (|a_xy| max 2.4 and 2.8 m/s²; a real hit reads
+above 5). The trajectory is not wandering — it is lurching along.
+
+| | 135902Z | 140117Z |
+|---|---|---|
+| ROUTE | 17.5 s (53%) | 13.1 s (49%) |
+| HOLD | 4.6 s (14%) | 7.1 s (27%) |
+| YAW_ALIGN | 4.3 s (13%) | 3.2 s (12%) |
+| stop events (<0.05 m/s) | 25 | 19 |
+| median speed, all / in ROUTE | 0.147 / 0.206 | 0.122 / 0.193 |
+
+In ROUTE it holds the commanded 0.20 m/s exactly. Half the route is not ROUTE.
+
+The amplifier is the follower's own hysteresis: it trips at 0.08 m of
+cross-track and needs 0.6 s under 0.04 m to recover, so in 135902Z only 1.5% of
+samples ever exceeded the limit and yet four dropout episodes resulted. Every one
+of them cost a full stop plus `route_limiter_->clear()`, and then 0.67 s at
+0.30 m/s² just to get back to cruise.
+
+## Correcting the code's own comment
+
+`planner_health_reason()` says an invalid follower "stops publishing displacement
+and goal state". It does not. Across all eight dropout episodes in the two
+flights the follower kept publishing `/planner/follower/vio_displacement` at its
+full 10 Hz. The staleness checks therefore never cut a dropout short, and the
+grace below is bounded only by its own parameter.
+
+Episode durations: 1.10, 1.30, 1.20, 1.00 s (135902Z) and 1.00, 1.20, 2.80,
+2.10 s (140117Z).
+
+## The change
+
+A `FollowerLatch` fault no longer latches a hold immediately. For
+`follower_latch_grace` (1.5 s) the adapter crawls the **already accepted** path
+at `degraded_speed` (0.06 m/s), publishing status kind `DEGRADED`. When the grace
+runs out the hold latches exactly as before.
+
+Waived: the follower's own validity, and only that. Re-checked every tick via
+`planner_health_reason(/*ignore_follower_validity=*/true)`: publisher counts,
+validity staleness, goal and displacement staleness, tracker health, correction
+magnitude — any of them still latches immediately. No replacement path is
+installed while the follower that would justify it is down. Every chord still
+passes the post-limiter clearance gate and the geofence check.
+
+`PathCommandLimiter::update()` gained an optional `speed_cap` that lowers the
+ceiling for one tick — bounding the along-path rate, the rejoin's lateral rate
+and the combined velocity — so a capped tick is the ordinary tick at a lower
+ceiling, not a different trajectory.
+
+**Safety envelope change, stated plainly:** the land countdown does not run while
+riding out, so the worst case from a dropout to a landing becomes
+`follower_latch_grace + planner_fault_land_time` = 7.5 s, where it was 6.0 s.
+Motion during a ride-out is capped at 0.06 m/s, so ≤ 9 cm over the full grace.
+
+## Expected effect
+
+Against the eight measured episodes, a 1.5 s grace covers six of them entirely —
+all four in 135902Z, two of four in 140117Z. The remaining two (2.80 s and
+2.10 s) would hold for 1.3 s and 0.6 s instead of their full length. On those
+flights that is roughly 4.6 s → 0 s and 7.1 s → ~2 s of HOLD, and the stop-start
+cycles that dominate the wobble go with it.
+
+Regressions: `SpeedCapLowersTheCeilingWithoutChangingTheTrajectory` (same route,
+slower, and releasing the cap resumes from speed rather than from rest),
+`SpeedCapAlsoBoundsARejoin`, `SpeedCapRejectsNonsense`. `colcon test`: 607 tests,
+0 errors, 0 failures, 3 skips.
+
+## Not done
+
+Yaw alignment still stops translation dead for 12–13% of the route (20 °/s slew,
+so a 45° turn is 2.25 s stationary). That was the other half of the plan and is
+deliberately left for a separate flight, so each change can be judged on its own.

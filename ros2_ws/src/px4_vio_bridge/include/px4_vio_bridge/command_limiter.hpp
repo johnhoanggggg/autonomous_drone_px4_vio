@@ -14,6 +14,13 @@
 namespace px4_vio_bridge
 {
 
+/// Taper translation between the yaw resume and hold errors (radians).
+/// The ceiling itself falls by at most acceleration * dt. The existing yaw
+/// hold and any stricter fault cap remain the caller's responsibility.
+std::optional<double> yaw_translation_speed_cap(
+  std::optional<double> error, double resume_error, double hold_error,
+  double max_speed, const Point2 & velocity, double acceleration, double dt);
+
 /// Speed- and acceleration-limit the final PX4 horizontal setpoint.
 class HorizontalCommandLimiter
 {
@@ -95,11 +102,20 @@ public:
 
   /// Throws std::runtime_error with no path, std::invalid_argument on a
   /// rejected command.
+  ///
+  /// `speed_cap` lowers `max_speed_` for this tick only, for a state that wants
+  /// to keep moving slowly rather than stop -- the grace a brief follower
+  /// dropout gets before it becomes a hold. It bounds
+  /// the along-path rate, the rejoin's lateral rate and the combined velocity,
+  /// so a capped tick is the ordinary tick at a lower ceiling -- not a
+  /// different trajectory. Everything else, corner and end braking included,
+  /// is unchanged.
   Point2 update(
     const Point2 & desired_point,
     double dt,
     bool advance = true,
-    const std::optional<Point2> & reference_point = std::nullopt);
+    const std::optional<Point2> & reference_point = std::nullopt,
+    std::optional<double> speed_cap = std::nullopt);
 
   /// Direction the accepted route is travelled in next, without committing any
   /// progress, join or corner state. Unit vector in the path frame.
@@ -137,10 +153,12 @@ private:
     std::shared_ptr<const Polyline> path, PathFingerprint fingerprint);
   [[nodiscard]] std::optional<double> shared_suffix_offset(const Polyline & new_path) const;
   void install(std::shared_ptr<const PathInstallation> installation, double progress);
-  Point2 update_join(double dt, bool advance);
+  Point2 update_join(double dt, bool advance, double ceiling);
   /// The on-path speed for this tick, shared by the advance and the join so a
   /// lane change is braked by corners and the path end exactly as motion is.
-  double along_path_speed(double along, double dt, bool advance);
+  double along_path_speed(double along, double dt, bool advance, double ceiling);
+  /// `max_speed_`, or the caller's lower ceiling for this tick.
+  [[nodiscard]] double speed_ceiling(std::optional<double> speed_cap) const;
   [[nodiscard]] Point2 path_tangent(double along) const;
   /// Unit tangent of the leg the command point is about to travel. Forward
   /// difference, so at a vertex this is the outgoing leg rather than the

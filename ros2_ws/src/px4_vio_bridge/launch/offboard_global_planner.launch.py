@@ -282,6 +282,12 @@ def generate_launch_description():
         # A fault hold pins the aircraft where it stands. 20260906T131950Z was
         # held inside its own clearance envelope for 4.5 s and landed on the
         # fault timer; these let the hold walk out of that, bounded.
+        # A follower dropout is a blink far more often than a failure: eight
+        # episodes across 20260906T135902Z and T140117Z ran 1.00-2.80 s, and
+        # stopping dead for each of them cost 14% and 27% of the route. Crawl
+        # the accepted path for this long before the hold latches.
+        DeclareLaunchArgument("follower_latch_grace", default_value="1.5"),
+        DeclareLaunchArgument("degraded_speed", default_value="0.06"),
         DeclareLaunchArgument("fault_escape_step", default_value="0.05"),
         DeclareLaunchArgument("fault_escape_limit", default_value="0.50"),
         DeclareLaunchArgument("max_horizontal_error", default_value="0.35"),
@@ -296,6 +302,8 @@ def generate_launch_description():
         DeclareLaunchArgument("yaw_track_deadband_deg", default_value="15.0"),
         DeclareLaunchArgument("yaw_align_error_deg", default_value="40.0"),
         DeclareLaunchArgument("yaw_resume_error_deg", default_value="15.0"),
+        # Taper speed from resume error to align error, retaining the hard hold.
+        DeclareLaunchArgument("yaw_slowdown", default_value="true"),
         DeclareLaunchArgument("tracking_loss_land", default_value="true"),
         DeclareLaunchArgument("keyboard_kill", default_value="true"),
         DeclareLaunchArgument("keyboard_land", default_value="true"),
@@ -347,6 +355,8 @@ def generate_launch_description():
         "max_correction_m": typed("max_correction_m", float),
         "max_correction_yaw_deg": typed("max_correction_yaw_deg", float),
         "min_vio_features": typed("min_vio_features", int),
+        "follower_latch_grace": typed("follower_latch_grace", float),
+        "degraded_speed": typed("degraded_speed", float),
         "fault_escape_step": typed("fault_escape_step", float),
         "fault_escape_limit": typed("fault_escape_limit", float),
         "vio_feature_loss_time": typed("vio_feature_loss_time", float),
@@ -357,6 +367,7 @@ def generate_launch_description():
         ),
         "yaw_follows_heading": typed("yaw_follows_heading", bool),
         "yaw_rate_deg": typed("yaw_rate_deg", float),
+        "yaw_slowdown": typed("yaw_slowdown", bool),
         "yaw_track_min_displacement": typed("yaw_track_min_displacement", float),
         "yaw_track_deadband_deg": typed("yaw_track_deadband_deg", float),
         "yaw_align_error_deg": typed("yaw_align_error_deg", float),
