@@ -72,3 +72,7 @@ tools/
 reports/*.csv
 reports/*.json
 reports/maps_*/
+# Console/tool captures kept for reference while debugging (param readbacks,
+# live topic dumps, logger topic lists). Same argument as the CSVs: they are
+# transcripts of a command, not sources, and nothing links to them.
+reports/*.txt

@@ -21,6 +21,32 @@ std::optional<double> yaw_translation_speed_cap(
   std::optional<double> error, double resume_error, double hold_error,
   double max_speed, const Point2 & velocity, double acceleration, double dt);
 
+/// Arc-length averaged route direction. Zero lookahead retains the point
+/// tangent. Hairpins are not averaged across: opposite legs can cancel.
+std::optional<Point2> route_heading_direction(
+  const Polyline & path, double progress, double lookahead);
+
+/// Persistent heading reference in the continuous flight frame. The geometric
+/// goal has a deadband; the reference slews to that goal even inside it.
+/// Copyable so rejected route commands can roll back all heading state.
+class HeadingReference
+{
+public:
+  void reset(std::optional<double> heading);
+  std::optional<double> update(
+    std::optional<double> preview, double deadband, double max_rate, double dt);
+  /// Use the largest error to preview, goal or reference for braking/alignment.
+  /// Smoothing must not hide a genuine large change in route direction.
+  [[nodiscard]] std::optional<double> alignment_error(double measured) const;
+  [[nodiscard]] std::optional<double> preview() const {return preview_;}
+  [[nodiscard]] std::optional<double> goal() const {return goal_;}
+  [[nodiscard]] std::optional<double> target() const {return target_;}
+
+private:
+  std::optional<double> preview_, goal_, target_;
+  bool slew_enabled_{false};
+};
+
 /// Speed- and acceleration-limit the final PX4 horizontal setpoint.
 class HorizontalCommandLimiter
 {
@@ -93,6 +119,24 @@ public:
   [[nodiscard]] Snapshot snapshot() const;
   void restore(const Snapshot & state);
 
+  /// Re-express every map-frame quantity this limiter holds in a new SLAM map
+  /// solution.
+  ///
+  /// The command point, its velocity and the installed path live in the map
+  /// frame, but the limiter integrates them across ticks and nothing else
+  /// moves them. When a loop closure changes the correction, the caller's pose
+  /// jumps into the new solution while this state stays in the old one, and
+  /// the difference the caller takes between them -- the displacement that
+  /// becomes the PX4 setpoint -- picks up the whole correction delta in a
+  /// single tick. On 20260908T052413Z a 0.396 m closure moved that setpoint
+  /// 0.293 m while the limiter's own speed cap was 0.06 m/s, because the cap
+  /// bounds this state and it was the *reference* that moved.
+  ///
+  /// A correction change is a rigid transform, so arc lengths, speeds, the
+  /// bend table and the corner/join bookkeeping all survive it unchanged;
+  /// only points and vectors are carried across.
+  void reexpress(const Correction4 & from, const Correction4 & to);
+
   /// Install a path, carrying the command onto it without a jump.
   /// Throws std::invalid_argument when the replacement cannot be joined.
   bool set_path(
@@ -103,13 +147,12 @@ public:
   /// Throws std::runtime_error with no path, std::invalid_argument on a
   /// rejected command.
   ///
-  /// `speed_cap` lowers `max_speed_` for this tick only, for a state that wants
-  /// to keep moving slowly rather than stop -- the grace a brief follower
-  /// dropout gets before it becomes a hold. It bounds
-  /// the along-path rate, the rejoin's lateral rate and the combined velocity,
-  /// so a capped tick is the ordinary tick at a lower ceiling -- not a
-  /// different trajectory. Everything else, corner and end braking included,
-  /// is unchanged.
+  /// `speed_cap` lowers the desired speed for this tick, including the
+  /// rejoin's combined velocity. A newly lowered cap is approached through
+  /// the acceleration limit; it is not an instantaneous bound on the state.
+  /// For the follower's degraded ride-out, 0.20 -> 0.06 m/s at 0.30 m/s^2
+  /// therefore takes ten 50 ms updates. Path geometry, corner/end handling
+  /// and the caller's clearance checks still apply.
   Point2 update(
     const Point2 & desired_point,
     double dt,
@@ -127,9 +170,11 @@ public:
   /// When the previewed tick commands no along-path motion at all, face an
   /// existing position target only if it is far enough from the vehicle;
   /// otherwise retain the caller's previous heading.
+  /// A positive heading_lookahead averages the route tangent over that arc
+  /// length. This changes heading only; the position command stays on the path.
   [[nodiscard]] std::optional<Point2> preview_direction(
     const Point2 & desired_point, double dt, const Point2 & reference_point,
-    double min_position_distance) const;
+    double min_position_distance, double heading_lookahead = 0.0) const;
 
   [[nodiscard]] const std::shared_ptr<const PathInstallation> & installation() const
   {
@@ -160,10 +205,8 @@ private:
   /// `max_speed_`, or the caller's lower ceiling for this tick.
   [[nodiscard]] double speed_ceiling(std::optional<double> speed_cap) const;
   [[nodiscard]] Point2 path_tangent(double along) const;
-  /// Unit tangent of the leg the command point is about to travel. Forward
-  /// difference, so at a vertex this is the outgoing leg rather than the
-  /// bisector a central difference would return.
-  [[nodiscard]] std::optional<Point2> advance_tangent() const;
+  /// Direction over the upcoming route horizon (point tangent at zero).
+  [[nodiscard]] std::optional<Point2> advance_tangent(double lookahead) const;
   [[nodiscard]] double next_motion_target(double desired_progress) const;
   [[nodiscard]] double corner_speed(double turn) const;
   [[nodiscard]] double corner_speed_limit() const;

@@ -38,6 +38,98 @@ std::optional<double> yaw_translation_speed_cap(
   return std::min(max_speed, std::max(max_speed * scale, braking_ceiling));
 }
 
+std::optional<Point2> route_heading_direction(
+  const Polyline & path, double progress, double lookahead)
+{
+  if (!std::isfinite(progress) || !std::isfinite(lookahead) || lookahead < 0.0) {
+    throw std::invalid_argument("heading progress and nonnegative lookahead must be finite");
+  }
+  const double length = path.length();
+  const double step = std::min(1.0e-4, length);
+  if (step <= kEpsilon) {
+    return std::nullopt;
+  }
+  const double begin = std::clamp(progress, 0.0, length - step);
+  double end = std::min(length, begin + std::max(step, lookahead));
+  const auto & points = path.points();
+  const auto & cumulative = path.cumulative();
+  for (std::size_t i = 1; i + 1 < points.size(); ++i) {
+    if (cumulative[i] <= begin + kEpsilon || cumulative[i] >= end) {
+      continue;
+    }
+    const Point2 a{points[i].first - points[i - 1].first,
+      points[i].second - points[i - 1].second};
+    const Point2 b{points[i + 1].first - points[i].first,
+      points[i + 1].second - points[i].second};
+    const double cosine = (a.first * b.first + a.second * b.second) /
+      (std::hypot(a.first, a.second) * std::hypot(b.first, b.second));
+    if (cosine <= -std::sqrt(0.5)) {
+      end = cumulative[i];
+      break;
+    }
+  }
+  const auto a = path.point_at(begin);
+  const auto b = path.point_at(end);
+  Point2 delta{b.first - a.first, b.second - a.second};
+  double norm = std::hypot(delta.first, delta.second);
+  // A tightly folded path can cancel without a single hairpin vertex.
+  if (norm < 0.1 * (end - begin)) {
+    const auto near = path.point_at(begin + step);
+    delta = {near.first - a.first, near.second - a.second};
+    norm = std::hypot(delta.first, delta.second);
+  }
+  if (norm <= kEpsilon) {
+    return std::nullopt;
+  }
+  return Point2{delta.first / norm, delta.second / norm};
+}
+
+void HeadingReference::reset(std::optional<double> heading)
+{
+  if (heading && !std::isfinite(*heading)) {
+    throw std::invalid_argument("heading seed must be finite");
+  }
+  preview_.reset();
+  goal_ = target_ = heading;
+}
+
+std::optional<double> HeadingReference::update(
+  std::optional<double> preview, double deadband, double max_rate, double dt)
+{
+  if (!std::isfinite(deadband) || deadband < 0.0 ||
+    !std::isfinite(max_rate) || max_rate < 0.0 || !std::isfinite(dt) || dt <= 0.0 ||
+    (preview && !std::isfinite(*preview)))
+  {
+    throw std::invalid_argument("invalid heading reference inputs");
+  }
+  preview_ = preview;
+  goal_ = track_yaw_target(goal_, preview, deadband);
+  slew_enabled_ = max_rate > 0.0;
+  if (!target_ || !slew_enabled_) {
+    target_ = goal_;
+  } else if (goal_) {
+    target_ = wrap_pi(*target_ + std::clamp(
+        wrap_pi(*goal_ - *target_), -max_rate * dt, max_rate * dt));
+  }
+  return target_;
+}
+
+std::optional<double> HeadingReference::alignment_error(double measured) const
+{
+  if (!std::isfinite(measured) || !target_) {
+    return std::nullopt;
+  }
+  double error = wrap_pi(*target_ - measured);
+  if (slew_enabled_) {
+    for (const auto heading : {preview_, goal_}) {
+      if (heading && std::abs(wrap_pi(*heading - measured)) > std::abs(error)) {
+        error = wrap_pi(*heading - measured);
+      }
+    }
+  }
+  return error;
+}
+
 // --- HorizontalCommandLimiter ---------------------------------------------
 
 HorizontalCommandLimiter::HorizontalCommandLimiter(
@@ -153,6 +245,37 @@ void PathCommandLimiter::clear()
   join_target_.reset();
   join_limit_ = 0.0;
   waiting_vertex_.reset();
+}
+
+void PathCommandLimiter::reexpress(const Correction4 & from, const Correction4 & to)
+{
+  if (!finite(from) || !finite(to)) {
+    throw std::invalid_argument("corrections must be finite");
+  }
+  if (from == to) {
+    return;
+  }
+  if (installation_) {
+    const auto & old_points = installation_->path->points();
+    std::vector<Point2> points;
+    points.reserve(old_points.size());
+    for (const auto & point : old_points) {
+      points.push_back(reexpress_point(point, from, to));
+    }
+    // Deliberately not install(): that resets the join and corner state, which
+    // a frame change does not invalidate. Arc length is preserved by the rigid
+    // transform, so progress_ carries over untouched.
+    auto fingerprint = path_fingerprint(points);
+    installation_ = build_installation(
+      std::make_shared<const Polyline>(points), std::move(fingerprint));
+  }
+  if (position_) {
+    position_ = reexpress_point(*position_, from, to);
+  }
+  velocity_ = reexpress_vector(velocity_, from, to);
+  if (join_target_) {
+    join_target_ = reexpress_point(*join_target_, from, to);
+  }
 }
 
 PathCommandLimiter::Snapshot PathCommandLimiter::snapshot() const
@@ -361,7 +484,9 @@ double PathCommandLimiter::along_path_speed(double along, double dt, bool advanc
   }
   const double delta = std::clamp(
     desired_speed - speed_, -max_acceleration_ * dt, max_acceleration_ * dt);
-  speed_ = std::clamp(speed_ + delta, 0.0, ceiling);
+  // The cap is a desired rate. Clamping the state to a newly lowered cap
+  // would undo the acceleration bound in delta.
+  speed_ = std::clamp(speed_ + delta, 0.0, max_speed_);
   return speed_;
 }
 
@@ -477,7 +602,7 @@ Point2 PathCommandLimiter::update_join(double dt, bool advance, double ceiling)
     {desired_velocity.first - velocity_.first, desired_velocity.second - velocity_.second},
     max_acceleration_ * dt);
   velocity_ = limit_norm(
-    {velocity_.first + change.first, velocity_.second + change.second}, ceiling);
+    {velocity_.first + change.first, velocity_.second + change.second}, max_speed_);
   position_ = Point2{
     position_->first + velocity_.first * dt,
     position_->second + velocity_.second * dt};
@@ -627,7 +752,10 @@ Point2 PathCommandLimiter::update(
       }
       const double delta = std::clamp(
         desired_speed - speed_, -max_acceleration_ * dt, max_acceleration_ * dt);
-      speed_ = std::clamp(speed_ + delta, 0.0, ceiling);
+      // A follower ride-out requests 0.06 m/s from a 0.20 m/s cruise.
+      // Reach that rate through the acceleration-limited delta, rather than
+      // stepping the velocity and then clipping only its acceleration FF.
+      speed_ = std::clamp(speed_ + delta, 0.0, max_speed_);
       const double step = std::min(remaining, speed_ * dt);
       progress_ += step;
       if (remaining - step <= kEpsilon) {
@@ -650,36 +778,21 @@ Point2 PathCommandLimiter::update(
   return *position_;
 }
 
-std::optional<Point2> PathCommandLimiter::advance_tangent() const
+std::optional<Point2> PathCommandLimiter::advance_tangent(double lookahead) const
 {
   if (!installation_) {
     return std::nullopt;
   }
-  const double length = installation_->path->length();
-  const double step = std::min(1.0e-4, length);
-  if (step <= kEpsilon) {
-    return std::nullopt;
-  }
-  // Forward difference from the previewed progress. A central difference would
-  // straddle a vertex and return the bisector; the command point is about to
-  // travel the outgoing leg, so that is the leg the nose has to face.
-  const double back = std::clamp(progress_, 0.0, length - step);
-  const Point2 a = installation_->path->point_at(back);
-  const Point2 b = installation_->path->point_at(back + step);
-  const Point2 delta{b.first - a.first, b.second - a.second};
-  const double norm = std::hypot(delta.first, delta.second);
-  if (norm <= kEpsilon) {
-    return std::nullopt;
-  }
-  return Point2{delta.first / norm, delta.second / norm};
+  return route_heading_direction(*installation_->path, progress_, lookahead);
 }
 
 std::optional<Point2> PathCommandLimiter::preview_direction(
   const Point2 & desired_point, double dt, const Point2 & reference_point,
-  double min_position_distance) const
+  double min_position_distance, double heading_lookahead) const
 {
   if (!finite(reference_point) || !std::isfinite(min_position_distance) ||
-    min_position_distance <= 0.0)
+    min_position_distance <= 0.0 || !std::isfinite(heading_lookahead) ||
+    heading_lookahead < 0.0)
   {
     throw std::invalid_argument("heading reference and positive distance must be finite");
   }
@@ -706,7 +819,7 @@ std::optional<Point2> PathCommandLimiter::preview_direction(
   const bool advancing =
     preview.speed_ > kEpsilon || preview.progress_ > progress_ + kEpsilon;
   if (advancing) {
-    if (const auto tangent = preview.advance_tangent()) {
+    if (const auto tangent = preview.advance_tangent(heading_lookahead)) {
       return tangent;
     }
   }

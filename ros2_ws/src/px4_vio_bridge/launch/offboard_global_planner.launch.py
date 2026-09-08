@@ -109,6 +109,7 @@ FLIGHT_RECORD_TOPICS = (
     "/planner/flight/command_speed",
     "/planner/flight/path_offset",
     "/planner/flight/joining",
+    "/planner/flight/heading_debug",
     "/planner/flight/teleop",
     # Non-commanding C++ clearance shadow. Absent unless cpp_shadow:=true,
     # but keeping them listed makes a parity run self-contained.
@@ -298,6 +299,10 @@ def generate_launch_description():
         # 20 deg/s turns 90 deg in ~4.5s without stepping the mixer.
         DeclareLaunchArgument("yaw_follows_heading", default_value="true"),
         DeclareLaunchArgument("yaw_rate_deg", default_value="20.0"),
+        # Preview across short route legs and slew the internal heading target.
+        # Both zero restores the point-tangent / stepped-target behavior.
+        DeclareLaunchArgument("yaw_heading_lookahead", default_value="0.35"),
+        DeclareLaunchArgument("yaw_reference_rate_deg", default_value="20.0"),
         DeclareLaunchArgument("yaw_track_min_displacement", default_value="0.15"),
         DeclareLaunchArgument("yaw_track_deadband_deg", default_value="15.0"),
         DeclareLaunchArgument("yaw_align_error_deg", default_value="40.0"),
@@ -368,6 +373,8 @@ def generate_launch_description():
         "yaw_follows_heading": typed("yaw_follows_heading", bool),
         "yaw_rate_deg": typed("yaw_rate_deg", float),
         "yaw_slowdown": typed("yaw_slowdown", bool),
+        "yaw_heading_lookahead": typed("yaw_heading_lookahead", float),
+        "yaw_reference_rate_deg": typed("yaw_reference_rate_deg", float),
         "yaw_track_min_displacement": typed("yaw_track_min_displacement", float),
         "yaw_track_deadband_deg": typed("yaw_track_deadband_deg", float),
         "yaw_align_error_deg": typed("yaw_align_error_deg", float),

@@ -1,4 +1,6 @@
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -576,17 +578,131 @@ TEST(CommandHeading, MapCorrectionIsRemovedBeforeNedHeading)
   EXPECT_NEAR(*heading, M_PI / 2.0, 1e-12);
 }
 
-TEST(PathCommandLimiter, SpeedCapLowersTheCeilingWithoutChangingTheTrajectory)
+TEST(CommandHeading, RecordedShortDiagonalDoesNotBecomeAFullYawExcursion)
 {
-  // The ride-out crawls the accepted path instead of stopping for a follower
-  // blink. A capped tick must be the ordinary tick at a lower ceiling: same
-  // path, same direction, just slower.
+  // 095742Z, path received at 13.171 s: 12.7 cm at 135.586 degrees NED,
+  // followed by 87 cm at 90.586 degrees. The old preview switches by 45 deg.
+  const Polyline path({{0.4720230894, 0.0197502850}, {0.5620230874, -0.0702497130},
+    {1.4320230680, -0.0702497130}, {1.7620230606, 0.2597502796}});
+  const auto heading = [&](double progress, double lookahead) {
+      const auto direction = px4_vio_bridge::route_heading_direction(path, progress, lookahead);
+      return *px4_vio_bridge::ned_track_heading(px4_vio_bridge::vio_enu_displacement_to_ned(
+          px4_vio_bridge::map_displacement_to_vio(*direction, 0.5861301866 * M_PI / 180)), 1e-6);
+    };
+  const double corner = path.cumulative()[1];
+  EXPECT_NEAR((heading(corner - 0.001, 0) - heading(corner, 0)) * 180 / M_PI, 45, 1e-5);
+  EXPECT_LT(std::abs(heading(corner - 0.001, 0.35) - heading(corner, 0.35)), 0.003);
+  EXPECT_LT(std::abs(heading(0, 0.35) - 95 * M_PI / 180), 15 * M_PI / 180);
+}
+
+TEST(CommandHeading, PreviewDoesNotAverageAcrossAHairpinOrInventAGoalDirection)
+{
+  const Polyline path({{0, 0}, {1, 0}, {0, 0}});
+  const auto incoming = px4_vio_bridge::route_heading_direction(path, 0.9, 0.35);
+  const auto outgoing = px4_vio_bridge::route_heading_direction(path, 1.0, 0.35);
+  ASSERT_TRUE(incoming);
+  ASSERT_TRUE(outgoing);
+  EXPECT_NEAR(incoming->first, 1, 1e-12);
+  EXPECT_NEAR(outgoing->first, -1, 1e-12);
+  EXPECT_FALSE(px4_vio_bridge::route_heading_direction(Polyline({{0, 0}}), 0, 0.35));
+  auto limiter = running_limiter();
+  const auto before = limiter.snapshot();
+  EXPECT_THROW((void)limiter.preview_direction({3, 0}, 0.05, {0, 0}, 0.15, -1),
+    std::invalid_argument);
+  EXPECT_EQ(limiter.snapshot().progress, before.progress);
+}
+
+TEST(CommandHeading, AveragedPreviewCannotChangeCommandOrConsumeACornerWait)
+{
+  PathCommandLimiter limiter;
+  limiter.set_path({{0, 0}, {0.2, 0}, {0.2, 0.5}}, {0, 0});
+  auto original = limiter;
+  for (int i = 0; i < 200; ++i) {
+    (void)limiter.preview_direction({0.2, 0.5}, 0.05, {0, 0}, 0.15, 0.35);
+    limiter.update({0.2, 0.5}, 0.05, true, Point2{0, 0});
+    original.update({0.2, 0.5}, 0.05, true, Point2{0, 0});
+    EXPECT_EQ(limiter.position(), original.position());
+    EXPECT_EQ(limiter.velocity(), original.velocity());
+    EXPECT_EQ(limiter.waiting_vertex(), original.waiting_vertex());
+  }
+  ASSERT_TRUE(limiter.waiting_vertex());
+  const auto direction = limiter.preview_direction({0.2, 0.5}, 0.05, {0, 0}, 0.15, 0.35);
+  ASSERT_TRUE(direction);
+  EXPECT_NEAR(direction->first, 1, 1e-12);
+}
+
+TEST(HeadingReference, ReplansStayBoundedButGenuineTurnsStillTriggerAlignment)
+{
+  px4_vio_bridge::HeadingReference heading;
+  heading.reset(0.0);
+  double previous = 0;
+  for (int i = 0; i < 40; ++i) {
+    const double goal = i < 10 ? M_PI / 2 : -M_PI / 2;
+    const double target = *heading.update(goal, 0.1, 0.4, 0.05);
+    EXPECT_LE(std::abs(px4_vio_bridge::wrap_pi(target - previous)), 0.020000001);
+    EXPECT_GE(std::abs(*heading.alignment_error(0)), M_PI / 2);
+    previous = target;
+  }
+  // An accepted reference must survive a rejected proposal verbatim.
+  const auto accepted = heading;
+  heading.update(M_PI, 0.1, 0.4, 0.05);
+  heading = accepted;
+  EXPECT_EQ(heading.target(), accepted.target());
+  EXPECT_EQ(heading.goal(), accepted.goal());
+  EXPECT_EQ(heading.preview(), accepted.preview());
+}
+
+TEST(HeadingReference, DeadbandDoesNotStallTheSlewAndWrapTakesTheShortWay)
+{
+  px4_vio_bridge::HeadingReference heading;
+  heading.reset(179 * M_PI / 180);
+  const double goal = -160 * M_PI / 180;
+  double previous = *heading.target();
+  for (int i = 0; i < 100; ++i) {
+    const double target = *heading.update(goal, 15 * M_PI / 180, 0.4, 0.05);
+    const double delta = px4_vio_bridge::wrap_pi(target - previous);
+    EXPECT_GE(delta, -1e-12);
+    EXPECT_LE(delta, 0.020000001);
+    previous = target;
+  }
+  EXPECT_NEAR(*heading.target(), goal, 1e-12);
+  heading.update(std::nullopt, 0.1, 0.4, 0.05);
+  EXPECT_NEAR(*heading.target(), goal, 1e-12);
+  EXPECT_THROW(heading.update(0.0, 0.1, -1, 0.05), std::invalid_argument);
+  EXPECT_NEAR(*heading.target(), goal, 1e-12);
+  heading.reset(0.3);
+  EXPECT_EQ(heading.goal(), heading.target());
+  EXPECT_FALSE(heading.preview());
+}
+
+TEST(HeadingReference, ZeroRateRetainsLegacyDeadbandAndGateBehavior)
+{
+  px4_vio_bridge::HeadingReference heading;
+  std::optional<double> legacy;
+  for (double goal : {0.2, 0.25, 1.0, -2.0, -2.05}) {
+    legacy = px4_vio_bridge::track_yaw_target(legacy, goal, 0.1);
+    EXPECT_EQ(heading.update(goal, 0.1, 0, 0.05), legacy);
+    EXPECT_NEAR(*heading.alignment_error(0.1), px4_vio_bridge::wrap_pi(*legacy - 0.1), 1e-12);
+  }
+}
+
+TEST(PathCommandLimiter, SpeedCapBrakesToTheCeilingWithoutSteppingVelocity)
+{
+  // Flights 20260908T032454Z and T032636Z stepped from cruise to the
+  // follower ride-out cap in one tick. At 20 Hz this demanded 2.8 m/s^2,
+  // despite the configured 0.3 m/s^2 limit and clipped acceleration FF.
   auto capped = running_limiter();
   auto normal = running_limiter();
   for (int tick = 0; tick < 40; ++tick) {
+    const auto before = capped.velocity();
+    const auto position = *capped.position();
     capped.update({3.0, 0.0}, 0.05, true, capped.position(), 0.06);
     normal.update({3.0, 0.0}, 0.05, true, normal.position());
-    EXPECT_LE(speed_of(capped), 0.06 + 1.0e-9) << "cap exceeded at tick " << tick;
+    EXPECT_NEAR(speed_of(capped), std::max(0.06, 0.20 - 0.015 * (tick + 1)), 1e-9);
+    EXPECT_LE(std::hypot(capped.velocity().first - before.first,
+      capped.velocity().second - before.second), 0.015 + 1e-9);
+    EXPECT_NEAR((capped.position()->first - position.first) / 0.05,
+      capped.velocity().first, 1e-9);
     EXPECT_NEAR(capped.position()->second, 0.0, 1.0e-9) << "left the route";
   }
   EXPECT_LT(capped.position()->first, normal.position()->first)
@@ -598,14 +714,39 @@ TEST(PathCommandLimiter, SpeedCapLowersTheCeilingWithoutChangingTheTrajectory)
   EXPECT_GT(speed_of(capped), resumed_from);
 }
 
-TEST(PathCommandLimiter, SpeedCapAlsoBoundsARejoin)
+TEST(PathCommandLimiter, SpeedCapBrakesARejoinWithoutSteppingTheVelocityVector)
 {
   auto limiter = running_limiter();
   ASSERT_TRUE(limiter.set_path({{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030}));
   ASSERT_TRUE(limiter.joining());
   for (int tick = 0; tick < 40 && limiter.joining(); ++tick) {
+    const auto before = limiter.velocity();
     limiter.update({3.0, 0.030}, 0.05, true, limiter.position(), 0.06);
-    EXPECT_LE(speed_of(limiter), 0.06 + 1.0e-9) << "rejoin outran the cap at tick " << tick;
+    EXPECT_LE(std::hypot(limiter.velocity().first - before.first,
+      limiter.velocity().second - before.second), 0.015 + 1e-9);
+    if (tick >= 10) {
+      EXPECT_LE(speed_of(limiter), 0.06 + 1.0e-9);
+    }
+  }
+}
+
+TEST(PathCommandLimiter, ZeroCapBrakesToRestOnPathAndDuringRejoin)
+{
+  for (const bool join : {false, true}) {
+    auto limiter = running_limiter();
+    if (join) {
+      ASSERT_TRUE(limiter.set_path({{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030}));
+    }
+    for (const double dt : {0.02, 0.08, 0.04, 0.06, 0.10, 0.10, 0.10, 0.10, 0.10}) {
+      const auto before = limiter.velocity();
+      limiter.update({3.0, 0.030}, dt, true, limiter.position(), 0.0);
+      EXPECT_LE(std::hypot(limiter.velocity().first - before.first,
+        limiter.velocity().second - before.second), 0.30 * dt + 1e-9);
+    }
+    EXPECT_NEAR(speed_of(limiter), 0.0, 1e-9);
+    limiter.update({3.0, 0.030}, 0.05, true, limiter.position());
+    EXPECT_GT(speed_of(limiter), 0.0);
+    EXPECT_LE(speed_of(limiter), 0.015 + 1e-9);
   }
 }
 
@@ -664,7 +805,9 @@ TEST(YawTranslation, KeepsExistingHoldAndStricterFollowerCap)
       0.6, 0.2, 0.7, 0.2, limiter.velocity(), 0.3, 0.05);
     ASSERT_TRUE(cap);
     limiter.update({3.0, 0.0}, 0.05, true, limiter.position(), std::min(*cap, 0.06));
-    EXPECT_LE(speed_of(limiter), 0.06 + 1e-9);
+    // The yaw taper eventually requests 0.04, stricter than the 0.06 crawl;
+    // both requests must preserve deceleration from the standing velocity.
+    EXPECT_NEAR(speed_of(limiter), std::max(0.04, 0.20 - 0.015 * (tick + 1)), 1e-9);
   }
   for (int tick = 0; tick < 20; ++tick) {
     const auto cap = px4_vio_bridge::yaw_translation_speed_cap(
@@ -672,4 +815,125 @@ TEST(YawTranslation, KeepsExistingHoldAndStricterFollowerCap)
     limiter.update({3.0, 0.0}, 0.05, false, limiter.position(), cap);
   }
   EXPECT_NEAR(speed_of(limiter), 0.0, 1e-9);
+}
+
+// --- carrying the command across a map correction ---------------------------
+//
+// 20260908T052413Z, t=19.29: RTAB-Map published a 0.396 m / 5.44 deg loop
+// closure in one message. The vehicle's map pose moved into the new solution
+// immediately; the limiter's command point, velocity and path stayed in the old
+// one, because nothing re-expressed them. The adapter publishes
+// `route_limiter_->position() - map_pose_` as the PX4 setpoint displacement, so
+// that difference picked up the whole correction delta in a single 50 ms tick:
+// the setpoint's lead ahead of the vehicle went 0.073 m -> 0.365 m and PX4
+// closed it at 0.30 m/s while the commanded crawl was 0.06 m/s. The limiter's
+// own speed cap cannot bind this -- it bounds the command point, and it was the
+// reference being subtracted that moved.
+
+namespace
+{
+/// The correction either side of that closure, radians for the yaw.
+constexpr px4_vio_bridge::Correction4 kBeforeClosure{-0.0306, -0.0080, 0.0, -0.00436};
+constexpr px4_vio_bridge::Correction4 kAfterClosure{-0.3072, -0.2912, 0.0, 0.09495};
+
+/// Wind a fresh limiter a little way along a straight route.
+PathCommandLimiter cruising_limiter()
+{
+  PathCommandLimiter limiter(0.20, 0.30, 0.05, 0.05, 0.30, 0.20, 0.01, false, 0.05);
+  limiter.set_path({{0.0, 0.0}, {2.0, 0.0}}, {0.0, 0.0});
+  for (int tick = 0; tick < 10; ++tick) {
+    limiter.update({2.0, 0.0}, 0.05);
+  }
+  return limiter;
+}
+}  // namespace
+
+TEST(PathCommandLimiter, ReexpressKeepsTheCommandedDisplacementContinuous)
+{
+  auto limiter = cruising_limiter();
+  const Point2 pose_before{0.05, 0.0};
+  const Point2 command_before = *limiter.position();
+  const Point2 lead_before{
+    command_before.first - pose_before.first, command_before.second - pose_before.second};
+
+  // The caller re-derives the pose through the new correction; the limiter has
+  // to follow it into the same solution.
+  const Point2 pose_after =
+    px4_vio_bridge::reexpress_point(pose_before, kBeforeClosure, kAfterClosure);
+  limiter.reexpress(kBeforeClosure, kAfterClosure);
+  const Point2 command_after = *limiter.position();
+  const Point2 lead_after{
+    command_after.first - pose_after.first, command_after.second - pose_after.second};
+
+  // What actually reaches PX4 is the displacement rotated out of the map frame,
+  // so that is the quantity which must not move.
+  const Point2 vio_before =
+    px4_vio_bridge::map_displacement_to_vio(lead_before, kBeforeClosure[3]);
+  const Point2 vio_after =
+    px4_vio_bridge::map_displacement_to_vio(lead_after, kAfterClosure[3]);
+  EXPECT_NEAR(vio_after.first, vio_before.first, 1e-9);
+  EXPECT_NEAR(vio_after.second, vio_before.second, 1e-9);
+}
+
+TEST(PathCommandLimiter, WithoutReexpressTheDisplacementStepsByTheCorrection)
+{
+  // The failure this guards against, stated as the size of the step: leaving
+  // the command point in the old solution while the pose moves into the new one
+  // is worth about the correction's own translation, in one tick.
+  auto limiter = cruising_limiter();
+  const Point2 pose_before{0.05, 0.0};
+  const Point2 stale_command = *limiter.position();
+  const Point2 pose_after =
+    px4_vio_bridge::reexpress_point(pose_before, kBeforeClosure, kAfterClosure);
+
+  const Point2 lead_before{
+    stale_command.first - pose_before.first, stale_command.second - pose_before.second};
+  const Point2 lead_stale{
+    stale_command.first - pose_after.first, stale_command.second - pose_after.second};
+  const double step = std::hypot(
+    lead_stale.first - lead_before.first, lead_stale.second - lead_before.second);
+  EXPECT_GT(step, 0.25);
+}
+
+TEST(PathCommandLimiter, ReexpressPreservesArcLengthSpeedAndGeometry)
+{
+  auto limiter = cruising_limiter();
+  const auto snapshot = limiter.snapshot();
+  const double length_before = limiter.path()->length();
+
+  limiter.reexpress(kBeforeClosure, kAfterClosure);
+
+  // A rigid transform changes neither how far along the route the command is
+  // nor how fast it is going, so the speed machinery carries on uninterrupted.
+  EXPECT_DOUBLE_EQ(limiter.snapshot().progress, snapshot.progress);
+  EXPECT_DOUBLE_EQ(limiter.snapshot().speed, snapshot.speed);
+  EXPECT_NEAR(limiter.path()->length(), length_before, 1e-12);
+  EXPECT_NEAR(
+    std::hypot(limiter.velocity().first, limiter.velocity().second),
+    std::hypot(snapshot.velocity.first, snapshot.velocity.second), 1e-12);
+  // The command point stays on its own path.
+  EXPECT_NEAR(limiter.path()->project(*limiter.position()).cross_track, 0.0, 1e-9);
+}
+
+TEST(PathCommandLimiter, ReexpressIsANoOpForAnUnchangedCorrectionAndRoundTrips)
+{
+  auto limiter = cruising_limiter();
+  const Point2 command = *limiter.position();
+
+  limiter.reexpress(kBeforeClosure, kBeforeClosure);
+  EXPECT_DOUBLE_EQ(limiter.position()->first, command.first);
+  EXPECT_DOUBLE_EQ(limiter.position()->second, command.second);
+
+  limiter.reexpress(kBeforeClosure, kAfterClosure);
+  limiter.reexpress(kAfterClosure, kBeforeClosure);
+  EXPECT_NEAR(limiter.position()->first, command.first, 1e-12);
+  EXPECT_NEAR(limiter.position()->second, command.second, 1e-12);
+}
+
+TEST(PathCommandLimiter, ReexpressRejectsANonFiniteCorrection)
+{
+  auto limiter = cruising_limiter();
+  const px4_vio_bridge::Correction4 broken{
+    std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0, 0.0};
+  EXPECT_THROW(limiter.reexpress(kBeforeClosure, broken), std::invalid_argument);
 }

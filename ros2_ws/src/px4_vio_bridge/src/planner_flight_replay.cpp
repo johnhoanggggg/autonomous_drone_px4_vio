@@ -85,6 +85,11 @@ int main()
   HorizontalCommandLimiter horizontal_limiter(
     config.at("max_speed").get<double>(),
     config.at("max_acceleration").get<double>());
+  px4_vio_bridge::HeadingReference heading_reference;
+  if (scenario.contains("initial_yaw")) {
+    heading_reference.reset(scenario.at("initial_yaw").get<double>());
+  }
+  bool yaw_holding = false;
 
   // A constant clearance verdict keeps the harness ROS-free while still
   // exercising both the accept and reject branches of the connector rejoin.
@@ -107,6 +112,40 @@ int main()
           point_of(step.at("reference")), step.value("min_position_distance", 0.15));
         result["direction"] = direction
           ? json::array({direction->first, direction->second}) : json(nullptr);
+      } else if (op == "heading_sample") {
+        // Recorded-state comparison, not a vehicle/adapter simulation: the
+        // caller supplies the accepted path and reconstructed command point.
+        const px4_vio_bridge::Polyline path(points_of(step.at("points")));
+        const auto projection = path.project(point_of(step.at("command")));
+        const auto direction = px4_vio_bridge::route_heading_direction(
+          path, projection.along, scenario.value("heading_lookahead", 0.35));
+        std::optional<double> preview;
+        if (direction) {
+          preview = px4_vio_bridge::ned_track_heading(
+            px4_vio_bridge::vio_enu_displacement_to_ned(
+              px4_vio_bridge::map_displacement_to_vio(
+                *direction, step.at("correction_yaw").get<double>())), 1e-6);
+        }
+        const auto target = heading_reference.update(
+          preview, scenario.value("heading_deadband", 15.0 * M_PI / 180.0),
+          scenario.value("heading_rate", 20.0 * M_PI / 180.0), step.value("dt", 0.05));
+        const auto error = heading_reference.alignment_error(step.at("measured_heading"));
+        if (error && std::abs(*error) > 40.0 * M_PI / 180.0) {
+          yaw_holding = true;
+        } else if (!error || std::abs(*error) <= 15.0 * M_PI / 180.0) {
+          yaw_holding = false;
+        }
+        const auto cap = px4_vio_bridge::yaw_translation_speed_cap(
+          error, 15.0 * M_PI / 180.0, 40.0 * M_PI / 180.0,
+          config.at("max_speed"), {step.value("command_speed", 0.0), 0.0},
+          config.at("max_acceleration"), step.value("dt", 0.05));
+        result["preview"] = preview ? json(*preview) : json(nullptr);
+        result["target"] = target ? json(*target) : json(nullptr);
+        result["error"] = error ? json(*error) : json(nullptr);
+        result["yaw_holding"] = yaw_holding;
+        result["yaw_speed_cap"] = cap ? json(*cap) : json(nullptr);
+        result["progress"] = projection.along;
+        result["projection_error"] = projection.cross_track;
       } else if (op == "update") {
         path_limiter.update(
           point_of(step.at("desired")),

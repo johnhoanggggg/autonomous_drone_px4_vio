@@ -1,5 +1,71 @@
 # Trajectory smoothness and wall strikes — handoff, 2026-09-07
 
+> **Yaw/motor investigation:** [YAW_MOTOR_DIAGNOSIS_20260908.md](YAW_MOTOR_DIAGNOSIS_20260908.md).
+> Reconstructed yaw P+I and 2 Hz filter agree with torque; diagonal motor split
+> agrees with allocation. Net gyro/attitude yaw changes agree within ≈1°, without
+> ruling out timing/transient estimation errors. MAIN PWM 400 Hz, matching ranges;
+> no ESC/RPM telemetry. User reports BLHeli 30 A, 1700 KV, 6-inch props. Prepared
+> a two-second low-output test and expected motor mapping; **no motors spun**.
+> Physical confirmation that all props are removed is needed before testing.
+> Roll P remains 0.150; no further control or ESC settings changed.
+
+> **Roll-P trial analyzed; restored baseline:**
+> [ROLL_RATE_TRIAL_RESULTS_20260908.md](ROLL_RATE_TRIAL_RESULTS_20260908.md).
+> Trial `050015Z`, SD `20_51_29.ulg`, verified P=0.165. Moving roll-rate RMS
+> improves 3.75→3.02°/s, but third overshoot remains 11.6 cm and final stationary
+> hold spans 26.7 cm for ≈10 s before LAND. Yaw integral peaks 0.161. ROS tail
+> is truncated; SD recovers the final stop. Calibration offsets also differ.
+> Restored **MC_ROLLRATE_P=0.150** over USB while disarmed, readback verified.
+> No further gain increase; yaw compensation/propulsion and estimator timing
+> remain unresolved. Terminal heading stays deferred.
+
+> **Current PX4 tuning trial, 2026-09-08:**
+> [ROLL_RATE_TUNING_20260908.md](ROLL_RATE_TUNING_20260908.md): user requested
+> tuning; changed only `MC_ROLLRATE_P` **0.150 -> 0.165 (+10%)** over USB while
+> disarmed. Readback confirms the value is saved. No flight started. Next is the
+> same open-area lateral sequence with a charged pack; evaluate roll tracking,
+> stopping/hold excursions and yaw compensation before retaining the change.
+> Baseline snapshots and rollback command are in that note. Earlier statements
+> below that gains were unchanged describe the preceding baseline flights.
+
+> **Lateral test flown and analyzed:**
+> [LATERAL_STOP_RESULTS_20260908.md](LATERAL_STOP_RESULTS_20260908.md): bag
+> `043031Z`, paired SD `20_22_29.ulg` (5,970,027 B, exact size verified).
+> Four legs completed. Third leg 0.316 m/s vs 0.20 reference, 12.2 cm initial
+> overshoot. Second stationary hold spans 25.8 cm laterally. Allocator reports
+> all thrust/torque achieved, no output clipping; yaw integral grows to 0.135
+> with fixed heading and increasingly split motor commands. This is not proof
+> of a specific bad motor or battery cause. Inner response/propulsion and
+> estimator timing remain the priorities; terminal heading stays deferred.
+
+> **Next flight prepared:** [LATERAL_STOP_TEST_20260908.md](LATERAL_STOP_TEST_20260908.md)
+> has the pasteable command for fixed-heading right/return/left/return, 35 cm
+> each leg, 0.20 m/s peak, smooth braking and measured settling gates. New
+> `offboard_lateral_stop` is built/installed; 17 new tests plus inherited hover
+> checks pass (aggregate 620 tests, no errors/failures, 3 skips). No flight was
+> launched by the preparation.
+> PX4 logger now loads 26 custom topics, including rate integrals, allocator
+> status, battery and actuator outputs; configured ESC status depends on
+> hardware publication. Logger was restarted disarmed; no gain changes.
+
+> **2026-09-08 runs 2/3 priority:** Terminal heading work is deferred by the
+> user. [TUNNEL_BRAKING_20260908.md](TUNNEL_BRAKING_20260908.md) traces roll-rate
+> braking response and documents a fixed acceleration-limit bypass when
+> entering `DEGRADED`. The cap now decelerates from 0.20 to 0.06 m/s over ten
+> 50 ms ticks. Wallward drift begins before this transition; the patch is not
+> proof of resolved wall strikes. Actual-velocity stopping clearance and full
+> vector continuity through joins/corners remain open. No PX4 gains changed.
+> Built/installed; **603 tests, 0 errors, 0 failures, 3 skipped**. New offline
+> analyzers: `scripts/analyze_command_continuity.py` and
+> `scripts/analyze_rate_loop.py`.
+
+> **2026-09-08 heading implementation:**
+> [HEADING_CONTINUITY_20260908.md](HEADING_CONTINUITY_20260908.md) traces the
+> 095742Z replacement-leg/vertex reversal and documents the new C++ heading
+> preview and persistent reference. Recorded-state shadow removes that target
+> excursion; 602 package tests pass with 3 skips. This is not flight validation
+> or proof that the braking/clearance issue is solved.
+
 > **Superseded diagnosis / follow-up:** Read
 > [HOVER_TURN_20260907.md](HOVER_TURN_20260907.md) for the subsequent open-area
 > test: a fixed-position hold reproduced poor rate tracking and growing yaw

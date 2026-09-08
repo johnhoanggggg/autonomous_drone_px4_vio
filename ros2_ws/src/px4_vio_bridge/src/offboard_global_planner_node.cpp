@@ -146,6 +146,13 @@ public:
       declare_parameter<double>("pre_route_max_horizontal_error", 0.15);
     yaw_track_ = declare_parameter<bool>("yaw_follows_heading", true);
     yaw_slowdown_ = declare_parameter<bool>("yaw_slowdown", true);
+    yaw_heading_lookahead_ = declare_parameter<double>("yaw_heading_lookahead", 0.35);
+    yaw_reference_rate_ = radians_of(declare_parameter<double>("yaw_reference_rate_deg", 20.0));
+    if (!std::isfinite(yaw_heading_lookahead_) || yaw_heading_lookahead_ < 0.0 ||
+      !std::isfinite(yaw_reference_rate_) || yaw_reference_rate_ < 0.0)
+    {
+      throw std::invalid_argument("heading lookahead and reference rate must be finite and nonnegative");
+    }
     yaw_track_min_displacement_ =
       declare_parameter<double>("yaw_track_min_displacement", 0.15);
     yaw_track_deadband_ =
@@ -209,6 +216,8 @@ public:
       "/planner/flight/path_offset", 10);
     joining_pub_ = create_publisher<std_msgs::msg::Bool>(
       "/planner/flight/joining", 10);
+    heading_debug_pub_ = create_publisher<std_msgs::msg::String>(
+      "/planner/flight/heading_debug", 10);
     // Latched, like /planner/config and /planner/follower/config, so a bag
     // records what the adapter was configured to do even when the recorder
     // started after the node did. Until this existed, corner_blending and the
@@ -277,6 +286,7 @@ protected:
       if (x0_ && std::isfinite(msg.x) && std::isfinite(msg.y)) {
         limiter_->reset({static_cast<double>(msg.x), static_cast<double>(msg.y)});
         route_limiter_->clear();
+        route_limiter_frame_.reset();
         holding_for_fault_ = true;
         require_follower_after_ = now;
         planner_fault_since_ = now;
@@ -291,6 +301,7 @@ protected:
         yaw0_ = static_cast<double>(msg.heading);
         yaw_cmd_ = static_cast<double>(msg.heading);
         yaw_target_.reset();
+        heading_reference_.reset(std::nullopt);
         yaw_holding_ = false;
       }
       RCLCPP_ERROR(get_logger(), "%s", planner_fault_reason_text_.c_str());
@@ -543,6 +554,7 @@ private:
       }
     }
     path_points_ = std::move(points);
+    ++path_input_id_;
     path_received_ = monotonic_time();
   }
 
@@ -739,9 +751,10 @@ private:
   // --- setpoint feedforward ------------------------------------------------
   std::pair<double, double> setpoint_velocity_xy() const
   {
-    // HorizontalCommandLimiter::velocity is already the speed- and
-    // acceleration-limited velocity of the point being published, in the same
-    // NED frame, and by construction it is that point's own derivative.
+    // Feed forward the path command's velocity, rotated into NED. Scalar
+    // speed changes and active rejoins are acceleration limited. Polyline
+    // corners/join completion can still change its direction abruptly, and
+    // map-to-PX4 rebasing can move the position independently of this velocity.
     // Gated to an advancing route on purpose: in a fault hold latch_fault_hold
     // resets the limiter, but a command hold does not, and the base-class LAND
     // state publishes through here too. NaN restores pure position control.
@@ -758,8 +771,9 @@ private:
   {
     // The derivative of the velocity just published. PX4 sums acceleration into
     // the velocity loop the same way it sums velocity into the position loop.
-    // Safe to differentiate because the limiter has already
-    // acceleration-bounded that velocity.
+    // Clip this derivative because path-direction transitions can still exceed
+    // the acceleration bound. Clipping acceleration FF alone does not make
+    // an abrupt velocity-reference transition dynamically continuous.
     if (std::isnan(vx) || std::isnan(vy) || !last_ff_velocity_) {
       last_ff_velocity_ =
         std::isnan(vx) ? std::nullopt : std::optional<Point2>{{vx, vy}};
@@ -784,6 +798,7 @@ private:
     nlohmann::json config;
     config["implementation"] = "cpp";
     config["follower_latch_grace"] = follower_latch_grace_;
+    config["speed_cap_transition"] = "acceleration_limited";
     config["degraded_speed"] = degraded_speed_;
     config["fault_escape_step"] = fault_escape_step_;
     config["fault_escape_limit"] = fault_escape_limit_;
@@ -803,7 +818,9 @@ private:
     config["route_command_grace"] = route_command_grace_;
     config["goal_hold_time"] = goal_hold_time_;
     config["yaw_track"] = yaw_track_;
-    config["yaw_direction_source"] = "constrained_command_preview";
+    config["yaw_direction_source"] = "accepted_route_heading_preview";
+    config["yaw_heading_lookahead"] = yaw_heading_lookahead_;
+    config["yaw_reference_rate_deg"] = degrees(yaw_reference_rate_);
     config["yaw_align_error_deg"] = degrees(yaw_align_error_);
     config["yaw_slowdown"] = yaw_slowdown_;
     config["yaw_resume_error_deg"] = degrees(yaw_resume_error_);
@@ -831,6 +848,27 @@ private:
     std_msgs::msg::Bool flag;
     flag.data = route_limiter_->joining();
     joining_pub_->publish(flag);
+    const auto angle_json = [](std::optional<double> angle) {
+        return angle ? nlohmann::json(degrees(*angle)) : nlohmann::json(nullptr);
+      };
+    nlohmann::json heading;
+    heading["frame"] = "ned";
+    heading["preview_deg"] = angle_json(heading_reference_.preview());
+    heading["goal_deg"] = angle_json(heading_reference_.goal());
+    heading["reference_deg"] = angle_json(yaw_target_);
+    heading["published_deg"] = angle_json(yaw_cmd_);
+    heading["alignment_error_deg"] = angle_json(yaw_track_error());
+    heading["holding"] = yaw_holding_;
+    heading["fault_holding"] = holding_for_fault_;
+    heading["command_rejected"] = route_command_holding_;
+    heading["path_installation"] = path_installation_id_;
+    heading["accepted_path_input"] = accepted_path_input_id_;
+    heading["latest_path_input"] = path_input_id_;
+    heading["has_path"] = route_limiter_->path() != nullptr;
+    heading["progress"] = route_limiter_->snapshot().progress;
+    std_msgs::msg::String detail;
+    detail.data = heading.dump();
+    heading_debug_pub_->publish(detail);
   }
 
   void publish_route_status(const std::string & text, const std::string & kind)
@@ -926,6 +964,7 @@ private:
     // Never let an unvalidated route command advance internally while the
     // published command is holding. A recovery restarts from actual pose.
     route_limiter_->clear();
+    route_limiter_frame_.reset();
     if (!planner_fault_since_) {
       planner_fault_since_ = now;
     }
@@ -1031,7 +1070,7 @@ private:
     if (!pos_ || !std::isfinite(pos_->heading)) {
       return std::nullopt;
     }
-    return wrap_pi(*yaw_target_ - static_cast<double>(pos_->heading));
+    return heading_reference_.alignment_error(static_cast<double>(pos_->heading));
   }
 
   void update_yaw_target(std::optional<double> heading)
@@ -1039,10 +1078,12 @@ private:
     if (!yaw_track_) {
       return;
     }
-    yaw_target_ = track_yaw_target(
-      yaw_target_,
-      heading,
-      yaw_track_deadband_);
+    if (!heading_reference_.target()) {
+      heading_reference_.reset(
+        yaw_reference_rate_ > 0.0 ? (yaw_cmd_ ? yaw_cmd_ : yaw0_) : std::nullopt);
+    }
+    yaw_target_ = heading_reference_.update(
+      heading, yaw_track_deadband_, yaw_reference_rate_, dt_);
     if (yaw_align_error_ <= 0.0) {
       yaw_holding_ = false;
       return;
@@ -1062,6 +1103,7 @@ private:
     yaw_holding_ = false;
     if (yaw_track_ && yaw_cmd_) {
       yaw_target_ = *yaw_cmd_;
+      heading_reference_.reset(yaw_target_);
     }
   }
 
@@ -1115,6 +1157,34 @@ private:
       ChordRole::IntermediateCarrot);
   }
 
+  /// Carry the route command's map-frame state into the current correction.
+  ///
+  /// The follower keeps its route in canonical VIO coordinates and re-renders
+  /// it on every correction, which is why its displacement is unchanged across
+  /// one. `route_limiter_` is the remaining piece of map-frame state that is
+  /// integrated across ticks, so it is the one that has to be carried by hand.
+  void reframe_route_limiter()
+  {
+    if (!correction_) {
+      return;
+    }
+    if (!route_limiter_->path() && !route_limiter_->position()) {
+      // Nothing installed yet: adopt the frame so the first tick with state
+      // does not report a spurious change.
+      route_limiter_frame_ = *correction_;
+      return;
+    }
+    if (!route_limiter_frame_) {
+      route_limiter_frame_ = *correction_;
+      return;
+    }
+    if (*route_limiter_frame_ == *correction_) {
+      return;
+    }
+    route_limiter_->reexpress(*route_limiter_frame_, *correction_);
+    route_limiter_frame_ = *correction_;
+  }
+
   /// The pose's own clearance, for telemetry. No value when it is not known.
   [[nodiscard]] std::optional<double> pose_clearance() const
   {
@@ -1133,6 +1203,14 @@ private:
   {
     std::optional<std::string> deferral;
 
+    // Carry the command state into this tick's map solution before anything
+    // differences it against the pose. `map_pose_` is already in the new
+    // solution; the limiter's point, velocity and path are still in the one
+    // they were integrated in. Everything below -- set_path's projection of
+    // the pose, the corner tolerance, and above all `final_map - map_pose_` --
+    // is a comparison between the two, so it has to happen first.
+    reframe_route_limiter();
+
     const auto clearance_check = [this](const Point2 & start, const Point2 & end) {
         return command_chord_permitted(start, end);
       };
@@ -1147,7 +1225,10 @@ private:
     // replacement is exactly what is down.
     if (!speed_cap && (!yaw_holding_ || replan_during_yaw_align_ || !route_limiter_->path())) {
       try {
-        route_limiter_->set_path(path_points_, *map_pose_, clearance_check);
+        if (route_limiter_->set_path(path_points_, *map_pose_, clearance_check)) {
+          ++path_installation_id_;
+          accepted_path_input_id_ = path_input_id_;
+        }
       } catch (const std::exception & error) {
         // An unjoinable replacement is not a flight fault. The accepted path is
         // still installed and still validated, so keep flying it and retry when
@@ -1164,10 +1245,12 @@ private:
 
     const auto restore_point = route_limiter_->snapshot();
     const auto previous_yaw_target = yaw_target_;
+    const auto previous_heading_reference = heading_reference_;
     const bool previous_yaw_holding = yaw_holding_;
     const auto restore_command = [&]() {
         route_limiter_->restore(restore_point);
         yaw_target_ = previous_yaw_target;
+        heading_reference_ = previous_heading_reference;
         yaw_holding_ = previous_yaw_holding;
       };
     Point2 final_map{};
@@ -1187,7 +1270,7 @@ private:
         // hand the nose the join's few-centimetre lateral correction and
         // restart the alignment it just finished.
         const auto direction = route_limiter_->preview_direction(
-          desired_map, dt_, *map_pose_, yaw_track_min_displacement_);
+          desired_map, dt_, *map_pose_, yaw_track_min_displacement_, yaw_heading_lookahead_);
         std::optional<double> heading;
         if (direction) {
           const auto vio_direction = map_displacement_to_vio(*direction, (*correction_)[3]);
@@ -1269,8 +1352,11 @@ private:
       return " yaw=hold";
     }
     std::string text = format(" yaw_target=%.0fdeg", degrees(*yaw_target_));
+    if (pos_ && std::isfinite(pos_->heading)) {
+      text += format(" yaw_error=%.0fdeg", degrees(wrap_pi(*yaw_target_ - pos_->heading)));
+    }
     if (const auto error = yaw_track_error()) {
-      text += format(" yaw_error=%.0fdeg", degrees(*error));
+      text += format(" yaw_align_error=%.0fdeg", degrees(*error));
     }
     return text;
   }
@@ -1357,15 +1443,19 @@ private:
   double transit_horizontal_error_{}, pre_route_max_horizontal_error_{};
   bool yaw_track_{};
   double yaw_track_min_displacement_{}, yaw_track_deadband_{};
+  double yaw_heading_lookahead_{}, yaw_reference_rate_{};
   double yaw_align_error_{}, yaw_resume_error_{};
   bool yaw_slowdown_{};
 
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr command_speed_pub_, path_offset_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr joining_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr flight_config_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr heading_debug_pub_;
 
   std::unique_ptr<HorizontalCommandLimiter> limiter_;
   std::unique_ptr<PathCommandLimiter> route_limiter_;
+  /// The map solution `route_limiter_`'s state is currently expressed in.
+  std::optional<Correction4> route_limiter_frame_;
 
   // --- runtime state -------------------------------------------------------
   std::optional<Point2> last_ff_velocity_;
@@ -1398,6 +1488,9 @@ private:
   bool route_command_holding_{false};
   std::optional<double> goal_since_;
   std::optional<double> yaw_target_;
+  HeadingReference heading_reference_;
+  std::size_t path_installation_id_{0};
+  std::size_t path_input_id_{0}, accepted_path_input_id_{0};
   bool yaw_holding_{false};
   bool holding_for_fault_{true};
   double require_follower_after_{0.0};

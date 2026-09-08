@@ -184,6 +184,7 @@ install(PROGRAMS
   scripts/global_planner_sim
   scripts/route_follower_monitor
   scripts/offboard_hold_yaw
+  scripts/offboard_lateral_stop
   scripts/offboard_global_planner
   scripts/offboard_hover
   scripts/offboard_square
@@ -227,6 +228,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_rtabmap_grid test/test_rtabmap_grid.py)
   ament_add_pytest_test(test_path_follower test/test_path_follower.py)
   ament_add_pytest_test(test_offboard_hover test/test_offboard_hover.py)
+  ament_add_pytest_test(test_offboard_lateral_stop test/test_offboard_lateral_stop.py)
   ament_add_pytest_test(test_planner_flight test/test_planner_flight.py)
   ament_add_pytest_test(test_process_monitor test/test_process_monitor.py)
   ament_add_pytest_test(test_process_singleton test/test_process_singleton.py)
