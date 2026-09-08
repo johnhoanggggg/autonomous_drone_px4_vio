@@ -170,6 +170,23 @@ def generate_launch_description():
         # less -- that is only tenable with the climb-phase grace and the
         # filtered recovery gate below.
         DeclareLaunchArgument("max_cross_track", default_value="0.08"),
+        # Ceiling the fault gate may open to where the pose has clearance to
+        # spare (pose clearance - robot_radius - safety_margin). max_cross_track
+        # stays the floor, so this never gates tighter than the fixed threshold.
+        #
+        # A fixed threshold answers "am I about to hit something" without
+        # knowing how much room there is. Over 20260908T064933Z-T065344Z the
+        # gate fired ten times and six were at 0.40-0.63 m of clearance, with
+        # 0.15-0.38 m of bubble to spare and nothing in reach. Each of those
+        # stops replanned from where the vehicle stopped, re-aiming the heading
+        # and driving the next excursion; T065022Z, the one flight that stayed
+        # under the gate (peak 0.075 m), had no faults and reached its goal.
+        #
+        # The widened branch cannot put the bubble closer to an obstacle than
+        # required_clearance: the vehicle may sit `gate` off the route, the
+        # route has `headroom + required` of clearance, and gate <= headroom.
+        # Set at or below max_cross_track to restore the fixed gate.
+        DeclareLaunchArgument("cross_track_clearance_cap", default_value="0.20"),
         DeclareLaunchArgument("cross_track_resume", default_value="0.04"),
         DeclareLaunchArgument("cross_track_recovery_time", default_value="0.6"),
         # Applies to the recovery gate only, never to the fault threshold.
@@ -256,6 +273,7 @@ def generate_launch_description():
         "max_carrot_speed": typed("max_carrot_speed", float),
         "max_carrot_acceleration": typed("max_carrot_acceleration", float),
         "max_cross_track": typed("max_cross_track", float),
+        "cross_track_clearance_cap": typed("cross_track_clearance_cap", float),
         "cross_track_resume": typed("cross_track_resume", float),
         "cross_track_recovery_time": typed("cross_track_recovery_time", float),
         "cross_track_filter_time_constant": typed(

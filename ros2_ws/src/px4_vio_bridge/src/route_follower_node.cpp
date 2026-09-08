@@ -189,6 +189,10 @@ public:
     max_carrot_acceleration_ = declare_parameter<double>("max_carrot_acceleration", 0.30);
     max_cross_track_ = declare_parameter<double>("max_cross_track", 0.60);
     cross_track_resume_ = declare_parameter<double>("cross_track_resume", 0.05);
+    // Ceiling the cross-track gate may open to where the pose has clearance to
+    // spare. At or below max_cross_track the gate stays fixed.
+    cross_track_clearance_cap_ =
+      declare_parameter<double>("cross_track_clearance_cap", 0.20);
     cross_track_recovery_time_ =
       declare_parameter<double>("cross_track_recovery_time", 1.0);
     // Applies to the recovery gate only; the fault threshold stays on the raw
@@ -245,7 +249,8 @@ public:
     follower_ = std::make_unique<PositionRouteFollower>(
       lookahead_, max_carrot_speed_, max_carrot_acceleration_, max_cross_track_,
       cross_track_resume_, cross_track_recovery_time_, arrival_tolerance_,
-      arrival_release_tolerance_, cross_track_filter_time_constant_);
+      arrival_release_tolerance_, cross_track_filter_time_constant_,
+      cross_track_clearance_cap_);
     last_tick_ = monotonic_seconds();
 
     const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -344,6 +349,7 @@ private:
       {"max_cross_track", max_cross_track_}, {"cross_track_resume", cross_track_resume_},
       {"cross_track_recovery_time", cross_track_recovery_time_},
       {"cross_track_filter_time_constant", cross_track_filter_time_constant_},
+      {"cross_track_clearance_cap", cross_track_clearance_cap_},
       {"path_start_tolerance", path_start_tolerance_},
       {"arrival_tolerance", arrival_tolerance_},
       {"arrival_release_tolerance", arrival_release_tolerance_},
@@ -725,6 +731,10 @@ private:
         ChordRole::IntermediateCarrot));
 
     const auto start_clearance = selection->start_clearance;
+    // How much room the safety bubble has to spare here. The follower widens
+    // its cross-track fault gate by this, so an excursion in open space stops
+    // costing a fault, a replan and a re-aimed heading.
+    follower_->set_clearance_headroom(start_clearance - required_clearance_);
     const auto result = follower_->update(
       pose_xy, dt, selection->lookahead,
       [this, &probe, &pose_xy, start_clearance](const Point2 & carrot) {
@@ -775,7 +785,8 @@ private:
     status += result.status + " generation=" + std::to_string(result.generation) +
       " progress=" + format(result.progress, 2) + "m path_progress=" +
       format(result.path_progress, 2) + "m remaining=" + format(result.remaining, 2) +
-      "m cross_track=" + format(result.cross_track, 2) + "m lookahead=" +
+      "m cross_track=" + format(result.cross_track, 2) + "/" +
+      format(follower_->cross_track_limit(), 2) + "m lookahead=" +
       format(selection->lookahead, 2) + "/" + format(lookahead_, 2) + "m";
     publish_status(
       status, result.valid, requested_goal_reached(result.status, goal_terminal_));
@@ -789,6 +800,7 @@ private:
   double lookahead_{}, lookahead_step_{}, min_lookahead_{};
   int occupied_threshold_{};
   double robot_radius_{}, safety_margin_{}, required_clearance_{};
+  double cross_track_clearance_cap_{};
   double max_carrot_speed_{}, max_carrot_acceleration_{}, max_cross_track_{};
   double cross_track_resume_{}, cross_track_recovery_time_{}, path_start_tolerance_{};
   double cross_track_filter_time_constant_{};

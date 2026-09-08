@@ -2,7 +2,11 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -836,4 +840,127 @@ TEST(ClearanceEscape, HeldPoseRejectsBadInputs)
   const px4_vio_bridge::ClearanceProbe blind =
     [](const Point2 &, const Point2 &) {return std::optional<double>{};};
   EXPECT_FALSE(px4_vio_bridge::best_clearance_escape_step(blind, {0.88, 1.0}, 0.05, limits, 0.12));
+}
+
+// --- clearance-scaled cross-track gate --------------------------------------
+//
+// The fault gate exists to stop the vehicle leaving the route into an obstacle,
+// but a fixed threshold decides that without knowing how much room there is.
+// Across 20260908T064933Z-T065344Z it fired ten times; the clearance at each,
+// against a 0.25 m required clearance, was:
+//
+//   0.631  0.510  0.470  0.450  0.420  0.400   <- 0.15-0.38 m of bubble spare
+//   0.277  0.270  0.218  0.212                 <- genuinely tight
+//
+// Six of ten stopped the vehicle where nothing was in reach, and every stop
+// replans from where it stopped, re-aiming the heading into the next excursion.
+
+namespace
+{
+/// A follower with the flight's gate settings: 0.08 m floor, 0.20 m cap.
+PositionRouteFollower scaled_gate_follower()
+{
+  return PositionRouteFollower(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 0.30, 0.20);
+}
+constexpr double kGateRequired = 0.25;
+}  // namespace
+
+TEST(RouteFollower, ClearanceHeadroomWidensTheGateOnlyWhereThereIsRoom)
+{
+  auto follower = scaled_gate_follower();
+  // No headroom reported: the fixed threshold, unchanged.
+  EXPECT_NEAR(follower.cross_track_limit(), 0.08, 1e-12);
+
+  // The six needless trips: the gate opens past the cross-track that stopped
+  // the vehicle, so none of them would have faulted.
+  for (const auto [clearance, was_at] : std::vector<std::pair<double, double>>{
+      {0.631, 0.099}, {0.510, 0.099}, {0.470, 0.080},
+      {0.450, 0.090}, {0.420, 0.084}, {0.400, 0.083}})
+  {
+    follower.set_clearance_headroom(clearance - kGateRequired);
+    EXPECT_GT(follower.cross_track_limit(), was_at) << "clearance " << clearance;
+    EXPECT_LE(follower.cross_track_limit(), 0.20) << "cap";
+  }
+
+  // The four real ones: the floor holds and they still fault.
+  for (const auto [clearance, was_at] : std::vector<std::pair<double, double>>{
+      {0.277, 0.083}, {0.270, 0.082}, {0.218, 0.090}, {0.212, 0.083}})
+  {
+    follower.set_clearance_headroom(clearance - kGateRequired);
+    EXPECT_NEAR(follower.cross_track_limit(), 0.08, 1e-12) << "clearance " << clearance;
+    EXPECT_LT(follower.cross_track_limit(), was_at) << "clearance " << clearance;
+  }
+}
+
+TEST(RouteFollower, WidenedGateNeverGatesTighterThanTheFixedThreshold)
+{
+  // The floor is what makes this change one-directional: it can only ever let
+  // the vehicle keep flying, never fault it sooner than today.
+  auto follower = scaled_gate_follower();
+  for (double clearance = 0.0; clearance <= 1.0; clearance += 0.01) {
+    follower.set_clearance_headroom(clearance - kGateRequired);
+    EXPECT_GE(follower.cross_track_limit(), 0.08 - 1e-12) << "clearance " << clearance;
+    EXPECT_LE(follower.cross_track_limit(), 0.20 + 1e-12) << "clearance " << clearance;
+  }
+}
+
+TEST(RouteFollower, WidenedGateKeepsTheBubbleOutsideTheRequiredClearance)
+{
+  // The safety argument, checked rather than asserted: wherever the gate opens
+  // past its floor it equals the spare room, so a vehicle sitting the full gate
+  // off the route still has `required` between its centre and the obstacle.
+  auto follower = scaled_gate_follower();
+  for (double clearance = 0.34; clearance <= 1.0; clearance += 0.01) {
+    follower.set_clearance_headroom(clearance - kGateRequired);
+    const double worst_case_centre_to_obstacle = clearance - follower.cross_track_limit();
+    EXPECT_GE(worst_case_centre_to_obstacle, kGateRequired - 1e-12) << "clearance " << clearance;
+  }
+}
+
+TEST(RouteFollower, WidenedGateActuallyKeepsTheFollowerFollowing)
+{
+  // End to end through update(): the 06:49 t=22.6 trip, 0.099 m off the route
+  // with 0.631 m of clearance. Fixed gate faults, scaled gate keeps flying.
+  PositionRouteFollower fixed(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 0.30);
+  ASSERT_TRUE(fixed.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0}));
+  fixed.update({1.0, 0.00}, 0.10);
+  EXPECT_EQ(fixed.update({1.0, 0.099}, 0.10).status, "CROSS_TRACK_EXCEEDED");
+
+  auto scaled = scaled_gate_follower();
+  ASSERT_TRUE(scaled.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0}));
+  scaled.set_clearance_headroom(0.631 - kGateRequired);
+  scaled.update({1.0, 0.00}, 0.10);
+  const auto result = scaled.update({1.0, 0.099}, 0.10);
+  EXPECT_EQ(result.status, "FOLLOWING");
+  EXPECT_TRUE(result.valid);
+
+  // And the tight case still faults with the scaling on: 06:52 t=21.5.
+  auto tight = scaled_gate_follower();
+  ASSERT_TRUE(tight.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0}));
+  tight.set_clearance_headroom(0.212 - kGateRequired);
+  tight.update({1.0, 0.00}, 0.10);
+  EXPECT_EQ(tight.update({1.0, 0.090}, 0.10).status, "CROSS_TRACK_EXCEEDED");
+}
+
+TEST(RouteFollower, ClearanceCapAtOrBelowTheThresholdRestoresTheFixedGate)
+{
+  // The rollback path: cross_track_clearance_cap <= max_cross_track disables it.
+  PositionRouteFollower off(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 0.30, 0.08);
+  off.set_clearance_headroom(0.631 - kGateRequired);
+  EXPECT_NEAR(off.cross_track_limit(), 0.08, 1e-12);
+
+  PositionRouteFollower defaulted(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 0.30);
+  defaulted.set_clearance_headroom(0.631 - kGateRequired);
+  EXPECT_NEAR(defaulted.cross_track_limit(), 0.08, 1e-12);
+}
+
+TEST(RouteFollower, ClearanceHeadroomRejectsNonFiniteAndCapRejectsNonsense)
+{
+  auto follower = scaled_gate_follower();
+  EXPECT_THROW(
+    follower.set_clearance_headroom(std::numeric_limits<double>::quiet_NaN()),
+    std::invalid_argument);
+  EXPECT_THROW(
+    PositionRouteFollower(0.60, 0.10, 0.30, 0.08, 0.04, 0.60, 0.12, 0.20, 0.30, -0.1),
+    std::invalid_argument);
 }

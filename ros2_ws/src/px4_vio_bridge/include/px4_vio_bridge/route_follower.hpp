@@ -236,7 +236,8 @@ public:
     double cross_track_recovery_time = 1.0,
     double arrival_tolerance = 0.12,
     double arrival_release_tolerance = 0.20,
-    double cross_track_filter_time_constant = 0.30);
+    double cross_track_filter_time_constant = 0.30,
+    double cross_track_clearance_cap = 0.0);
 
   void clear_path();
   void reset_route_progress();
@@ -255,6 +256,31 @@ public:
   /// regardless, so dropping one that still passes buys no safety.
   /// Staying in, or leaving, the escape always preserves route progress.
   void set_escape(bool escaping, bool stale_command_admissible = false);
+
+  /// Spare room at the current pose: its clearance minus the clearance the
+  /// caller requires. Widens the cross-track fault gate where there is room to
+  /// wander. No value leaves the gate at `max_cross_track`.
+  ///
+  /// The gate exists to stop the vehicle leaving the route into an obstacle,
+  /// but a fixed threshold answers that question without knowing how much room
+  /// there is. Across 20260908T064933Z-T065344Z it fired ten times; six were at
+  /// 0.40-0.63 m of clearance, where the safety bubble had 0.15-0.38 m to spare
+  /// and nothing was in reach. Each needless stop replans from wherever the
+  /// vehicle stopped, which re-aims the heading and drives the next excursion.
+  /// The one flight whose cross-track stayed under the gate (T065022Z, peak
+  /// 0.075 m) had no faults, no weave, and reached its goal.
+  void set_clearance_headroom(std::optional<double> headroom);
+
+  /// The cross-track fault threshold for this tick.
+  ///
+  /// `max_cross_track` is the floor, so this never gates tighter than a fixed
+  /// threshold does. Where headroom exceeds it the gate opens to the spare room
+  /// itself, capped by `cross_track_clearance_cap`. That branch cannot bring
+  /// the bubble closer to an obstacle than the caller already requires: the
+  /// vehicle may be `gate` off the route, the route has `headroom + required`
+  /// of clearance, and gate <= headroom, so what is left is at least
+  /// `required`. A cap at or below `max_cross_track` disables the widening.
+  [[nodiscard]] double cross_track_limit() const;
 
   /// `correction` is the map<-vio transform the supplied map-frame points and
   /// pose belong to. The route is stored in VIO coordinates, so re-publishing
@@ -306,6 +332,8 @@ private:
   double cross_track_resume_;
   double cross_track_recovery_time_;
   double cross_track_filter_time_constant_;
+  double cross_track_clearance_cap_;
+  std::optional<double> clearance_headroom_;
   double arrival_tolerance_;
   double arrival_release_tolerance_;
   std::vector<Point2> vio_points_;

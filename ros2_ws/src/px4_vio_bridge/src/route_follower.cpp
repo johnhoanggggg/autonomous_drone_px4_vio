@@ -324,7 +324,7 @@ PositionRouteFollower::PositionRouteFollower(
   double lookahead, double max_carrot_speed, double max_carrot_acceleration,
   double max_cross_track, double cross_track_resume, double cross_track_recovery_time,
   double arrival_tolerance, double arrival_release_tolerance,
-  double cross_track_filter_time_constant)
+  double cross_track_filter_time_constant, double cross_track_clearance_cap)
 : lookahead_(lookahead),
   max_carrot_speed_(max_carrot_speed),
   max_carrot_acceleration_(max_carrot_acceleration),
@@ -332,6 +332,7 @@ PositionRouteFollower::PositionRouteFollower(
   cross_track_resume_(cross_track_resume),
   cross_track_recovery_time_(cross_track_recovery_time),
   cross_track_filter_time_constant_(cross_track_filter_time_constant),
+  cross_track_clearance_cap_(cross_track_clearance_cap),
   arrival_tolerance_(arrival_tolerance),
   arrival_release_tolerance_(arrival_release_tolerance)
 {
@@ -347,6 +348,9 @@ PositionRouteFollower::PositionRouteFollower(
   }
   if (cross_track_resume_ >= max_cross_track_) {
     throw std::invalid_argument("cross_track_resume must be below max_cross_track");
+  }
+  if (!std::isfinite(cross_track_clearance_cap_) || cross_track_clearance_cap_ < 0.0) {
+    throw std::invalid_argument("cross_track_clearance_cap must be finite and non-negative");
   }
   if (arrival_release_tolerance_ < arrival_tolerance_) {
     throw std::invalid_argument(
@@ -435,6 +439,22 @@ void PositionRouteFollower::set_escape(bool escaping, bool stale_command_admissi
     at_goal_ = false;
   }
   escaping_ = escaping;
+}
+
+void PositionRouteFollower::set_clearance_headroom(std::optional<double> headroom)
+{
+  if (headroom && !std::isfinite(*headroom)) {
+    throw std::invalid_argument("clearance headroom must be finite");
+  }
+  clearance_headroom_ = headroom;
+}
+
+double PositionRouteFollower::cross_track_limit() const
+{
+  if (cross_track_clearance_cap_ <= max_cross_track_ || !clearance_headroom_) {
+    return max_cross_track_;
+  }
+  return std::clamp(*clearance_headroom_, max_cross_track_, cross_track_clearance_cap_);
 }
 
 bool PositionRouteFollower::set_path(
@@ -528,7 +548,7 @@ FollowResult PositionRouteFollower::update(
   const Point2 desired = path_->point_at(candidate_progress + effective_lookahead);
   const Point2 desired_offset{desired.first - pose.first, desired.second - pose.second};
 
-  if (projection.cross_track > max_cross_track_) {
+  if (projection.cross_track > cross_track_limit()) {
     if (!cross_track_latched_) {
       cross_track_latched_ = true;
       cross_track_fault_generation_ = generation_;
