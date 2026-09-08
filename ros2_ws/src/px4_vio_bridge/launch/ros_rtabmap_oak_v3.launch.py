@@ -1,9 +1,10 @@
 """ROS-native RTAB-Map on the depthai_ros_driver_v3 (depthai-core v3) driver.
 
-This is the version of ros_rtabmap_oak_3d.launch.py that can actually fuse the
-IMU. The v2 driver delivers /oak/imu/data ~0.4 s behind the images, so
-rtabmap_odom drops nearly every frame; measured on the Pi, v3 brings that to
-about 10 ms and odometry runs with zero IMU-caused drops.
+The v2 driver delivers /oak/imu/data ~0.4 s behind the images, so
+OdometryROS drops nearly every frame while waiting for IMU. The v3 driver fixes
+that timing. F2M needs an orientation quaternion to use the IMU: bare raw
+acceleration/gyro messages are ignored by this core. Set filter_imu:=true to
+experiment with Madgwick orientation aiding (not tightly coupled VIO).
 
 depthai_ros_driver_v3 is NOT installed system-wide. Either install it
 (`sudo apt install ros-jazzy-depthai-ros-driver-v3`, which also upgrades
@@ -21,7 +22,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import AnyLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
@@ -50,8 +51,14 @@ def generate_launch_description():
                 "oak_v3_rtabmap.yaml",
             ]),
         ),
-        # v3 fuses the IMU correctly, so unlike the v2 launch this defaults on.
+        # v3 provides current IMU stamps, so waiting for IMU can default on.
         DeclareLaunchArgument("use_imu", default_value="true"),
+        DeclareLaunchArgument("start_mapper", default_value="true"),
+        DeclareLaunchArgument("base_frame_id", default_value="oak"),
+        # F2M consumes orientation, not bare gyro/accelerometer measurements.
+        # Keep this selectable for controlled comparisons with the historical
+        # raw-IMU path. It is orientation aiding, not tightly coupled VIO.
+        DeclareLaunchArgument("filter_imu", default_value="false"),
         # Use keypoints detected/tracked by the OAK's RVC2 while keeping the
         # ROS OdometryROS/F2M core. No DepthAI RTABMapVIO node is created.
         DeclareLaunchArgument("use_oak_features", default_value="false"),
@@ -80,6 +87,9 @@ def generate_launch_description():
         DeclareLaunchArgument("vis_cor_type", default_value="0"),
         DeclareLaunchArgument("odom_f2m_max_size", default_value="2000"),
         DeclareLaunchArgument("odom_bundle_adjustment", default_value="1"),
+        DeclareLaunchArgument("odom_vis_keyframe_thr", default_value="150"),
+        DeclareLaunchArgument("odom_bundle_min_motion", default_value="0.0"),
+        DeclareLaunchArgument("odom_config_path", default_value=""),
         DeclareLaunchArgument("sync_max_interval", default_value="0.05"),
         DeclareLaunchArgument("oak_feature_sync_max_interval", default_value="0.001"),
         DeclareLaunchArgument("sensor_qos", default_value="2"),
@@ -113,6 +123,26 @@ def generate_launch_description():
         output="screen",
     )
 
+    imu_filter = LoadComposableNodes(
+        target_container="/oak_container",
+        condition=IfCondition(LaunchConfiguration("filter_imu")),
+        composable_node_descriptions=[ComposableNode(
+            package="imu_filter_madgwick",
+            plugin="ImuFilterMadgwickRos",
+            name="oak_imu_orientation",
+            parameters=[{
+                "use_sim_time": typed("use_sim_time", bool),
+                "use_mag": False,
+                "publish_tf": False,
+                "world_frame": "enu",
+            }],
+            remappings=[
+                ("imu/data_raw", LaunchConfiguration("imu_topic")),
+                ("imu/data", "/rtabmap/imu_orientation"),
+            ],
+        )],
+    )
+
     # The default camera profile publishes depth in the colour optical frame.
     # A mono-parity profile can instead align it to CAM_B and select
     # /oak/left/image_rect here without changing the RTAB-Map graph.
@@ -123,8 +153,9 @@ def generate_launch_description():
     ]
 
     odometry_parameters = {
+        "config_path": LaunchConfiguration("odom_config_path"),
         "use_sim_time": typed("use_sim_time", bool),
-        "frame_id": "oak",
+        "frame_id": LaunchConfiguration("base_frame_id"),
         "odom_frame_id": "rtabmap_odom",
         "publish_tf": True,
         # A null odometry message is an identity pose. Publishing it on a
@@ -149,9 +180,16 @@ def generate_launch_description():
         "Vis/CorType": core_string("vis_cor_type"),
         "OdomF2M/MaxSize": core_string("odom_f2m_max_size"),
         "OdomF2M/BundleAdjustment": core_string("odom_bundle_adjustment"),
+        "Odom/VisKeyFrameThr": core_string("odom_vis_keyframe_thr"),
+        "OdomF2M/BundleAdjustmentMinMotion": core_string("odom_bundle_min_motion"),
     }
     odometry_remappings = [
-        ("imu", LaunchConfiguration("imu_topic")),
+        ("imu", IfElseSubstitution(
+            LaunchConfiguration("use_imu"),
+            IfElseSubstitution(
+                LaunchConfiguration("filter_imu"),
+                "/rtabmap/imu_orientation", LaunchConfiguration("imu_topic")),
+            "/rtabmap/imu_disabled")),
         ("odom", "/rtabmap/vio_odometry"),
         ("odom_info", "/rtabmap/vio_odom_info"),
     ]
@@ -184,7 +222,7 @@ def generate_launch_description():
             "subscribe_rgbd": False,
             "subscribe_stereo": False,
             "subscribe_odom_info": True,
-            "frame_id": "oak",
+            "frame_id": LaunchConfiguration("base_frame_id"),
             "map_frame_id": "world",
             "publish_tf": True,
             "approx_sync": True,
@@ -250,11 +288,13 @@ def generate_launch_description():
 
     mapper_component = LoadComposableNodes(
         target_container="/oak_container",
+        condition=IfCondition(LaunchConfiguration("start_mapper")),
         composable_node_descriptions=[mapper],
     )
 
     octomap = Node(
         package="px4_vio_bridge",
+        condition=IfCondition(LaunchConfiguration("start_mapper")),
         executable="rtabmap_octomap_node",
         name="ros_rtabmap_octomap",
         output="screen",
@@ -301,12 +341,13 @@ def generate_launch_description():
 
     return LaunchDescription(arguments + [
         LogInfo(msg=(
-            "ROS-native RTAB-Map on depthai_ros_driver_v3, IMU fusion enabled. "
+            "ROS-native RTAB-Map on depthai_ros_driver_v3. filter_imu selects orientation aiding. "
             "No node publishes to /fmu/in/*. Foxglove fixed frame is 'world'. "
             "Requires the v3 driver on AMENT_PREFIX_PATH; see the module docstring."
         )),
         camera,
         replay_container,
+        imu_filter,
         standard_odometry,
         tracked_odometry,
         mapper_component,

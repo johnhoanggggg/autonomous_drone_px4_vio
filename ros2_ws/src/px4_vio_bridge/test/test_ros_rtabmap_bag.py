@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 
 import yaml
+import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[4] / "scripts/ros_rtabmap_bag.py"
@@ -43,3 +44,30 @@ def test_missing_calibration_is_not_replayable(tmp_path):
     (tmp_path / "metadata.yaml").write_text(yaml.safe_dump(
         {"rosbag2_bagfile_information": metadata}))
     assert bag.inspect_bag(tmp_path)["all_inputs_recorded"]
+
+
+def test_report_reads_ros_bag_timestamps_without_datetime_conversion(tmp_path, monkeypatch):
+    rosbag = pytest.importorskip("rosbag2_py")
+    from nav_msgs.msg import Odometry
+    from rclpy.serialization import serialize_message
+
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    path = tmp_path / "poses"
+    writer = rosbag.SequentialWriter()
+    writer.open(rosbag.StorageOptions(uri=str(path), storage_id="mcap"),
+                rosbag.ConverterOptions("", ""))
+    topic = "/rtabmap/vio_odometry"
+    writer.create_topic(rosbag.TopicMetadata(
+        id=0, name=topic, type="nav_msgs/msg/Odometry", serialization_format="cdr"))
+    for i in range(301):
+        msg = Odometry()
+        msg.pose.pose.orientation.w = 1.0
+        msg.pose.pose.position.x = 0.0 if i <= 100 else 0.3
+        stamp = 1_000_000_000 + i * 100_000_000
+        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp, 1_000_000_000)
+        writer.write(topic, serialize_message(msg), stamp)
+    writer.close()
+    result = bag.report_bag(path, 10, 0.05)["raw_vio_pose_the_one_px4_uses"]
+    assert result["recording_duration_s"] == 30.0
+    assert result["hold_comparison_valid"]
+    assert result["return_to_origin_error_mm"] == 300.0

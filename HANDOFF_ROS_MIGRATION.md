@@ -1,11 +1,12 @@
 # ROS-native RTAB-Map Migration — Results Handoff
 
-Status: investigation and bench work ongoing; **nothing here has flown**. The
-hybrid described below is committed and is the recommended next thing to take to
-props-off. The full ROS-native stack is committed but is **not** flight-eligible
-because the original RGB-camera profile fails to initialise about two runs in
-three. The new global-shutter mono profile has now passed the instrumented
-startup gate 10/10, but it has not passed the moving-trajectory gate.
+Status: ROS/DepthAI parity is **not established**. The OAK-tracked ROS path
+now has a corrected body-to-camera transform, a 1 ms feature/image sync gate,
+and a repeatable bag workflow. The September 7 carried bag fails tracking
+continuity (39.8% lost updates, 12.61 s longest output gap). ROS accepted ten
+global closures, but those do not repair the raw-odometry outages. The recording
+has no stationary ending hold, so it is a motion stress test, not a valid
+return-to-origin test. The ROS-native launch remains disconnected from PX4.
 
 Branch: `ros-rtabmap-migration`. Nothing on this branch publishes to `/fmu/in/*`
 except the pre-existing `vio_to_px4_odometry`, whose input is unchanged.
@@ -18,8 +19,11 @@ while `OdometryROS` transforms the IMU into `frame_id=oak`. Thus the visual
 camera model used optical axes as body axes and omitted the camera lever arm.
 Standard ROS RGBDOdometry explicitly looks up body-to-camera TF. The tracked
 adapter now does the same, rejects a tuple if its transform is unavailable,
-and uses OdometryROS's data callback group and pause state. This invalidates any
-claim that the previous adapter already had full visual/IMU frame parity.
+and uses OdometryROS's data callback group and pause state. This fixes the
+published body-frame geometry and the camera lever arm. The earlier explanation
+that it was already mixing active visual and inertial constraints was too
+strong: the raw IMU stream supplies no changing orientation and F2M ignores it
+(see the IMU correction below).
 
 A stationary raw-input and original-output bag survived the Pi reboot:
 `/home/john/ros_parity_stationary_before_20260907`. It contains 33.4 seconds,
@@ -66,9 +70,243 @@ failure, but its wall-clock output rate is not a live-performance benchmark.
 The current loop harness uses wall time, so use 1x playback for its existing
 metrics. Record a fresh output bag or subscribe to the new odometry/status
 while replaying for comparison. Input presence alone does not prove a lossless
-capture. This ROS bag cannot yet be fed directly to DepthAI's host node; that
-requires a separate DepthAI replay adapter. Moving robustness and DepthAI
+capture. The new `depthai_rtabmap_bag.py` can also feed its visual inputs into
+the SDK host node (see controlled replay below). Moving robustness and DepthAI
 motion/map parity remain open, and the ROS launch still has no PX4 output.
+
+## September 7 motion bag and follow-up results
+
+The original carried capture is `/home/john/ros_parity_carry_20260907_01`
+(about 89 seconds, all six required sensor/calibration topics). The original
+live report is `/home/john/ros_parity_carry_20260907_01_report.json`.
+`validated_report.json` inside the bag recomputes the result with the corrected
+hold checks and suppresses return error: the ending position span is **2.497 m**.
+The original 1.900 m reported return error must not be used as a drift metric.
+Saved `frame_*.png` images show continued camera movement and a different view
+at the end. Raw images/tracks continue around 30 Hz during the odometry losses;
+`sensor_audit.json` inside the bag contains the
+per-second image, depth, feature and tracking measurements.
+
+The live capture reported 447 lost updates out of 1123 (39.8%), four loss
+episodes, a 12.61 s longest output gap, and three valid-pose steps above 250 mm
+(two immediately after long gaps). ROS mapper Info reported **10 global
+closures and 2 proximity detections**. Container plus OctoMap CPU averaged
+133.3% over the recording; the recorder's CPU is excluded. The live graph was
+stopped after recording. Camera/odometry parameter snapshots timed out after
+this carry, but successful snapshots from the **same unchanged launch** are
+in `/home/john/ros_parity_stationary_fixed_20260907`; the carry manifest
+explicitly records those timeouts rather than claiming success.
+
+Same-bag experiments, each with a fresh ROS estimator at 0.5x playback:
+
+| settings | status samples | lost fraction | longest output gap (wall time) |
+| --- | ---: | ---: | ---: |
+| original tracked settings | 1490 | 31.8% | 19.64 s |
+| `odom_bundle_min_motion:=1.0` | 1517 | 45.6% | 29.52 s |
+| orientation aiding, separate filter process | 1440 | 28.5% | 19.52 s |
+| orientation aiding, composed filter | 1456 | 41.6% | 26.04 s |
+
+Reports are `replay_half_report.json`, `replay_half_minmotion1_report.json`, and
+`replay_half_orientation_report.json`, plus
+`replay_half_orientation_composed_report.json` inside the carried bag. Different message
+arrival/drop patterns mean these are diagnostic runs, not deterministic
+frame-for-frame estimator comparisons. Slower playback still loses tracking,
+but it also still drops input frames, so it does not rule out compute/delivery
+pressure as the cause. The minimum-motion setting
+made this recording worse and remains **0.0 by default**. Orientation aiding
+remains opt-in (`filter_imu:=true`) and is not a motion-gate pass. The final
+launch composes Madgwick into `/oak_container` to avoid the extra process hop.
+The composed experiment's full output bag is
+`/home/john/ros_parity_carry_20260907_orientation_composed_outputs`; its
+`report.json` uses sensor time and includes slightly more ending data:
+1468 status samples, 42.0% lost and a 13.01 s longest output gap. Neither filter
+arrangement passes the motion gate.
+`use_imu:=false` now actually disconnects the odometry IMU subscription instead
+of only disabling the wait-for-IMU flag.
+
+The tracked sensor config now pins stereo confidence **55** (DepthAI 3.5's
+`StereoDepthConfig` default) and `ACCELEROMETER_RAW`/`GYROSCOPE_RAW`, matching
+the reference requests. The carried bag predates these settings and cannot
+evaluate their effect. A later 30-second stationary check of the new settings
+measured 7.6 Hz and 0.76 mm RMS, with zero lost updates; its report is
+`/home/john/ros_parity_inputmatched_stationary_20260907.json`. This was a later
+scene/session and is not a controlled accuracy improvement over the morning
+reference. The driver also logs a distorted `inputAlignTo` warning; depth
+alignment remains worth checking against the native graph before claiming
+pixel-for-pixel input parity.
+
+### IMU correction: raw samples are not orientation aiding
+
+The live OAK message has orientation `(0,0,0,1)` with zero covariance and no
+changing orientation estimate. The installed RTAB-Map 0.22.1 F2M base caches
+IMU only if the orientation quaternion's vector part is nonzero; otherwise it
+ignores the IMU. It does not integrate raw gyro/accelerometer inputs into a
+motion estimate. The DepthAI 3.5 port pins an earlier RTAB-Map commit with the
+same behavior, and its RTABMapVIO adapter only supplies raw gyro/acceleration.
+Thus **providing IMU samples and waiting for their timestamps did not establish
+inertial fusion** on either F2M path. The earlier v3 timing measurements remain
+valid; the claim that they proved fusion does not.
+
+Sources: [installed-core version's IMU handling](https://github.com/introlab/rtabmap/blob/0.22.1/corelib/src/Odometry.cpp),
+[DepthAI 3.5 RTAB-Map dependency](https://github.com/luxonis/depthai-core/blob/v3.5.0/cmake/ports/rtabmap/portfile.cmake),
+[DepthAI 3.5 adapter](https://github.com/luxonis/depthai-core/blob/v3.5.0/src/rtabmap/RTABMapVIO.cpp).
+
+Optional Madgwick filtering supplies the orientation that F2M can actually use.
+It has no magnetometer and publishes no TF. This is orientation aiding, not a
+tightly coupled inertial estimator, and it is a deliberate experiment beyond
+the native adapter's raw-input behavior.
+
+### Bag reporting and acceptance
+
+`ros_rtabmap_bag.py report BAG --out REPORT.json` computes metrics directly from
+recorded outputs and bag receive timestamps. It does not need a running graph.
+It now reads the epoch from `metadata.yaml`: Jazzy's Python metadata exposes
+ROS Time objects, not Python datetimes. A regression test writes a real small
+MCAP bag and checks the report.
+
+Both the live harness and bag report reject an ending pose older than 0.5 s and
+hold windows with a position span above 0.05 m (`--max-hold-span` can adjust the
+threshold). This rejects continued carrying or unstable estimation rather than
+reporting either as measured closed-loop drift. It cannot independently prove
+the camera was physically returned to its mark or orientation.
+
+New captures snapshot effective parameters **before** recording starts; wait
+for the recorder's subscription messages before moving. Existing bag paths
+are never overwritten. For replay output capture, use `ros2 bag record
+--use-sim-time` so the saved output uses sensor time even at 0.5x playback.
+The original live output remains in the input bag and is excluded from playback.
+
+### Controlled visual replay through both estimators
+
+`scripts/depthai_rtabmap_bag.py` feeds saved image/depth/tracked-feature tuples
+into the actual DepthAI 3.5 `RTABMapVIO` host node. It requires the original OAK
+for calibration and the SDK's internal Sync node; it creates no live cameras,
+mapper or ROS publishers. It checks the bag's focal lengths/principal point
+against the connected OAK before processing. `device_calibration.json` records
+the calibration used. The SDK's default body convention is retained, so direct
+coordinate subtraction against ROS poses is not a trajectory-alignment method.
+
+`scripts/ros_rtabmap_replay_frames.py` supplies the same tuples to a fresh ROS
+tracked estimator and waits for each matching OdomInfo result before sending
+another. Both scripts use the same bounded 1 ms matcher, canonicalize tuple
+stamps to the image stamp, skip the SDK's initialization-only first tuple, and
+save original image stamps/sequence numbers in `poses.jsonl`. Unmatched inputs
+are counted. A September 8 forced blank-image/depth test found that the SDK
+emits **zero position and quaternion `(0.5,0.5,0.5,0.5)`** on failure with its
+default local transform. This quaternion is unit length, so the original
+norm-only classifier was wrong. The replay now conservatively rejects that
+exact sentinel as well as nonfinite/non-unit output. The SDK exposes no lost
+bit; an actual pose exactly equal to the sentinel is indistinguishable.
+
+These are **offline visual diagnostics**, not real-time or full-stack parity
+measurements. Raw IMU is deliberately omitted because both F2M cores ignore it
+without orientation. Per-frame elapsed time includes conversion/transport and
+waiting, including a USB round trip for the SDK. Native core parameters remain
+at defaults unless `--params` supplies an explicit JSON string map. In
+particular, native defaults are `Vis/MaxFeatures=1000` and `OdomF2M/MaxSize=2000`,
+larger than the current ROS tracked profile's 600/1000 tuning.
+
+```bash
+# Source the environment from README first. Run the two estimators separately.
+PYTHONPATH="$PYTHONPATH:/usr/lib/python3/dist-packages" \
+  /home/john/depthai_env/bin/python scripts/depthai_rtabmap_bag.py \
+  /home/john/ros_parity_carry_20260907_01 --out /home/john/new_native_comparison
+
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_tracked.launch.py \
+  start_camera:=false use_sim_time:=true use_imu:=false \
+  odometry_rate_hz:=0.0 sensor_qos:=1 vis_max_features:=1000 odom_f2m_max_size:=2000 foxglove:=false
+# In another terminal with the same sourced environment:
+python3 scripts/ros_rtabmap_replay_frames.py \
+  /home/john/ros_parity_carry_20260907_01 --out /home/john/new_ros_comparison
+```
+
+The native full replay is `/home/john/ros_parity_carry_20260907_native_serial`.
+Use **`validated_report.json` and `validated_poses.jsonl`** there: the original
+files incorrectly count two failure sentinels as valid. Corrected results:
+2593 outputs, 2 lost (0.077%), longest valid-output gap 0.100 s in sensor time,
+maximum step between valid poses 0.132 m. Failure times are 40.128 and 76.454 s.
+The forced-failure evidence is `/home/john/ros_parity_native_null_probe_20260908`.
+This is not a live-rate benchmark or a return-to-origin accuracy measurement.
+
+The initial ROS frame-at-a-time replay stalled: image/tracks/calibration arrived,
+but a depth message did not. The tracked adapter hard-coded best-effort input
+QoS despite the parent node's `qos` parameter. It now honors that setting, and
+the controlled replay requires `sensor_qos:=1` for reliable delivery of large
+depth messages. Live defaults remain best effort (`sensor_qos:=2`).
+
+On September 8 the package build passed and the full suite passed **597 tests,
+0 errors/failures/skips**, including both reliable and best-effort component
+inputs, frame correspondence, depth byte order/stride, and SDK failure-sentinel
+classification. The ROS frame replay also accounts for an initialization
+detail: with `publish_null_when_lost=false`, OdometryROS acknowledges its first
+frame through OdomInfo but withholds the pose until a velocity estimate exists.
+The harness records that state without inventing a pose or timing out.
+
+### September 8 controlled replay findings
+
+The first complete ROS frame-at-a-time replay is
+`/home/john/ros_parity_carry_20260908_ros_serial_complete`. Its 2593 submitted
+image sequence numbers and nanosecond stamps **exactly match** the native
+replay. It lost 478 updates (18.43%), with a 12.10 s longest valid-pose gap in
+sensor time. Its launch log and effective parameters are saved there. A prior
+partial run followed a different loss pattern; do not claim bitwise
+determinism merely because the input frames match.
+
+`/home/john/ros_parity_optimizer_audit_20260908/native_defaults_probe.cpp`
+loads the installed SDK's exported RTAB-Map parameter getter without starting
+a device. The 127 dumped defaults are in `native_runtime_defaults.tsv`. Among
+the parameters also exposed by the ROS odometry node, only two defaults differ
+after explicitly matching the feature/map limits: native `Optimizer/Strategy=1`
+and `Optimizer/Epsilon=0.0`, versus ROS 2 and 0.00001. This confirms the installed
+SDK's feature settings directly rather than inferring them from build files.
+
+The next replay disabled the ROS mapper and loaded those optimizer defaults
+through `odom_config_path` (a standard RTAB-Map INI). It is saved at
+`/home/john/ros_parity_carry_20260908_ros_native_optimizer`: 346/2593 lost
+(13.34%), longest gap 7.03 s. These two changes do not establish causation or
+parity, and neither changed the live defaults. `start_mapper:=false` disables
+both the mapper component and OctoMap for isolated odometry experiments.
+
+The tracked adapter now also clears the stereo projection translation in
+CameraInfo when constructing its left RGB-D model. The driver left P[3] is
+-34.3176, while DepthAI's `model.left()` has zero projection translation. The
+focal lengths, principal point and calibrated local transform are preserved.
+This matches the SDK's RGB-D camera construction and is covered by both QoS
+variants of the component test. It is not yet a motion-parity result.
+
+For a diagnostic using DepthAI's internal reference frame, launch with
+`base_frame_id:=native_sdk_internal start_mapper:=false` and pass
+`--native-body-frame` to `ros_rtabmap_replay_frames.py`. The harness adds that
+virtual frame as the parent of the left optical frame, replacing the physical
+rig's static TF tree for this diagnostic only. This reproduces the SDK 3.5
+camera model's fixed rotation and zero lever arm without conflicting with
+OdometryROS's dynamic odom-to-base TF. The output is
+explicitly labeled with this virtual frame; it must not be interpreted as
+the physical `oak` body pose. The SDK additionally conjugates its output pose,
+so direct coordinate subtraction is still not a comparison method.
+
+The projection-normalized replay is
+`/home/john/ros_parity_carry_20260908_ros_rgbd_projection`: 342/2593 lost
+(13.19%), longest gap 6.965 s. The SDK internal-frame replay is
+`/home/john/ros_parity_carry_20260908_ros_native_frame_root`: 343/2593 lost
+(13.23%), longest gap 6.999 s. Both completed the same frame sequence. Thus
+these geometry adjustments do not explain the native/ROS tracking gap.
+Earlier `ros_native_frame`/`ros_native_frame_paced` directories are incomplete
+probes with a conflicting TF parent; do not use them as estimator benchmarks.
+
+The binary parameter probe also calls `Parameters::getVersion()` and confirms
+**RTAB-Map 0.21.12** inside the installed DepthAI 3.5 wheel. The source port's
+package version label is not the runtime version. ROS is 0.22.1. An isolated
+source comparison is being prepared in `/home/john/rtabmap_parity_0_21_12`:
+
+- Core source commit: `08f031e11c45589fc2b68440383a3e40982dc06f` (the SDK port pin).
+- ROS wrappers: `5723507617c4bcd16b35da391d506da2661c3784`
+  (`0.21.10-jazzy`, the latest available 0.21 Jazzy wrapper tag).
+- Separate `build`, `install`, and `ros_ws`; nothing replaces system packages.
+- Core build uses system OpenCV 4.6, g2o enabled and GTSAM disabled. This isolates
+  core-version behavior from the installed ROS core, but does **not** reproduce
+  every dependency/build choice in the SDK wheel.
+- Configuration/build logs and source archives are retained in that directory.
 
 ## Terminology correction that matters
 
@@ -126,8 +364,8 @@ frame-to-map (`Odom/Strategy=0`). At each image timestamp it supplies:
 
 It does not run a separate inertial state estimator, integrate every 200 Hz
 sample into position, or estimate velocity and IMU biases. In particular it is
-not equivalent to Basalt, OpenVINS or VINS-Fusion. The word VIO here means
-RTAB-Map frame-to-map RGB-D odometry supplied with IMU measurements. The
+not equivalent to Basalt, OpenVINS or VINS-Fusion. The node is named VIO and supplies IMU measurements, but this F2M core ignores
+raw measurements without orientation; see the correction above. The
 separate `RTABMapSLAM` host node consumes that raw odometry and adds the pose
 graph, loop closures and map; SLAM never produces the raw VIO pose.
 
@@ -476,14 +714,16 @@ python3 scripts/loop_closure_test.py \
 
 1. **OAK-tracked ROS VIO stability under motion.** Both host-detected mono
    profiles fail for roughly half of a 60 s carry. The direct OAK-feature path
-   is live and proven to use device features, but only stationary so far. Run
-   the 60 s screen above; require no loss episode or reset-sized discontinuity
-   before extending it to 180 s.
+   also fails the September 7 motion bag (39.8% lost updates live). Resolve
+   the recorded-motion failures and establish live continuity before extending
+   a new marked closed-loop capture to 180 s.
 2. Re-run the loop-closure test once the VIO holds tracking, and confirm the
    ROS mapper accepts closures when the trajectory is consistent. The
    corrected-pose path and `cpp_slam_pose_relay`'s non-identity branch remain
    unexercised outside unit tests.
-3. Moving-scene CPU. Every CPU number here is stationary.
+3. Moving-scene CPU. The September 7 carried capture measured 133.3% average
+   for container plus OctoMap, excluding recorder; compare against native on
+   equivalent workloads once tracking is continuous.
 4. Map quality against the DepthAI map on a real trajectory.
 5. `Grid/3D` differs by design: the DepthAI grid was 2D at 0.03 m for the
    planner, the ROS one is 3D at 0.05 m projected down. Verified to publish, not

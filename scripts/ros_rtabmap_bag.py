@@ -137,9 +137,10 @@ def report_bag(bag, hold, max_hold_span):
                 t, msg.ref_id, msg.loop_closure_id or msg.proximity_detection_id,
                 math.sqrt(p.x*p.x + p.y*p.y + p.z*p.z),
                 "global_loop_closure" if msg.loop_closure_id else "proximity_detection"))
-    metadata = reader.get_metadata()
-    start = metadata.starting_time.timestamp()
-    end = start + metadata.duration.total_seconds()
+    with (Path(bag) / "metadata.yaml").open() as stream:
+        metadata = yaml.safe_load(stream)["rosbag2_bagfile_information"]
+    start = metadata["starting_time"]["nanoseconds_since_epoch"] / 1e9
+    end = start + metadata["duration"]["nanoseconds"] / 1e9
     return {"bag": str(bag), "time_basis": "bag receive timestamps",
             **report(node, hold, start, end, max_hold_span)}
 

@@ -76,3 +76,7 @@ reports/maps_*/
 # live topic dumps, logger topic lists). Same argument as the CSVs: they are
 # transcripts of a command, not sources, and nothing links to them.
 reports/*.txt
+# Additional local migration artifacts (already tracked files remain tracked).
+*.json
+*.csv
+*.png

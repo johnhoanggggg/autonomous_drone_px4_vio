@@ -17,7 +17,7 @@ from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from composition_interfaces.srv import LoadNode
 from depthai_ros_msgs_v3.msg import TrackedFeature, TrackedFeatures
 from geometry_msgs.msg import TransformStamped
@@ -26,7 +26,8 @@ from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 
 
-def test_camera_model_uses_body_to_optical_tf(tmp_path):
+@pytest.mark.parametrize("input_reliability", [ReliabilityPolicy.RELIABLE, ReliabilityPolicy.BEST_EFFORT])
+def test_camera_model_uses_body_to_optical_tf(tmp_path, input_reliability):
     domain = 160 + os.getpid() % 50
     context = Context()
     rclpy.init(context=context, domain_id=domain)
@@ -44,7 +45,7 @@ def test_camera_model_uses_body_to_optical_tf(tmp_path):
     sub = node.create_subscription(SensorData, "/odom_sensor_data/features",
                                    received.append, qos_profile_sensor_data)
     publishers = [
-        node.create_publisher(kind, topic, qos_profile_sensor_data)
+        node.create_publisher(kind, topic, QoSProfile(depth=5, reliability=input_reliability))
         for kind, topic in (
             (Image, "/oak/left/image_rect"),
             (Image, "/oak/stereo/image_raw"),
@@ -64,6 +65,7 @@ def test_camera_model_uses_body_to_optical_tf(tmp_path):
         request.parameters = [Parameter(name, value=value).to_parameter_msg()
                               for name, value in {
                                   "frame_id": "test_body",
+                                  "qos": int(input_reliability),
                                   "wait_for_transform": 0.01,
                                   "publish_tf": False,
                                   "publish_null_when_lost": False,
@@ -73,6 +75,13 @@ def test_camera_model_uses_body_to_optical_tf(tmp_path):
         future = client.call_async(request)
         executor.spin_until_future_complete(future, timeout_sec=15)
         assert future.done() and future.result().success
+        discovery_deadline = time.monotonic() + 5
+        while time.monotonic() < discovery_deadline:
+            endpoints = node.get_subscriptions_info_by_topic("/oak/stereo/image_raw")
+            if endpoints:
+                break
+            executor.spin_once(timeout_sec=0.05)
+        assert endpoints and endpoints[0].qos_profile.reliability == input_reliability
 
         image = Image(height=120, width=160, encoding="mono8", step=160)
         image.data = np.random.default_rng(123).integers(
@@ -82,7 +91,9 @@ def test_camera_model_uses_body_to_optical_tf(tmp_path):
         info = CameraInfo(height=120, width=160)
         info.k = [100., 0., 80., 0., 100., 60., 0., 0., 1.]
         info.r = [1., 0., 0., 0., 1., 0., 0., 0., 1.]
-        info.p = [100., 0., 80., 0., 0., 100., 60., 0., 0., 0., 1., 0.]
+        # OAK's left CameraInfo carries a stereo translation. RGB-D must use
+        # the left optical frame without that right-camera projection offset.
+        info.p = [100., 0., 80., -7.5, 0., 100., 60., 0., 0., 0., 1., 0.]
         tracks = TrackedFeatures()
         for y in range(20, 101, 20):
             for x in range(20, 141, 20):
@@ -130,6 +141,8 @@ def test_camera_model_uses_body_to_optical_tf(tmp_path):
                   1 - 2 * (q.x*q.x + q.y*q.y))
         assert z_axis == pytest.approx((1., 0., 0.), abs=1e-6)
         assert received[-1].header.frame_id == "test_body"
+        assert received[-1].left_camera_info[0].p[3] == 0.0
+        assert received[-1].left_camera_info[0].p[0] == 100.0
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGINT)

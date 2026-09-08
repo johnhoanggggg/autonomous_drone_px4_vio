@@ -57,10 +57,16 @@ public:
 
     rclcpp::SubscriptionOptions subscription_options;
     subscription_options.callback_group = dataCallbackGroup_;
-    image_sub_.subscribe(this, image_topic, rmw_qos_profile_sensor_data, subscription_options);
-    depth_sub_.subscribe(this, depth_topic, rmw_qos_profile_sensor_data, subscription_options);
-    camera_info_sub_.subscribe(this, camera_info_topic, rmw_qos_profile_sensor_data, subscription_options);
-    features_sub_.subscribe(this, features_topic, rmw_qos_profile_sensor_data, subscription_options);
+    // Honor OdometryROS's qos setting for these custom inputs too. Reliable
+    // replay publishers can then retransmit large depth messages; hard-coded
+    // best-effort readers silently lose fragmented samples over DDS.
+    auto input_qos = rmw_qos_profile_sensor_data;
+    input_qos.reliability = static_cast<rmw_qos_reliability_policy_t>(
+      get_parameter("qos").as_int());
+    image_sub_.subscribe(this, image_topic, input_qos, subscription_options);
+    depth_sub_.subscribe(this, depth_topic, input_qos, subscription_options);
+    camera_info_sub_.subscribe(this, camera_info_topic, input_qos, subscription_options);
+    features_sub_.subscribe(this, features_topic, input_qos, subscription_options);
 
     sync_ = std::make_shared<Synchronizer>(
       SyncPolicy(queue_size), image_sub_, depth_sub_, camera_info_sub_, features_sub_);
@@ -113,7 +119,7 @@ private:
     // OdometryROS transforms IMU measurements into frameId(). The camera
     // model MUST use that same body frame, as standard RGBDOdometry does.
     // The conversion's default identity silently treated optical coordinates
-    // as body coordinates, making visual and inertial rotations disagree.
+    // as body coordinates and omitting the camera lever arm.
     const auto local_transform = rtabmap_conversions::getTransform(
       frameId(), image->header.frame_id, stamp, tfBuffer(), waitForTransform());
     if(local_transform.isNull()) {
@@ -124,7 +130,14 @@ private:
     // owned CvImage buffers rather than views into ROS message storage.
     const auto image_cv = cv_bridge::toCvCopy(image, image->encoding);
     const auto depth_cv = cv_bridge::toCvCopy(depth, depth->encoding);
-    auto camera_model = rtabmap_conversions::cameraModelFromROS(*camera_info, local_transform);
+    // This tuple is RGB-D in the left optical frame, not a right-camera
+    // stereo observation. The driver puts a stereo baseline in left P[3];
+    // carrying it into F2M changes its bundle-adjustment camera model. Match
+    // the SDK adapter's model.left(), whose projection translation is zero.
+    auto rgbd_info = *camera_info;
+    rgbd_info.p[3] = 0.0;
+    rgbd_info.p[7] = 0.0;
+    auto camera_model = rtabmap_conversions::cameraModelFromROS(rgbd_info, local_transform);
     rtabmap::SensorData data(
       image_cv->image,
       depth_cv->image,

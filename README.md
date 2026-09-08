@@ -869,6 +869,14 @@ profile uses 400 Harris/KLT tracks with 49-pixel squared minimum spacing at
 30 FPS, matching the known-good DepthAI-host front end, and uses the driver's
 depth-only pipeline so the unused RGB camera path is not started.
 
+The September 7 carried bag failed tracking continuity (39.8% lost status
+updates); its ending window was still moving, so it provides no valid return
+error. Same-bag half-speed replay also fails. The optional `filter_imu:=true`
+path now supplies Madgwick orientation to F2M; raw gyro/acceleration alone is
+ignored by this F2M core, despite the earlier notes calling it IMU fusion.
+This option remains experimental, as does the exposed
+`odom_bundle_min_motion` tuning (the tested value 1.0 was worse).
+
 The September 7 continuation fixes a missing body-to-camera transform in this
 adapter. Earlier tracked runs used an identity camera extrinsic while the IMU
 was transformed into the body frame, so they did not establish frame parity.
@@ -876,6 +884,13 @@ A raw-input bag workflow now supports repeating a motion recording against
 subsequent estimator changes. See [the migration handoff](HANDOFF_ROS_MIGRATION.md)
 for recording and camera-free replay commands. The replay mode uses the bag's
 static calibration and excludes its old odometry and dynamic TF.
+
+The handoff also includes controlled visual replay through both the actual
+DepthAI host node and ROS, using the same recorded frame tuples. ROS replay
+can now select reliable sensor delivery (`sensor_qos:=1`); live defaults stay
+best effort. The SDK can emit a unit quaternion at the origin on tracking
+failure, so the native replay explicitly rejects that verified failure value.
+These offline comparisons do not establish live-rate or map parity.
 
 For the next moving screen, use the same slow, textured route and 10-second
 holds as the two failed mono tests:
