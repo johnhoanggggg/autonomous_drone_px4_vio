@@ -144,6 +144,9 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("occupied_threshold", default_value="65"),
         DeclareLaunchArgument("robot_radius", default_value="0.25"),
+        # Sets BOTH the planner's lethal radius and the follower's required
+        # clearance: each is robot_radius + this.
+        #
         # Tight-space profile, chosen 2026-08-31 after the 064x flights. At
         # 0.30 m of lethal radius the neck on 20260831T064828Z (0.266-0.294 m of
         # clearance) is not routable and 44% of that flight's track sat inside
@@ -151,7 +154,23 @@ def generate_launch_description():
         # both flyable. The cost is that contact stays possible: worst case the
         # airframe reaches max_cross_track (0.08 m) inside an obstacle, about
         # half the 0.15 m budget it hit the door frame under on 20260831T033736Z.
-        DeclareLaunchArgument("safety_margin", default_value="0.00"),
+        #
+        # 2026-09-08: that cost was being paid. ULogs 22_41_51/22_42_49 and
+        # 23_21_06/23_22_16/23_23_08 carry twelve |a_xy| > 5 m/s2 contacts over
+        # five flights, peaking at 3.32 g. Aligned to the bags (position rms
+        # 0.001-0.004 m) every wall contact sat at 0.212-0.297 m of pose
+        # clearance with cross-track 0.03-0.12 m -- the vehicle was tracking its
+        # route, and the route was in the wall. Across those flights the 251
+        # published routes ran to a median min clearance of 0.335 m and a p10 of
+        # 0.283 m, against a 0.25 m requirement with no margin for the
+        # airframe's own 0.08-0.12 m of tracking error.
+        #
+        # 0.03 puts the requirement at 0.28 m. On those same 251 routes 90%
+        # still plan, against 73% at the 0.30 m that 2026-08-31 rejected. It
+        # trims the worst routes rather than eliminating contact -- worst-case
+        # penetration falls from 0.08 to 0.05 m -- so treat it as a reduction,
+        # not a fix, and re-measure the contact count before trusting it.
+        DeclareLaunchArgument("safety_margin", default_value="0.03"),
         DeclareLaunchArgument("inflation_extra", default_value="0.25"),
         DeclareLaunchArgument("start_recovery_radius", default_value="0.30"),
         DeclareLaunchArgument("heuristic_weight", default_value="1.0"),
