@@ -76,6 +76,64 @@ Consequence: `slam_num_features` throttles the *camera*, not the Pi. See
 
 ## Quick start — the three terminals
 
+### ROS-native VIO + PX4 + OctoMap option (experimental)
+
+After the same environment preamble below, select the ROS backend explicitly:
+
+```bash
+systemctl is-active micro-xrce-agent.service
+ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py backend:=ros foxglove:=true
+```
+
+This **forwards raw ROS visual odometry to PX4**, from
+`/rtabmap/vio_odometry` through the existing ENU/FLU-to-NED/FRD bridge.
+Map-corrected poses are not forwarded. Sensor timestamps are retained; invalid,
+wrong-frame, out-of-order, future, or older-than-500-ms samples are rejected.
+This is integration toward flight testing, not flight qualification. Validate
+props-off PX4 reception, axes, timing and tracking-loss behavior before flight;
+do not run another VIO publisher alongside it.
+
+No argument (or `backend:=depthai`) preserves the established DepthAI path.
+`rtabmap_slam_px4_3d.launch.py` remains explicitly DepthAI-backed.
+ROS mode uses the tested latest-frame, cached-calibration, PnP-3 host-feature
+profile. Its installed `ros_rtabmap_backend` wrapper loads this Pi's
+`/home/john/rtabmap_parity_0_21_12/base_ros_env.bash` and
+`/home/john/rtabmap_latest_frame_overlay/install/local_setup.bash`; these external
+overlays are required, not supplied by a stock Jazzy installation. DepthAI-only
+camera/SLAM tuning arguments do not configure the ROS child launch.
+The wrapper explicitly prioritizes the Jazzy-compatible message libraries even
+in an already-sourced shell, and checks their symbols before opening the camera.
+To check only the environment without starting the graph:
+
+```bash
+ros2 run px4_vio_bridge ros_rtabmap_backend --check-environment
+```
+
+In Foxglove's 3D panel, use fixed frame `world` and enable
+`/rtabmap/octomap_ground_markers` and `/rtabmap/octomap_obstacle_markers`.
+For the ROS camera image, select `/foxglove/camera/image/compressed`.
+`foxglove_image_rate_hz:=5.0` limits this visualization-only compressed relay;
+the OAK image/depth inputs to VIO remain full rate. Excess frames are dropped,
+not queued or re-encoded. Full-rate `/oak/left/image_rect` and its compressed
+variant are excluded from the default bridge whitelist so an old image panel
+cannot bypass the relay. A custom whitelist must preserve this restriction.
+The existing DepthAI image path is unchanged. At the measured ~105 KB/frame,
+5 FPS is about 4.2 Mbit/s instead of ~24 Mbit/s at 29 FPS; this is an estimate,
+not a fixed byte-rate cap. Lower the visualization rate further for slower links.
+`ros_max_marker_voxels:=5000` bounds visualization payload, not the full binary
+`/rtabmap/octomap` used for perception/navigation. Marker generation is disabled
+with `foxglove:=false`; sampling a bounded marker set still traverses the map.
+This launch does not start an autonomous navigation controller.
+
+Historical ROS graph CPU samples were about **137–157%** (100% = one CPU core),
+or roughly **34–39% of this four-core Pi's capacity**: camera/odometry ~114–131%,
+mapper ~20–23%, OctoMap ~2–4%. These are different earlier runs, including a
+failed carry, not a controlled backend benchmark. The successful September 13
+10:27 RAM carry had no CPU sampler; the new PX4/Foxglove combination has not yet
+been profiled. Keep raw recording in RAM with verified disk archival, leave
+mapping at 1 Hz, and bound/disable visualization before sacrificing tracking
+features or bundle adjustment for CPU savings.
+
 Every terminal needs the same preamble:
 
 ```bash
@@ -611,22 +669,24 @@ outright. Measured on the same bench:
 The naming hides how similar the estimators are. DepthAI's `RTABMapVIO` is a
 Pi-host `ThreadedHostNode`, not firmware VIO: its source calls the ordinary
 `rtabmap::Odometry::create()` frame-to-map core, then gives it a rectified CAM_B
-frame, CAM_B-aligned stereo depth, RVC2-tracked Harris points, and one
-interpolated accel/gyro sample at the image timestamp. It does not estimate an
+frame and CAM_B-aligned stereo depth. Its source supports supplied Harris
+points, but September 8 replay probes found those points were not consumed
+through the tested Python input path; host GFTT/ORB detection reproduces the
+native continuity. Raw accel/gyro does not provide F2M orientation aiding.
+It does not estimate an
 inertial velocity or IMU biases like Basalt/OpenVINS/VINS-Fusion. The separate
 `RTABMapSLAM` host node consumes that raw odometry; it does not output VIO.
 
 ROS parity is consequently `depthai_ros_driver_v3 -> RGBDOdometry ->
 rtabmap_slam`, not `rtabmap_slam` by itself. `RGBDOdometry` is also frame-to-map
-RTAB-Map odometry with the same RGB-D/IMU class of inputs. ROS extracts and
-matches descriptors on the Pi instead of receiving the RVC2's tracked Harris
-points; that enables the bundle adjustment needed for the stationary accuracy
-shown below. Its raw output is `/rtabmap/vio_odometry`; its loop-corrected map
+RTAB-Map odometry with the same RGB-D class of inputs. ROS can detect GFTT/ORB
+features on the Pi or consume OAK locations; both support bundle adjustment.
+Its raw output is `/rtabmap/vio_odometry`; its loop-corrected map
 pose comes from the `world -> rtabmap_odom` transform generated by
 `rtabmap_slam`.
 
-Run `ros_rtabmap_oak_v3.launch.py`. With the IMU fused the whole ROS-native
-stack becomes viable for the first time:
+The following historical measurements use `ros_rtabmap_oak_v3.launch.py`.
+Their IMU timestamp improvement did not demonstrate inertial fusion:
 
 | stack | odom rate | stationary rms | total CPU |
 | --- | --- | --- | --- |
@@ -877,6 +937,25 @@ ignored by this F2M core, despite the earlier notes calling it IMU fusion.
 This option remains experimental, as does the exposed
 `odom_bundle_min_motion` tuning (the tested value 1.0 was worse).
 
+The September 9 correctly cued carry exposed a recoverable F2M failure rather
+than a feature-source dead end. With no reset, nominal 15 Hz live rate limiting
+lost 447/861 status outputs in a 31.93-second outage. Replaying the raw 30 Hz
+stream through the deployable component with deterministic pre-odometry 2x
+selection, `Vis/MinInliers=10`, and `Odom/ResetCountdown=1` reduced that to
+**3/944 lost outputs (0.32%)**, with a 0.60-second maximum valid-output gap,
+69 mm maximum pose step, a current final pose, and 73 native-OctoMap updates.
+The experimental tracked launch now defaults to those settings: its RTAB-Map
+`max_update_rate` gate is disabled to avoid a second irregular selection step.
+This is a full-stack real-time replay result; repeat it live before connecting
+the pose path to any flight-facing consumer.
+
+A follow-up 45-second live stationary run of those exact wrapper defaults had
+345/345 valid statuses, 0.439 mm pose RMS, 0.828 mm net drift, 43 native-OctoMap
+updates and about 102.3% total CPU. It ended at 53.45 C without throttling.
+The pose stream aged to 7.67 Hz while OAK features remained at 28.22 Hz, so a
+fresh moving carry—not another stationary soak—is the remaining acceptance
+test.
+
 The September 7 continuation fixes a missing body-to-camera transform in this
 adapter. Earlier tracked runs used an identity camera extrinsic while the IMU
 was transformed into the body frame, so they did not establish frame parity.
@@ -892,6 +971,69 @@ best effort. The SDK can emit a unit quaternion at the origin on tracking
 failure, so the native replay explicitly rejects that verified failure value.
 These offline comparisons do not establish live-rate or map parity.
 
+**September 8 host-feature result:** explicit DepthAI host detection and ROS
+`RGBDOdometry` each lost **1/2593 frames (0.039%)** on the carried recording,
+with a **0.100 s** longest valid-pose gap. The OAK-supplied ROS path lost about
+13% under matched offline delivery. The earlier native replays did not verify
+feature consumption; their low loss cannot be attributed to OAK tracks.
+The replay tools now label the feature source and require feature passthrough
+verification when native OAK-input mode is requested.
+
+Use the dedicated experimental profile after sourcing the environment above:
+
+```bash
+ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_native_features.launch.py
+```
+
+It uses the left mono/depth camera profile, standard ROS host GFTT/ORB
+detection, native feature/map limits of 1000/2000, and explicit PCG matching
+the SDK's effective g2o fallback. OAK tracks remain available for recordings.
+The validated experimental defaults use 10 Hz camera capture, put the mapper
+in a separate component process, update the native OctoMap incrementally, and
+disable visualization-marker traversal (`max_marker_voxels:=0`). The binary
+`octomap_msgs/Octomap` and its metadata remain enabled; set a positive marker
+limit only for short visualization sessions. The normal physical body frame
+and unchanged camera projection also completed the same 2593-frame cohort with
+one lost frame and a 0.100 s longest gap. The offline matcher now also retains
+delayed calibration for one second; the historical cohort predates that buffer
+fix.
+
+On the September 9 deterministic motion replay, fixed 10 Hz VIO alone produced
+883/884 statuses with zero loss. The full mapper/native-OctoMap configuration
+then repeated twice with zero loss: 842/884 and 830/884 statuses, each with a
+0.300 s maximum valid-pose gap and zero stale ending. The latter map reached 45
+source keyframes with 15,004 ground, 42,471 obstacle, and 1,025,944 observed-free
+cells at 5 cm resolution. A lit stationary live run produced 589/589 valid
+updates at 9.82 Hz, 0.592 mm pose RMS, 140 ms median capture-to-pose age, and
+mapping/OctoMap output at 0.917 Hz. Total measured compute was 114.4% of one Pi
+core and the Pi did not throttle. Live carried motion, loop closure, and
+return-to-origin accuracy remain required before flight use.
+
+On the exact sparse sequence processed by the ROS VIO-only run, DepthAI and
+ROS subsequently lost the same 191/703 evaluated frames with no tracking-status
+disagreements. Thus the remaining motion problem is present in both estimators
+on that input sequence; the successful fixed 10 Hz policy avoids those short
+intervals before DDS synchronization. Nothing in this launch publishes to PX4.
+Live-motion and trajectory parity remain unproven.
+
+September 8 stationary CPU comparison, 640x400 at 20 FPS, 35-second warmup and
+60-second measurement, visualization off (**100% CPU = one Pi core**):
+
+| Stack | Total CPU | Actual pose rate |
+| --- | ---: | ---: |
+| ROS VIO | 105.90% | 9.98 Hz |
+| DepthAI VIO | 110.71% | 12.51 Hz |
+| ROS VIO+SLAM+OctoMap | 111.90% | 9.10 Hz |
+| DepthAI VIO+SLAM | 215.73% | 12.31 Hz |
+
+ROS full used 48.1% less CPU but delivered 26.1% fewer poses/s. Both selected
+ROS windows had zero reported tracking loss. These sequential stationary
+windows compare practical stacks with different map outputs/feature limits;
+they do not prove moving accuracy or equal-work performance parity. Full
+methodology, excluded disturbed runs and process/thread breakdowns are in
+[the migration handoff](HANDOFF_ROS_MIGRATION.md), with raw evidence in
+`/home/john/ros_parity_cpu_20260908/comparison_summary.json`.
+
 For the next moving screen, use the same slow, textured route and 10-second
 holds as the two failed mono tests:
 
@@ -904,7 +1046,7 @@ python3 scripts/loop_closure_test.py \
 
 Pass criteria remain no tracking-loss episode, no reset-sized valid-pose jump,
 a valid ending hold and a usable return error. Until this carry passes, the
-production fallback remains DepthAI's hardware-tracked VIO feeding the single
+production fallback remains DepthAI's host VIO feeding the single
 ROS mapper and OctoMap (`rtabmap_slam_px4_3d.launch.py`, with DepthAI SLAM
 disabled).
 

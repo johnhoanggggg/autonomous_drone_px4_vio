@@ -6,12 +6,12 @@ from launch.actions import (
     IncludeLaunchDescription,
     TimerAction,
 )
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.launch_description_sources import AnyLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, IfElseSubstitution, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare, FindPackagePrefix
 from launch_ros.parameter_descriptions import ParameterValue
-from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -62,6 +62,10 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument("backend", default_value="depthai", choices=["depthai", "ros"],
+                                  description="DepthAI flight default, or experimental ROS raw VIO + mapping feeding PX4."),
+            DeclareLaunchArgument("ros_max_marker_voxels", default_value="5000",
+                                  description="Bounded Foxglove OctoMap view; 0 disables markers, binary map remains complete."),
             # Use continuous VIO for EKF2. The loop-corrected /rtabmap/pose can
             # jump when a loop closes, so it is intended for mapping by default.
             DeclareLaunchArgument(
@@ -126,12 +130,16 @@ def generate_launch_description():
             DeclareLaunchArgument("battery_critical_percent", default_value="25.0"),
             DeclareLaunchArgument("battery_empty_percent", default_value="15.0"),
             DeclareLaunchArgument("foxglove", default_value="true"),
+            DeclareLaunchArgument("foxglove_image_rate_hz", default_value="5.0",
+                                  description="ROS visualization image rate only; VIO camera stays full rate."),
             DeclareLaunchArgument("foxglove_port", default_value="8765"),
             DeclareLaunchArgument(
                 "foxglove_topic_whitelist",
                 default_value=(
                     "['^/tf(_static)?$', "
-                    "'^/rtabmap/(vio_pose|pose|body_vio_pose|body_pose(/config)?|odometry|odom_correction|path|vio_feature_count|grid|octomap_(ground_|obstacle_)?markers|octomap_metadata)$', "
+                    "'^/rtabmap/(vio_pose|vio_odometry|vio_odom_info_lite|pose|body_vio_pose|body_pose(/config)?|odometry|odom_correction|path|mapPath|localization_pose|info|vio_feature_count|grid|octomap|octomap_(ground_|obstacle_)?markers|octomap_metadata)$', "
+                    "'^/oak/left/camera_info$', "
+                    "'^/foxglove/camera/image/compressed$', "
                     "'^/rtabmap/image(/compressed)?$', "
                     "'^/rtabmap/(depth|camera_info)$', "
                     "'^/rtabmap/(obstacle_cloud|ground_cloud)$', "
@@ -203,6 +211,7 @@ def generate_launch_description():
                                     )
                                 ),
                                 # This launch owns the single combined Foxglove bridge below.
+                                condition=LaunchConfigurationEquals("backend", "depthai"),
                                 launch_arguments={
                                     "foxglove": "false",
                                     "slam_fps": slam_fps,
@@ -221,6 +230,19 @@ def generate_launch_description():
                                     "slam_grid_footprint_radius": slam_grid_footprint_radius,
                                     "slam_num_features": slam_num_features,
                                 }.items(),
+                            ),
+                            ExecuteProcess(
+                                condition=LaunchConfigurationEquals("backend", "ros"),
+                                name="ros_backend_launcher", output="screen",
+                                cmd=[
+                                    PathJoinSubstitution([FindPackagePrefix("px4_vio_bridge"), "lib", "px4_vio_bridge", "ros_rtabmap_backend"]),
+                                    "foxglove:=false", "use_imu:=false", "odometry_rate_hz:=0.0",
+                                    "odom_reset_countdown:=0", "keep_latest_frame:=true",
+                                    "odom_key_frame_thr:=0.3", "odom_vis_keyframe_thr:=150",
+                                    ["camera_config:=", PathJoinSubstitution([FindPackageShare("px4_vio_bridge"), "config", "oak_v3_rtabmap_tracked.yaml"])],
+                                    ["odom_config_path:=", PathJoinSubstitution([FindPackageShare("px4_vio_bridge"), "config", "rtabmap_ros_parity.ini"])],
+                                    ["max_marker_voxels:=", IfElseSubstitution(foxglove, LaunchConfiguration("ros_max_marker_voxels"), "0")],
+                                ],
                             )
                         ],
                     )
@@ -257,6 +279,9 @@ def generate_launch_description():
                         parameters=[
                             {
                                 "input_pose_topic": input_pose_topic,
+                                "input_odometry_topic": ParameterValue(IfElseSubstitution(
+                                    PythonExpression(["'", LaunchConfiguration("backend"), "' == 'ros'"]),
+                                    "/rtabmap/vio_odometry", ""), value_type=str),
                                 "output_odometry_topic": output_odometry_topic,
                                 "frame_transform": frame_transform,
                                 "vio_yaw_offset_deg": vio_yaw_offset_deg,
@@ -288,6 +313,15 @@ def generate_launch_description():
                                 "path_publish_stride": px4_local_path_publish_stride,
                             }
                         ],
+                    ),
+                    Node(
+                        package="px4_vio_bridge", executable="foxglove_image_throttle",
+                        name="foxglove_image_throttle", output="screen",
+                        condition=IfCondition(PythonExpression([
+                            "'", LaunchConfiguration("backend"), "' == 'ros' and '",
+                            foxglove, "'.lower() in ('true', '1')"])),
+                        parameters=[{"rate_hz": ParameterValue(
+                            LaunchConfiguration("foxglove_image_rate_hz"), value_type=float)}],
                     ),
                     IncludeLaunchDescription(
                         AnyLaunchDescriptionSource(

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -38,9 +39,16 @@ public:
       "ground_markers_topic", "/rtabmap/octomap_ground_markers");
     const auto obstacle_markers_topic = declare_parameter<std::string>(
       "obstacle_markers_topic", "/rtabmap/octomap_obstacle_markers");
-    const auto max_marker_voxels = declare_parameter<int>("max_marker_voxels", 50000);
+    const auto max_marker_voxels = declare_parameter<int>("max_marker_voxels", 0);
+    pose_update_tolerance_m_ = declare_parameter<double>("pose_update_tolerance_m", 0.01);
+    pose_update_tolerance_rad_ = declare_parameter<double>("pose_update_tolerance_rad", 0.01);
     if (max_marker_voxels < 0) {
       throw std::invalid_argument("max_marker_voxels cannot be negative");
+    }
+    if (!std::isfinite(pose_update_tolerance_m_) || pose_update_tolerance_m_ < 0.0 ||
+      !std::isfinite(pose_update_tolerance_rad_) || pose_update_tolerance_rad_ < 0.0)
+    {
+      throw std::invalid_argument("pose update tolerances must be finite and non-negative");
     }
     max_marker_voxels_ = static_cast<std::size_t>(max_marker_voxels);
     const auto output_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -106,7 +114,10 @@ private:
       }
     }
     std::string error;
-    if (!assembler_.rebuild(observations, optimized_poses_, &error)) {
+    if (!assembler_.update(
+        observations, optimized_poses_, static_cast<float>(pose_update_tolerance_m_),
+        static_cast<float>(pose_update_tolerance_rad_), &error))
+    {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 5000, "OctoMap generation rejected: %s", error.c_str());
       return;
@@ -223,6 +234,8 @@ private:
   std::string map_data_topic_;
   std::string frame_id_;
   std::size_t max_marker_voxels_{};
+  double pose_update_tolerance_m_{};
+  double pose_update_tolerance_rad_{};
   std::int64_t generation_{};
   std::map<int, LocalGridObservation> observations_;
   std::map<int, rtabmap::Transform> optimized_poses_;

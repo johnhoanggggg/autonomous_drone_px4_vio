@@ -2,7 +2,7 @@
 """Record OAK parity inputs and baseline outputs, or replay only sensor inputs.
 
 Source the v3 message and project workspaces first. For replay, start:
-  ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_tracked.launch.py \
+  ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_native_features.launch.py \
     start_camera:=false use_sim_time:=true foxglove:=false
 Then run this script's play command. Restart the estimator between replays.
 """
@@ -30,19 +30,82 @@ INPUT_TOPICS = (
     "/tf_static",
 )
 BASELINE_TOPICS = (
-    "/tf", "/rtabmap/vio_odometry", "/rtabmap/vio_odom_info",
-    "/rtabmap/info", "/rtabmap/oak_feature_count", "/diagnostics",
+    "/tf", "/rtabmap/vio_odometry", "/rtabmap/vio_odom_info_lite",
+    "/rtabmap/info",
+    "/rtabmap/mapPath", "/rtabmap/localization_pose",
+    "/rtabmap/octomap_metadata", "/rtabmap/oak_feature_count", "/diagnostics",
+)
+FULL_ODOM_INFO_TOPIC = "/rtabmap/vio_odom_info"
+ODOM_STATUS_TOPICS = (
+    "/rtabmap/vio_odom_info",
+    "/rtabmap/vio_odom_info_lite",
+    # Older launch files remap only odom_info, leaving the sibling publisher
+    # at its node-relative name.
+    "/rtabmap/odom_info_lite",
 )
 REPO = Path(__file__).resolve().parents[1]
 QOS_PATH = REPO / "ros2_ws/src/px4_vio_bridge/config/oak_parity_bag_qos.yaml"
 
 
-def record_command(bag):
+def record_command(bag, record_full_odom_info=False):
+    topics = (*INPUT_TOPICS, *BASELINE_TOPICS)
+    if record_full_odom_info:
+        topics += (FULL_ODOM_INFO_TOPIC,)
     return [
         "ros2", "bag", "record", "--output", str(bag), "--storage", "mcap",
         "--disable-keyboard-controls", "--qos-profile-overrides-path", str(QOS_PATH),
-        "--topics", *INPUT_TOPICS, *BASELINE_TOPICS,
+        "--topics", *topics,
     ]
+
+
+def wait_while_running(process, seconds):
+    """Wait for a capture phase, returning early if rosbag exits."""
+    deadline = time.monotonic() + seconds
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
+def record_timeline(process, total_seconds, discovery_seconds,
+                    pre_roll_seconds, post_roll_seconds):
+    """Run a cued still/motion/still capture within the requested duration."""
+    motion_seconds = total_seconds - discovery_seconds - pre_roll_seconds - post_roll_seconds
+    print(
+        f"RECORDER STARTED: keep still for {discovery_seconds:.1f} s while topics discover.",
+        flush=True,
+    )
+    wait_while_running(process, discovery_seconds)
+    if process.poll() is not None:
+        return motion_seconds
+    print(
+        f"PRE-ROLL: keep the rig still for {pre_roll_seconds:.1f} s so odometry initializes.",
+        flush=True,
+    )
+    wait_while_running(process, pre_roll_seconds)
+    if process.poll() is not None:
+        return motion_seconds
+    return_warning_seconds = min(15.0, motion_seconds / 2.0)
+    print(
+        f"MOVE NOW: carry slowly and follow a closed loop. A return warning follows "
+        f"in {motion_seconds - return_warning_seconds:.1f} s.",
+        flush=True,
+    )
+    wait_while_running(process, motion_seconds - return_warning_seconds)
+    if process.poll() is not None:
+        return motion_seconds
+    print(
+        f"RETURN SOON: {return_warning_seconds:.1f} s remain; move back to the marked pose.",
+        flush=True,
+    )
+    wait_while_running(process, return_warning_seconds)
+    if process.poll() is not None:
+        return motion_seconds
+    print(
+        f"RETURN/HOLD NOW: restore the marked pose and keep still for "
+        f"{post_roll_seconds:.1f} s.",
+        flush=True,
+    )
+    wait_while_running(process, post_roll_seconds)
+    return motion_seconds
 
 
 def play_command(bag, rate):
@@ -86,7 +149,8 @@ def stop(process):
 def save_parameters(bag):
     """Retain the effective live settings, including launch overrides."""
     results = {}
-    for node in ("/oak", "/rtabmap/oak_tracked_odometry", "/rtabmap/rtabmap"):
+    for node in ("/oak", "/rtabmap/rgbd_odometry",
+                 "/rtabmap/oak_tracked_odometry", "/rtabmap/rtabmap"):
         filename = node.strip("/").replace("/", "_") + "_parameters.yaml"
         try:
             result = subprocess.run(
@@ -112,10 +176,17 @@ def report_bag(bag, hold, max_hold_span):
 
     reader = rosbag2_py.SequentialReader()
     reader.open(rosbag2_py.StorageOptions(uri=str(bag)), rosbag2_py.ConverterOptions("", ""))
-    topics = ("/rtabmap/vio_odometry", "/rtabmap/vio_odom_info", "/rtabmap/info")
+    topics = ("/rtabmap/vio_odometry", *ODOM_STATUS_TOPICS, "/rtabmap/info")
     reader.set_filter(rosbag2_py.StorageFilter(topics=list(topics)))
-    types = {t.name: get_message(t.type) for t in reader.get_all_topics_and_types()
-             if t.name in topics}
+    bag_topics = {t.name: t.type for t in reader.get_all_topics_and_types()}
+    types = {name: get_message(msg_type) for name, msg_type in bag_topics.items()
+             if name in topics}
+    # Full OdomInfo carries feature/local-map arrays and can add meaningful
+    # work inside OdometryROS's processing mutex.  Diagnostic runs may record
+    # the built-in lite publisher instead; its scalar lost/inlier/feature
+    # fields are sufficient for this report. Prefer full if a bag has both so
+    # a normal capture is never double-counted.
+    status_topic = next((topic for topic in ODOM_STATUS_TOPICS if topic in types), None)
     node = SimpleNamespace(raw=[], raw_odom_stamps=[], lost_odom_stamps=set(),
                            corrected=[], corrections=[], closures=[], odom=[])
     while reader.has_next():
@@ -127,11 +198,11 @@ def report_bag(bag, hold, max_hold_span):
             p = msg.pose.pose.position
             node.raw.append((t, p.x, p.y, p.z))
             node.raw_odom_stamps.append(stamp)
-        elif topic == topics[1]:
+        elif topic == status_topic:
             node.odom.append((t, msg.lost, msg.inliers, msg.features))
             if msg.lost:
                 node.lost_odom_stamps.add(stamp)
-        elif msg.loop_closure_id or msg.proximity_detection_id:
+        elif topic == "/rtabmap/info" and (msg.loop_closure_id or msg.proximity_detection_id):
             p = msg.loop_closure_transform.translation
             node.closures.append((
                 t, msg.ref_id, msg.loop_closure_id or msg.proximity_detection_id,
@@ -142,6 +213,7 @@ def report_bag(bag, hold, max_hold_span):
     start = metadata["starting_time"]["nanoseconds_since_epoch"] / 1e9
     end = start + metadata["duration"]["nanoseconds"] / 1e9
     return {"bag": str(bag), "time_basis": "bag receive timestamps",
+            "odometry_status_topic": status_topic,
             **report(node, hold, start, end, max_hold_span)}
 
 
@@ -150,7 +222,15 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     record = commands.add_parser("record", help="Record from an already running tracked launch")
     record.add_argument("bag", type=Path)
-    record.add_argument("--seconds", type=float, default=90)
+    record.add_argument("--seconds", type=float, default=90,
+                        help="total recording time, including all capture phases")
+    record.add_argument("--discovery-seconds", type=float, default=5.0)
+    record.add_argument("--pre-roll-seconds", type=float, default=10.0)
+    record.add_argument("--post-roll-seconds", type=float, default=15.0)
+    record.add_argument(
+        "--record-full-odom-info", action="store_true",
+        help="also record feature/local-map arrays (adds serialization load)",
+    )
     play = commands.add_parser("play", help="Replay inputs into an already running replay launch")
     play.add_argument("bag", type=Path)
     play.add_argument("--rate", type=float, default=1.0)
@@ -178,9 +258,14 @@ def main():
     if not math.isfinite(value) or value <= 0:
         parser.error("duration/rate must be finite and positive")
     if args.command == "record":
+        phases = (args.discovery_seconds, args.pre_roll_seconds, args.post_roll_seconds)
+        if any(not math.isfinite(v) or v < 0 for v in phases):
+            parser.error("capture phase durations must be finite and nonnegative")
+        if sum(phases) >= args.seconds:
+            parser.error("seconds must exceed discovery + pre-roll + post-roll")
         if args.bag.exists():
             parser.error("output already exists; choose a new bag directory")
-        command = record_command(args.bag)
+        command = record_command(args.bag, args.record_full_odom_info)
     else:
         report = inspect_bag(args.bag)
         if not report["all_inputs_recorded"]:
@@ -189,20 +274,20 @@ def main():
     snapshots = {}
     parameter_files = {}
     if args.command == "record":
-        print("Reading live parameters. Keep still until the recorder reports subscriptions.", flush=True)
+        print("Reading live parameters. Keep still until MOVE NOW is printed.", flush=True)
         # Read while the rig is still stationary. Asking a busy/lost estimator
         # after a carry can time out and lose the settings behind the result.
         with tempfile.TemporaryDirectory(prefix="oak_parity_parameters_") as tmp:
             snapshots = save_parameters(Path(tmp))
             parameter_files = {p.name: p.read_text() for p in Path(tmp).glob("*.yaml")}
+    motion_seconds = None
     process = subprocess.Popen(command, start_new_session=True)
     try:
         if args.command == "record":
-            # Includes discovery time. Hold still until the recorder reports
-            # all subscriptions, then leave at least 10 s holds at both ends.
-            deadline = time.monotonic() + args.seconds
-            while process.poll() is None and time.monotonic() < deadline:
-                time.sleep(0.1)
+            motion_seconds = record_timeline(
+                process, args.seconds, args.discovery_seconds,
+                args.pre_roll_seconds, args.post_roll_seconds,
+            )
         else:
             process.wait()
     except KeyboardInterrupt:
@@ -215,6 +300,20 @@ def main():
         report = inspect_bag(args.bag)
         report["recorder_exit_code"] = process.returncode
         report["record_command"] = command
+        report["capture_timeline"] = {
+            "total_seconds": args.seconds,
+            "discovery_seconds": args.discovery_seconds,
+            "stationary_pre_roll_seconds": args.pre_roll_seconds,
+            "motion_seconds": (
+                motion_seconds if motion_seconds is not None else
+                args.seconds - sum(phases)
+            ),
+            "return_warning_seconds": min(
+                15.0, (args.seconds - sum(phases)) / 2.0
+            ),
+            "stationary_post_roll_seconds": args.post_roll_seconds,
+            "full_odom_info_recorded": args.record_full_odom_info,
+        }
         for filename, contents in parameter_files.items():
             (args.bag / filename).write_text(contents)
         report["parameter_snapshots"] = snapshots

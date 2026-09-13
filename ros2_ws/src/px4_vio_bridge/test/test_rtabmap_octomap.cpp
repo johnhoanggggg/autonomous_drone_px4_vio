@@ -134,6 +134,53 @@ TEST(RtabmapOctomap, LoopCorrectionRebuildRemovesOldVoxelLocation)
   EXPECT_NE(assembler.metadata().source_pose_generation, original_generation);
 }
 
+TEST(RtabmapOctomap, IncrementalUpdateAddsNodesAndRebuildsAfterLoopCorrection)
+{
+  p::RtabmapOctomapAssembler assembler;
+  p::LocalGridObservation first;
+  first.node_id = 1;
+  first.cell_size = 0.1F;
+  first.obstacles = points({{0.0F, 0.0F, 0.5F}});
+  p::LocalGridObservation second = first;
+  second.node_id = 2;
+  std::map<int, rtabmap::Transform> poses = {
+    {1, rtabmap::Transform::getIdentity()},
+  };
+  std::string error;
+  ASSERT_TRUE(assembler.update({first}, poses, 0.01F, 0.01F, &error)) << error;
+  EXPECT_TRUE(occupied(*assembler.tree(), 0.0F, 0.0F, 0.5F));
+
+  poses.emplace(2, rtabmap::Transform(1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F));
+  ASSERT_TRUE(assembler.update({first, second}, poses, 0.01F, 0.01F, &error)) << error;
+  EXPECT_EQ(assembler.metadata().source_nodes, 2U);
+  EXPECT_TRUE(occupied(*assembler.tree(), 1.0F, 0.0F, 0.5F));
+
+  poses.at(1) = rtabmap::Transform(0.5F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+  ASSERT_TRUE(assembler.update({first, second}, poses, 0.01F, 0.01F, &error)) << error;
+  EXPECT_EQ(assembler.tree()->search(0.0F, 0.0F, 0.5F), nullptr);
+  EXPECT_TRUE(occupied(*assembler.tree(), 0.5F, 0.0F, 0.5F));
+}
+
+TEST(RtabmapOctomap, IncrementalUpdateRebuildsAfterPureRotationCorrection)
+{
+  p::RtabmapOctomapAssembler assembler;
+  p::LocalGridObservation observation;
+  observation.node_id = 1;
+  observation.cell_size = 0.1F;
+  observation.obstacles = points({{1.0F, 0.0F, 0.5F}});
+  std::map<int, rtabmap::Transform> poses = {
+    {1, rtabmap::Transform::getIdentity()},
+  };
+  std::string error;
+  ASSERT_TRUE(assembler.update({observation}, poses, 0.01F, 0.01F, &error)) << error;
+  EXPECT_TRUE(occupied(*assembler.tree(), 1.0F, 0.0F, 0.5F));
+
+  poses.at(1) = rtabmap::Transform(0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.5707963F);
+  ASSERT_TRUE(assembler.update({observation}, poses, 0.01F, 0.01F, &error)) << error;
+  EXPECT_FALSE(occupied(*assembler.tree(), 1.0F, 0.0F, 0.5F));
+  EXPECT_TRUE(occupied(*assembler.tree(), 0.0F, 1.0F, 0.5F));
+}
+
 TEST(RtabmapOctomap, PoseGenerationIsDeterministicAndOrderIndependent)
 {
   const std::map<int, rtabmap::Transform> poses_a{

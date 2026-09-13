@@ -26,6 +26,7 @@ ros2_ws/flight_logs/
 /flight_logs/
 
 # Local runtime output
+/reports/
 *.tlog
 *.tlog.raw
 *.ulg

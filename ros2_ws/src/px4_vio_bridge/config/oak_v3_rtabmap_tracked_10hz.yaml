@@ -1,0 +1,53 @@
+# 10 Hz variant of oak_v3_rtabmap_tracked.yaml for the ROS host-feature
+# scheduling candidate. The 100 ms sensor interval exceeds the measured
+# worst-case per-frame compute time on the Raspberry Pi motion recording.
+/oak:
+  ros__parameters:
+    driver:
+      i_enable_ir: false
+    pipeline_gen:
+      i_nn_type: none
+      i_pipeline_type: depth
+      i_enable_imu: true
+    left:
+      i_fps: 10.0
+      i_resolution: "480P"
+      i_width: 640
+      i_height: 400
+    right:
+      i_fps: 10.0
+      i_resolution: "480P"
+      i_width: 640
+      i_height: 400
+    stereo:
+      i_board_socket_id: 1
+      i_aligned: true
+      i_synced: true
+      i_left_rect_publish_topic: true
+      i_left_rect_synced: true
+      i_left_rect_enable_feature_tracker: true
+      i_fps: 10.0
+      i_width: 640
+      i_height: 400
+      i_set_input_size: true
+      i_input_width: 640
+      i_input_height: 400
+      i_subpixel: true
+      i_lr_check: true
+      i_stereo_conf_threshold: 55
+    left_rect_feature_tracker:
+      i_num_target_features: 400
+      i_enable_motion_estimator: true
+      i_min_distance_between_features: 49.0
+      i_motion_estimator: LUCAS_KANADE_OPTICAL_FLOW
+      i_num_shaves: 1
+      i_num_memory_slices: 2
+    imu:
+      i_batch_report_threshold: 1
+      i_max_batch_reports: 10
+      i_enable_rotation: false
+      i_acc_mode: ACCELEROMETER_RAW
+      i_gyro_mode: GYROSCOPE_RAW
+      i_acc_freq: 200
+      i_gyro_freq: 200
+      i_message_type: IMU

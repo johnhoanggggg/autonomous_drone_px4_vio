@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,11 @@ public:
     // stamps can differ by sub-microseconds. Allow that offset, but never a
     // neighboring 30 Hz frame: its keypoints describe different image pixels.
     const auto max_interval = declare_parameter<double>("input_max_interval", 0.001);
+    const auto input_stride = declare_parameter<int>("input_stride", 1);
+    if (input_stride < 1) {
+      throw std::invalid_argument("input_stride must be at least 1");
+    }
+    input_stride_ = static_cast<std::uint32_t>(input_stride);
 
     feature_count_pub_ = create_publisher<std_msgs::msg::Int32>(
       "/rtabmap/oak_feature_count", rclcpp::SensorDataQoS().keep_last(2));
@@ -86,8 +92,8 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "ROS F2M odometry using OAK RVC2 tracks directly from %s",
-      features_topic.c_str());
+      "ROS F2M odometry using every %u synchronized OAK RVC2 tuple from %s",
+      input_stride_, features_topic.c_str());
   }
 
 private:
@@ -114,6 +120,15 @@ private:
     const std::lock_guard<std::mutex> lock(callback_mutex_);
     const rclcpp::Time stamp(image->header.stamp);
     if(last_input_stamp_.nanoseconds() != 0 && stamp <= last_input_stamp_) {
+      return;
+    }
+    last_input_stamp_ = stamp;
+    // OdometryROS's max_update_rate gate runs after synchronization and its
+    // processing mutex can therefore produce a data-dependent, irregular
+    // frame sequence under load. A fixed source stride gives F2M predictable
+    // visual displacement. Count complete, strictly ordered tuples here,
+    // before image copies and before handing work to OdometryROS.
+    if (input_tuple_index_++ % input_stride_ != 0) {
       return;
     }
     // OdometryROS transforms IMU measurements into frameId(). The camera
@@ -158,7 +173,6 @@ private:
     // and local-map bookkeeping from this point onward.
     data.setFeatures(keypoints, std::vector<cv::Point3f>(), cv::Mat());
 
-    last_input_stamp_ = stamp;
     tick(stamp);
     std_msgs::msg::Int32 count;
     count.data = static_cast<std::int32_t>(keypoints.size());
@@ -174,6 +188,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr feature_count_pub_;
   std::mutex callback_mutex_;
   rclcpp::Time last_input_stamp_{0, 0, RCL_ROS_TIME};
+  std::uint64_t input_tuple_index_{0};
+  std::uint32_t input_stride_{1};
 };
 
 }  // namespace px4_vio_bridge

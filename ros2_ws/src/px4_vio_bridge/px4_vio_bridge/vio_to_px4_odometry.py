@@ -165,11 +165,26 @@ def pose_rejection_reason(
     return None
 
 
+def raw_odometry_rejection_reason(message, now_ns, previous_stamp_ns=None):
+    """ROS backend only: accept continuous oak-body odometry, never map poses."""
+    if message.header.frame_id != 'rtabmap_odom' or message.child_frame_id != 'oak':
+        return 'unexpected raw odometry frames'
+    stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+    if stamp <= 0 or stamp > now_ns or now_ns - stamp > 500_000_000:
+        return 'raw odometry timestamp is invalid, future or over 500 ms old'
+    if previous_stamp_ns is not None and stamp <= previous_stamp_ns:
+        return 'non-increasing raw odometry timestamp'
+    p, q = message.pose.pose.position, message.pose.pose.orientation
+    return pose_rejection_reason((p.x, p.y, p.z), (q.w, q.x, q.y, q.z))
+
+
 class VioToPx4Odometry(Node):
     def __init__(self) -> None:
         super().__init__("vio_to_px4_odometry")
 
         self.declare_parameter("input_pose_topic", "/basalt/pose")
+        # Empty preserves the established DepthAI PoseStamped path exactly.
+        self.declare_parameter("input_odometry_topic", "")
         self.declare_parameter("output_odometry_topic", "/fmu/in/vehicle_visual_odometry")
         self.declare_parameter("frame_transform", "enu_flu_to_ned_frd")
         self.declare_parameter("vio_yaw_offset_deg", 0.0)
@@ -187,6 +202,9 @@ class VioToPx4Odometry(Node):
         self.declare_parameter("reset_orientation_epsilon", 1.0e-3)
 
         input_topic = self.get_parameter("input_pose_topic").value
+        odometry_topic = self.get_parameter("input_odometry_topic").value
+        self.raw_odometry_input = bool(odometry_topic)
+        self.last_raw_stamp_ns = None
         output_topic = self.get_parameter("output_odometry_topic").value
 
         qos = QoSProfile(
@@ -197,7 +215,10 @@ class VioToPx4Odometry(Node):
         )
 
         self.publisher = self.create_publisher(VehicleOdometry, output_topic, qos)
-        self.subscription = self.create_subscription(PoseStamped, input_topic, self.pose_callback, qos)
+        self.subscription = (
+            self.create_subscription(Odometry, odometry_topic, self.odometry_callback, qos)
+            if self.raw_odometry_input else
+            self.create_subscription(PoseStamped, input_topic, self.pose_callback, qos))
         self.debug_pose_pub = self.create_publisher(
             PoseStamped, str(self.get_parameter("debug_pose_topic").value), 10
         )
@@ -218,7 +239,24 @@ class VioToPx4Odometry(Node):
         self.reset_counter = 0
         self.reset_pose_active = False
 
-        self.get_logger().info(f"Bridging {input_topic} -> {output_topic}")
+        self.get_logger().info(f"Bridging {odometry_topic or input_topic} -> {output_topic}")
+
+    def odometry_callback(self, odometry: Odometry) -> None:
+        reason = raw_odometry_rejection_reason(
+            odometry, self.get_clock().now().nanoseconds, self.last_raw_stamp_ns)
+        if reason is not None:
+            self.previous_position = None
+            self.previous_time_us = None
+            self.rejected_count += 1
+            if self.rejected_count == 1 or self.rejected_count % 100 == 0:
+                self.get_logger().warning(f"Rejected ROS VIO: {reason}")
+            return
+        self.last_raw_stamp_ns = (odometry.header.stamp.sec * 1_000_000_000 +
+                                  odometry.header.stamp.nanosec)
+        pose = PoseStamped()
+        pose.header = odometry.header
+        pose.pose = odometry.pose.pose
+        self.pose_callback(pose)
 
     def pose_callback(self, pose: PoseStamped) -> None:
         position_enu: Vector3 = (
@@ -280,11 +318,12 @@ class VioToPx4Odometry(Node):
             return
 
         now_us = self.get_clock().now().nanoseconds // 1000
-        velocity = self.estimate_velocity(position, now_us)
+        sample_us = (self.last_raw_stamp_ns // 1000) if self.raw_odometry_input else now_us
+        velocity = self.estimate_velocity(position, sample_us)
 
         msg = VehicleOdometry()
         msg.timestamp = int(now_us)
-        msg.timestamp_sample = int(now_us)
+        msg.timestamp_sample = int(sample_us)
         msg.pose_frame = pose_frame
         msg.position = [float(value) for value in position]
         msg.q = [float(value) for value in orientation]

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Pi-specific isolated dependency setup. No arming/offboard node is created.
+set -eo pipefail
+source /home/john/rtabmap_parity_0_21_12/base_ros_env.bash
+source /home/john/rtabmap_latest_frame_overlay/install/local_setup.bash
+# setup.bash deduplicates paths without moving existing entries to the front.
+# In an already-sourced launch shell this can leave the unpacked (newer ABI)
+# messages ahead of our Jazzy rebuild. Explicitly prioritize the compatible
+# messages and patched driver after ALL setup scripts have run.
+ros_compat_prefix=/home/john/depthai_v3_compat_ws/install/depthai_ros_msgs_v3
+ros_driver_prefix=/home/john/depthai_v3_feature_ws/install/depthai_ros_driver_v3
+export AMENT_PREFIX_PATH="$ros_driver_prefix:$ros_compat_prefix:$AMENT_PREFIX_PATH"
+export LD_LIBRARY_PATH="$ros_driver_prefix/lib:$ros_compat_prefix/lib:$LD_LIBRARY_PATH"
+export PYTHONPATH="$ros_compat_prefix/lib/python3.12/site-packages:$PYTHONPATH"
+ros_backend_prefix="$(ros2 pkg prefix rtabmap_odom)"
+if [[ "$ros_backend_prefix" != /home/john/rtabmap_latest_frame_overlay/install/rtabmap_odom ]]; then
+  echo "ROS mode requires the validated rtabmap_odom overlay; refusing fallback." >&2
+  exit 1
+fi
+# Resolve lazy symbols now, before opening the camera or creating the graph.
+# This also provides a hardware-free regression check of the actual environment.
+python3 - <<'PY'
+import ctypes
+from ament_index_python.packages import get_package_prefix
+
+expected = '/home/john/depthai_v3_compat_ws/install/depthai_ros_msgs_v3'
+if get_package_prefix('depthai_ros_msgs_v3') != expected:
+    raise SystemExit('ROS mode requires the Jazzy-compatible DepthAI messages')
+ctypes.CDLL('libdepthai_ros_msgs_v3__rosidl_typesupport_fastrtps_cpp.so')
+PY
+if [[ "${1:-}" == --check-environment ]]; then
+  echo "ROS backend environment verified (no graph started)."
+  exit 0
+fi
+export RTABMAP_CACHE_CAMERA_INFO=1
+unset RTABMAP_TIMING_AUDIT
+exec ros2 launch px4_vio_bridge ros_rtabmap_oak_v3_native_features.launch.py "$@"

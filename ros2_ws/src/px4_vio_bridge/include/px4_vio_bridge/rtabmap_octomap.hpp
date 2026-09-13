@@ -53,6 +53,16 @@ public:
     const std::map<int, rtabmap::Transform> & optimized_poses,
     std::string * error = nullptr);
 
+  // Retain RTAB-Map's local-grid cache and tree between updates. New nodes are
+  // inserted incrementally; GlobalMap rebuilds from the cache only when an
+  // existing pose moves farther than pose_update_tolerance_m.
+  bool update(
+    const std::vector<LocalGridObservation> & observations,
+    const std::map<int, rtabmap::Transform> & optimized_poses,
+    float pose_update_tolerance_m,
+    float pose_update_tolerance_rad,
+    std::string * error = nullptr);
+
   [[nodiscard]] const rtabmap::RtabmapColorOcTree * tree() const;
   [[nodiscard]] const OctomapBuildMetadata & metadata() const {return metadata_;}
 
@@ -60,9 +70,16 @@ public:
     const std::map<int, rtabmap::Transform> & optimized_poses);
 
 private:
+  bool refresh_metadata(
+    const std::map<int, rtabmap::Transform> & optimized_poses,
+    std::string * error);
+
   rtabmap::LocalGridCache cache_;
   std::unique_ptr<rtabmap::OctoMap> octomap_;
   OctomapBuildMetadata metadata_;
+  float resolution_{};
+  float pose_update_tolerance_m_{};
+  float pose_update_tolerance_rad_{};
 };
 
 }  // namespace px4_vio_bridge

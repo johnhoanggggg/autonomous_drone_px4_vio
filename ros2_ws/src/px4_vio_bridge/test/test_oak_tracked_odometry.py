@@ -69,6 +69,7 @@ def test_camera_model_uses_body_to_optical_tf(tmp_path, input_reliability):
                                   "wait_for_transform": 0.01,
                                   "publish_tf": False,
                                   "publish_null_when_lost": False,
+                                  "input_stride": 2,
                                   "Vis/MinInliers": "5",
                                   "OdomF2M/BundleAdjustment": "0",
                               }.items()]

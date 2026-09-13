@@ -22,7 +22,10 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import AnyLaunchDescriptionSource
-from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (
+    IfElseSubstitution, LaunchConfiguration, PathJoinSubstitution,
+    PythonExpression,
+)
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
@@ -54,6 +57,10 @@ def generate_launch_description():
         # v3 provides current IMU stamps, so waiting for IMU can default on.
         DeclareLaunchArgument("use_imu", default_value="true"),
         DeclareLaunchArgument("start_mapper", default_value="true"),
+        DeclareLaunchArgument("start_octomap", default_value="true"),
+        DeclareLaunchArgument("multithreaded_container", default_value="false"),
+        DeclareLaunchArgument("separate_mapper_container", default_value="false"),
+        DeclareLaunchArgument("mapper_subscribe_odom_info", default_value="true"),
         DeclareLaunchArgument("base_frame_id", default_value="oak"),
         # F2M consumes orientation, not bare gyro/accelerometer measurements.
         # Keep this selectable for controlled comparisons with the historical
@@ -75,7 +82,12 @@ def generate_launch_description():
         DeclareLaunchArgument("voxel_size", default_value="0.05"),
         DeclareLaunchArgument("range_min", default_value="0.30"),
         DeclareLaunchArgument("range_max", default_value="4.0"),
-        DeclareLaunchArgument("max_marker_voxels", default_value="50000"),
+        # Full-tree marker traversal causes estimator starvation as maps grow.
+        # The binary OctoMap remains published; opt in to markers for short
+        # visualization sessions only.
+        DeclareLaunchArgument("max_marker_voxels", default_value="0"),
+        DeclareLaunchArgument("octomap_pose_update_tolerance_m", default_value="0.01"),
+        DeclareLaunchArgument("octomap_pose_update_tolerance_rad", default_value="0.01"),
         # Bundle adjustment is what buys the accuracy: with it off this
         # odometry sits at 3.3-3.8 mm stationary rms regardless of
         # correspondence type, and with it on it reaches 0.47 mm, matching the
@@ -84,14 +96,30 @@ def generate_launch_description():
         # 1000 and the local map to 3000 gives 0.44 mm and a smoother path but
         # drops the rate to ~10 Hz.
         DeclareLaunchArgument("vis_max_features", default_value="600"),
+        DeclareLaunchArgument("vis_min_inliers", default_value="20"),
         DeclareLaunchArgument("vis_cor_type", default_value="0"),
+        DeclareLaunchArgument("odom_strategy", default_value="0"),
         DeclareLaunchArgument("odom_f2m_max_size", default_value="2000"),
+        DeclareLaunchArgument("odom_reset_countdown", default_value="0"),
+        DeclareLaunchArgument("odom_guess_motion", default_value="true"),
+        DeclareLaunchArgument("odom_guess_smoothing_delay", default_value="0.0"),
         DeclareLaunchArgument("odom_bundle_adjustment", default_value="1"),
+        DeclareLaunchArgument("odom_bundle_adjustment_max_frames", default_value="10"),
+        DeclareLaunchArgument("odom_key_frame_thr", default_value="0.3"),
         DeclareLaunchArgument("odom_vis_keyframe_thr", default_value="150"),
+        DeclareLaunchArgument("odom_f2m_max_new_features", default_value="0"),
         DeclareLaunchArgument("odom_bundle_min_motion", default_value="0.0"),
+        DeclareLaunchArgument("vis_cor_guess_win_size", default_value="40"),
         DeclareLaunchArgument("odom_config_path", default_value=""),
+        # Available only in the isolated patched rtabmap_odom overlay. Keep
+        # false for the stock package; diagnostic launches can retain one
+        # latest complete tuple while the odometry worker is busy.
+        DeclareLaunchArgument("keep_latest_frame", default_value="false"),
+        DeclareLaunchArgument("keep_next_frame", default_value="false"),
+        DeclareLaunchArgument("processing_queue_size", default_value="0"),
         DeclareLaunchArgument("sync_max_interval", default_value="0.05"),
         DeclareLaunchArgument("oak_feature_sync_max_interval", default_value="0.001"),
+        DeclareLaunchArgument("oak_input_stride", default_value="1"),
         DeclareLaunchArgument("sensor_qos", default_value="2"),
     ]
 
@@ -117,7 +145,9 @@ def generate_launch_description():
     replay_container = ComposableNodeContainer(
         condition=UnlessCondition(LaunchConfiguration("start_camera")),
         package="rclcpp_components",
-        executable="component_container",
+        executable=IfElseSubstitution(
+            LaunchConfiguration("multithreaded_container"),
+            "component_container_mt", "component_container"),
         name="oak_container",
         namespace="",
         output="screen",
@@ -169,18 +199,30 @@ def generate_launch_description():
         "qos": typed("sensor_qos", int),
         "expected_update_rate": typed("odometry_rate_hz", float),
         "max_update_rate": typed("odometry_rate_hz", float),
+        "keep_latest_frame": typed("keep_latest_frame", bool),
+        "keep_next_frame": typed("keep_next_frame", bool),
+        "processing_queue_size": typed("processing_queue_size", int),
         # RTAB-Map core parameters are declared as strings; passing them as
         # numbers makes the node abort at startup.
-        "Odom/Strategy": "0",
+        "Odom/Strategy": core_string("odom_strategy"),
         # Preserve the odometry frame through a temporary registration
         # failure. The default is zero too, but make this flight-critical
         # behavior explicit.
-        "Odom/ResetCountdown": "0",
+        "Odom/ResetCountdown": core_string("odom_reset_countdown"),
+        "Odom/GuessMotion": core_string("odom_guess_motion"),
+        "Odom/GuessSmoothingDelay": core_string("odom_guess_smoothing_delay"),
         "Vis/MaxFeatures": core_string("vis_max_features"),
+        "Vis/MinInliers": core_string("vis_min_inliers"),
         "Vis/CorType": core_string("vis_cor_type"),
+        "Vis/CorGuessWinSize": core_string("vis_cor_guess_win_size"),
         "OdomF2M/MaxSize": core_string("odom_f2m_max_size"),
         "OdomF2M/BundleAdjustment": core_string("odom_bundle_adjustment"),
+        "OdomF2M/BundleAdjustmentMaxFrames": core_string(
+            "odom_bundle_adjustment_max_frames"
+        ),
+        "Odom/KeyFrameThr": core_string("odom_key_frame_thr"),
         "Odom/VisKeyFrameThr": core_string("odom_vis_keyframe_thr"),
+        "OdomF2M/MaxNewFeatures": core_string("odom_f2m_max_new_features"),
         "OdomF2M/BundleAdjustmentMinMotion": core_string("odom_bundle_min_motion"),
     }
     odometry_remappings = [
@@ -192,6 +234,7 @@ def generate_launch_description():
             "/rtabmap/imu_disabled")),
         ("odom", "/rtabmap/vio_odometry"),
         ("odom_info", "/rtabmap/vio_odom_info"),
+        ("odom_info_lite", "/rtabmap/vio_odom_info_lite"),
     ]
 
     odometry = ComposableNode(
@@ -221,7 +264,7 @@ def generate_launch_description():
             "subscribe_rgb": False,
             "subscribe_rgbd": False,
             "subscribe_stereo": False,
-            "subscribe_odom_info": True,
+            "subscribe_odom_info": typed("mapper_subscribe_odom_info", bool),
             "frame_id": LaunchConfiguration("base_frame_id"),
             "map_frame_id": "world",
             "publish_tf": True,
@@ -281,6 +324,7 @@ def generate_launch_description():
                 ),
                 "input_queue_size": 10,
                 "input_max_interval": typed("oak_feature_sync_max_interval", float),
+                "input_stride": typed("oak_input_stride", int),
             }],
             remappings=odometry_remappings,
         )],
@@ -288,13 +332,32 @@ def generate_launch_description():
 
     mapper_component = LoadComposableNodes(
         target_container="/oak_container",
-        condition=IfCondition(LaunchConfiguration("start_mapper")),
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration("start_mapper"), "' == 'true' and '",
+            LaunchConfiguration("separate_mapper_container"), "' != 'true'",
+        ])),
+        composable_node_descriptions=[mapper],
+    )
+
+    mapper_container = ComposableNodeContainer(
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration("start_mapper"), "' == 'true' and '",
+            LaunchConfiguration("separate_mapper_container"), "' == 'true'",
+        ])),
+        package="rclcpp_components",
+        executable="component_container",
+        name="rtabmap_mapper_container",
+        namespace="",
+        output="screen",
         composable_node_descriptions=[mapper],
     )
 
     octomap = Node(
         package="px4_vio_bridge",
-        condition=IfCondition(LaunchConfiguration("start_mapper")),
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration("start_mapper"), "' == 'true' and '",
+            LaunchConfiguration("start_octomap"), "' == 'true'",
+        ])),
         executable="rtabmap_octomap_node",
         name="ros_rtabmap_octomap",
         output="screen",
@@ -309,6 +372,8 @@ def generate_launch_description():
             "ground_markers_topic": "/rtabmap/octomap_ground_markers",
             "obstacle_markers_topic": "/rtabmap/octomap_obstacle_markers",
             "max_marker_voxels": typed("max_marker_voxels", int),
+            "pose_update_tolerance_m": typed("octomap_pose_update_tolerance_m", float),
+            "pose_update_tolerance_rad": typed("octomap_pose_update_tolerance_rad", float),
         }],
     )
 
@@ -351,6 +416,7 @@ def generate_launch_description():
         standard_odometry,
         tracked_odometry,
         mapper_component,
+        mapper_container,
         octomap,
         foxglove,
     ])

@@ -1,5 +1,6 @@
 """Frame correspondence and invalid-pose handling for estimator comparisons."""
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,21 @@ SCRIPT = Path(__file__).resolve().parents[4] / "scripts/depthai_rtabmap_bag.py"
 spec = importlib.util.spec_from_file_location("depthai_rtabmap_bag", SCRIPT)
 replay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replay)
+
+
+def test_load_selection_requires_ordered_integer_sequence_and_stamp(tmp_path):
+    path = tmp_path / "poses.jsonl"
+    path.write_text("\n".join((
+        json.dumps({"sequence": 2, "stamp_ns": 100}),
+        json.dumps({"sequence": 5, "stamp_ns": 200}),
+    )))
+    assert replay.load_selection(path) == {2: 100, 5: 200}
+    path.write_text("\n".join((
+        json.dumps({"sequence": 2, "stamp_ns": 100}),
+        json.dumps({"sequence": 2, "stamp_ns": 200}),
+    )))
+    with pytest.raises(ValueError, match="strictly increasing"):
+        replay.load_selection(path)
 
 
 def message(stamp):
@@ -56,6 +72,21 @@ def test_sdk_null_rotation_is_not_normalized_into_valid_pose():
     assert not replay.pose_is_valid([float("nan"), 0, 0], [0, 0, 0, 1])
 
 
+def test_feature_passthrough_rejects_missing_wrong_and_stale_tracks():
+    point = SimpleNamespace(position=SimpleNamespace(x=123.5, y=45.25))
+    expected = SimpleNamespace(features=[point])
+    supplied = SimpleNamespace(trackedFeatures=[point], getSequenceNum=lambda: 7)
+    replay.validate_feature_passthrough(supplied, expected, 7)
+    with pytest.raises(RuntimeError, match="supplied tracks"):
+        replay.validate_feature_passthrough(supplied, expected, 8)
+    supplied.trackedFeatures = []
+    with pytest.raises(RuntimeError, match="supplied tracks"):
+        replay.validate_feature_passthrough(supplied, expected, 7)
+    supplied.trackedFeatures = [SimpleNamespace(position=SimpleNamespace(x=-1000., y=-1000.))]
+    with pytest.raises(RuntimeError, match="supplied tracks"):
+        replay.validate_feature_passthrough(supplied, expected, 7)
+
+
 def test_depth_byte_conversion_preserves_pixels_and_removes_row_padding():
     import numpy as np
 
@@ -74,3 +105,23 @@ def test_invalid_depth_buffer_is_rejected():
                             is_bigendian=False, data=bytes(7))
     with pytest.raises(ValueError, match="buffer size"):
         replay.image_bytes(depth, "16UC1", np)
+
+
+def test_delayed_calibration_does_not_discard_recorded_frame():
+    first, second = 1_000_000_000, 1_333_333_333
+    inputs = [(t, message(first)) for t in replay.TOPICS[:-1]]
+    inputs += [(t, message(second)) for t in replay.TOPICS]
+    inputs += [(replay.TOPICS[-1], message(first))]
+    stats = audit()
+    frames = list(replay.matched_frames(inputs, stats))
+    assert [replay.stamp_ns(frame[0]) for frame in frames] == [first, second]
+    assert stats["unmatched_messages"] == 0
+
+
+def test_eof_flushes_complete_frames_after_incomplete_tuple():
+    inputs = [(replay.TOPICS[0], message(1_000_000_000))]
+    inputs += [(t, message(1_033_333_333)) for t in replay.TOPICS]
+    stats = audit()
+    frames = list(replay.matched_frames(inputs, stats))
+    assert [replay.stamp_ns(frame[0]) for frame in frames] == [1_033_333_333]
+    assert stats["unmatched_messages"] == 1

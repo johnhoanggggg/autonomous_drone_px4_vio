@@ -75,6 +75,9 @@ def generate_launch_description():
             ])
         ),
         launch_arguments={
+            # Preserve the established flight path, even if an outer scope
+            # supplies backend:=ros. ROS mode is selected on the base launch.
+            "backend": "depthai",
             "start_xrce_agent": LaunchConfiguration("start_xrce_agent"),
             "foxglove": LaunchConfiguration("foxglove"),
             "foxglove_port": LaunchConfiguration("foxglove_port"),

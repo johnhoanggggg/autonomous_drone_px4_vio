@@ -21,8 +21,9 @@ def generate_launch_description():
         "voxel_size": "0.05",
         "range_min": "0.30",
         "range_max": "4.0",
-        "max_marker_voxels": "50000",
+        "max_marker_voxels": "0",
         "vis_max_features": "1000",
+        "vis_min_inliers": "20",
         "odom_f2m_max_size": "3000",
         # Keep both correspondence paths selectable from this wrapper. The
         # accurate profile uses descriptor matching + bundle adjustment;

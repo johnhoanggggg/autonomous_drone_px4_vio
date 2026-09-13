@@ -216,6 +216,8 @@ install(TARGETS
 install(DIRECTORY include/ DESTINATION include)
 
 install(PROGRAMS
+  scripts/foxglove_image_throttle
+  scripts/ros_rtabmap_backend
   scripts/basalt_odometry_test
   scripts/basalt_rtabmap_slam_ros2
   scripts/battery_to_ros
@@ -284,8 +286,11 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_vfh2d test/test_vfh2d.py)
   ament_add_pytest_test(test_vfh_telemetry test/test_vfh_telemetry.py)
   ament_add_pytest_test(test_vio_to_px4_odometry test/test_vio_to_px4_odometry.py)
+  ament_add_pytest_test(test_backend_launch test/test_backend_launch.py)
+  ament_add_pytest_test(test_foxglove_image_throttle test/test_foxglove_image_throttle.py)
   ament_add_pytest_test(test_ros_rtabmap_bag test/test_ros_rtabmap_bag.py)
   ament_add_pytest_test(test_parity_frame_replay test/test_parity_frame_replay.py)
+  ament_add_pytest_test(test_parity_realtime_replay test/test_parity_realtime_replay.py)
   ament_add_pytest_test(test_loop_closure_metrics test/test_loop_closure_metrics.py)
   ament_add_pytest_test(test_oak_tracked_odometry test/test_oak_tracked_odometry.py TIMEOUT 60)
 endif()
