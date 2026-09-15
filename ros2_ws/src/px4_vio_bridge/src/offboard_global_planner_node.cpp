@@ -168,7 +168,7 @@ public:
     route_limiter_ = std::make_unique<PathCommandLimiter>(
       limiter_->max_speed(), limiter_->max_acceleration(), projection_tolerance,
       corner_tolerance, entry_tolerance, connector_tolerance, suffix_tolerance,
-      corner_blending, junction_deviation);
+      corner_blending, junction_deviation, true);
 
     displacement_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
       follower_displacement_topic_, 10,
@@ -751,10 +751,10 @@ private:
   // --- setpoint feedforward ------------------------------------------------
   std::pair<double, double> setpoint_velocity_xy() const
   {
-    // Feed forward the path command's velocity, rotated into NED. Scalar
-    // speed changes and active rejoins are acceleration limited. Polyline
-    // corners/join completion can still change its direction abruptly, and
-    // map-to-PX4 rebasing can move the position independently of this velocity.
+    // Feed forward the path command's velocity, rotated into NED. The strict
+    // route limiter bounds the whole velocity vector, including joins and
+    // sharp bends. Map-to-PX4 rebasing can still move the position independently
+    // of this velocity; this is not a measured aircraft acceleration bound.
     // Gated to an advancing route on purpose: in a fault hold latch_fault_hold
     // resets the limiter, but a command hold does not, and the base-class LAND
     // state publishes through here too. NaN restores pure position control.
@@ -805,6 +805,9 @@ private:
     config["command_speed"] = limiter_->max_speed();
     config["command_acceleration"] = limiter_->max_acceleration();
     config["corner_blending"] = corner_blending_;
+    config["strict_vector_limits"] = true;
+    config["path_target_retreat"] = "brake_on_validated_segment";
+    config["sharp_corner_policy"] = "decelerate_to_zero_on_polyline";
     config["junction_deviation"] = junction_deviation_;
     config["path_corner_tolerance"] = path_corner_tolerance_;
     config["hover_height"] = hover_height_;

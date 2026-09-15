@@ -210,7 +210,8 @@ Point2 HorizontalCommandLimiter::adopt(const Point2 & position, const Point2 & v
 PathCommandLimiter::PathCommandLimiter(
   double max_speed, double max_acceleration, double max_projection_error,
   double corner_tolerance, double max_entry_error, double max_connector_error,
-  double suffix_tolerance, bool corner_blending, double junction_deviation)
+  double suffix_tolerance, bool corner_blending, double junction_deviation,
+  bool strict_vector_limits)
 : max_speed_(max_speed),
   max_acceleration_(max_acceleration),
   max_projection_error_(max_projection_error),
@@ -219,7 +220,8 @@ PathCommandLimiter::PathCommandLimiter(
   max_connector_error_(max_connector_error),
   suffix_tolerance_(suffix_tolerance),
   corner_blending_(corner_blending),
-  junction_deviation_(junction_deviation)
+  junction_deviation_(junction_deviation),
+  strict_vector_limits_(strict_vector_limits)
 {
   for (const double value : {max_speed, max_acceleration, max_projection_error,
       corner_tolerance, max_entry_error, max_connector_error, suffix_tolerance,
@@ -386,7 +388,7 @@ bool PathCommandLimiter::set_path(
   } else {
     anchor = *position_;
     const auto offset = shared_suffix_offset(*new_path);
-    if (offset) {
+    if (offset && !strict_vector_limits_) {
       // Identical geometry ahead: keep the command point and its speed and
       // only renumber the arc length it is measured against.
       std::optional<double> waiting;
@@ -423,7 +425,25 @@ bool PathCommandLimiter::set_path(
   // through the bounded band; snapping directly to projection.point would
   // bypass the speed limit.
   position_ = anchor;
-  if (projection.cross_track > join_tolerance_) {
+  bool tangent_requires_join = false;
+  if (strict_vector_limits_ && projection.cross_track <= kEpsilon) {
+    const Point2 tangent = segment_tangent(projection.along);
+    const double tangent_speed =
+      velocity_.first * tangent.first + velocity_.second * tangent.second;
+    const Point2 tangent_velocity{
+      tangent.first * std::max(0.0, tangent_speed),
+      tangent.second * std::max(0.0, tangent_speed)};
+    tangent_requires_join = std::hypot(
+      velocity_.first - tangent_velocity.first,
+      velocity_.second - tangent_velocity.second) > kEpsilon;
+  }
+  // Strict mode never snaps even a sub-tolerance replacement onto its new
+  // path. It must either already be the same point or pass through the bounded
+  // join state, where the caller's swept-chord clearance gate still applies.
+  const bool open_join = projection.cross_track > join_tolerance_ ||
+    (strict_vector_limits_ &&
+    (projection.cross_track > kEpsilon || tangent_requires_join));
+  if (open_join) {
     join_target_ = projection.point;
     join_limit_ = limit;
     // Carry the standing rate into the join. update_join() runs the same
@@ -458,7 +478,8 @@ double PathCommandLimiter::speed_ceiling(std::optional<double> speed_cap) const
   return std::min(max_speed_, *speed_cap);
 }
 
-double PathCommandLimiter::along_path_speed(double along, double dt, bool advance, double ceiling)
+double PathCommandLimiter::along_path_speed(
+  double along, double desired_progress, double dt, bool advance, double ceiling)
 {
   // The same speed machinery the on-path advance uses, factored out so a join
   // is braked by corners and by the path end exactly as ordinary motion is.
@@ -466,7 +487,8 @@ double PathCommandLimiter::along_path_speed(double along, double dt, bool advanc
     speed_ = std::max(0.0, speed_ - max_acceleration_ * dt);
     return speed_;
   }
-  const double target_progress = next_motion_target(installation_->path->length());
+  const double target_progress = next_motion_target(
+    std::max(along, std::min(desired_progress, installation_->path->length())));
   const double remaining = std::max(0.0, target_progress - along);
   if (remaining <= kEpsilon) {
     speed_ = 0.0;
@@ -508,7 +530,123 @@ Point2 PathCommandLimiter::path_tangent(double along) const
   return {delta.first / norm, delta.second / norm};
 }
 
-Point2 PathCommandLimiter::update_join(double dt, bool advance, double ceiling)
+Point2 PathCommandLimiter::segment_tangent(double along) const
+{
+  const auto & points = installation_->path->points();
+  const auto & cumulative = installation_->path->cumulative();
+  if (points.size() < 2) {
+    return {0.0, 0.0};
+  }
+  const double clamped = std::clamp(along, 0.0, installation_->path->length());
+  for (std::size_t index = 0; index + 1 < points.size(); ++index) {
+    if (clamped < cumulative[index + 1] - kEpsilon || index + 2 == points.size()) {
+      const Point2 delta{
+        points[index + 1].first - points[index].first,
+        points[index + 1].second - points[index].second};
+      const double norm = std::hypot(delta.first, delta.second);
+      if (norm > kEpsilon) {
+        return {delta.first / norm, delta.second / norm};
+      }
+    }
+  }
+  return {0.0, 0.0};
+}
+
+double PathCommandLimiter::strict_progress(
+  double target_progress, double dt, const Point2 & old_position) const
+{
+  const double start = progress_;
+  const double target = std::clamp(
+    target_progress, start, installation_->path->length());
+  const double requested = target - start;
+  double planned = requested;
+  const double maximum_delta = max_acceleration_ * dt;
+  double segment_end = installation_->path->length();
+  // Collinear waypoint subdivisions are not braking boundaries.
+  for (const double vertex : installation_->bends) {
+    if (vertex > start + kEpsilon) {
+      segment_end = vertex;
+      break;
+    }
+  }
+  const double segment_remaining = std::max(0.0, segment_end - start);
+  const auto candidate_velocity = [&](double step) {
+      const auto point = installation_->path->point_at(start + step);
+      return Point2{
+        (point.first - old_position.first) / dt,
+        (point.second - old_position.second) / dt};
+    };
+  const auto reachable = [&](const Point2 & candidate) {
+      return std::hypot(
+        candidate.first - velocity_.first, candidate.second - velocity_.second) <=
+        maximum_delta + 1.0e-10;
+    };
+
+  bool brake_without_target = false;
+  if (planned <= kEpsilon) {
+    if (reachable(candidate_velocity(0.0))) {
+      return start;
+    }
+    // A newly lowered cap or a follower pause can ask for zero path progress
+    // while the current vector still needs a braking tick.  Holding the exact
+    // path point would require an acceleration jump; use the nearest reachable
+    // secant on this segment instead.  Crossing a bend here is impossible to
+    // validate without a fillet, so that case remains fail-closed below.
+    planned = segment_remaining;
+    brake_without_target = true;
+  }
+
+  const auto candidate = candidate_velocity(planned);
+  if (!brake_without_target && reachable(candidate)) {
+    return target;
+  }
+
+  // On one segment the velocity secant is affine in arc length, so the
+  // reachable set is the interval cut out by one quadratic inequality. Strict
+  // mode never intentionally crosses a bend: next_motion_target() has already
+  // stopped the requested interval at the next vertex.
+  const Point2 base = candidate_velocity(0.0);
+  const Point2 tangent = segment_tangent(start);
+  const Point2 direction{tangent.first / dt, tangent.second / dt};
+  const Point2 relative{
+    base.first - velocity_.first, base.second - velocity_.second};
+  const double aa = direction.first * direction.first + direction.second * direction.second;
+  const double bb = 2.0 * (relative.first * direction.first + relative.second * direction.second);
+  const double cc = relative.first * relative.first + relative.second * relative.second -
+    maximum_delta * maximum_delta;
+  if (aa <= kEpsilon) {
+    throw std::invalid_argument("strict vector limit has no path tangent");
+  }
+  const double discriminant = bb * bb - 4.0 * aa * cc;
+  if (discriminant < -1.0e-12) {
+    throw std::invalid_argument("strict vector limit cannot reach the path");
+  }
+  const double root = std::sqrt(std::max(0.0, discriminant));
+  const double low = std::max(0.0, (-bb - root) / (2.0 * aa));
+  const double high = std::min(planned, (-bb + root) / (2.0 * aa));
+  if (high < low - 1.0e-10 || high < -1.0e-10 ||
+    !reachable(candidate_velocity(std::max(0.0, high))))
+  {
+    if (!brake_without_target && requested < low - 1.0e-10) {
+      const bool target_is_geometry_boundary =
+        std::abs(target - segment_end) <= 1.0e-8;
+      if (!target_is_geometry_boundary && low <= segment_remaining + 1.0e-10) {
+        return start + low;
+      }
+    }
+    throw std::invalid_argument("strict vector limit cannot reach the requested path step");
+  }
+  if (brake_without_target) {
+    if (low > segment_remaining + 1.0e-10) {
+      throw std::invalid_argument("strict vector limit cannot brake before the path bend");
+    }
+    return start + std::max(0.0, low);
+  }
+  return start + std::max(0.0, high);
+}
+
+Point2 PathCommandLimiter::update_join(
+  const Point2 & desired_point, double dt, bool advance, double ceiling)
 {
   // A join is a lane change, not a stop.
   //
@@ -533,9 +671,14 @@ Point2 PathCommandLimiter::update_join(double dt, bool advance, double ceiling)
   // would leave `join_limit_`, and the caller still clearance-checks the
   // resulting chord and rolls the tick back if it fails.
   const Point2 old_position = *position_;
+  const Point2 old_velocity = velocity_;
   const auto start = installation_->path->project(*position_);
 
-  const double along_speed = along_path_speed(start.along, dt, advance, ceiling);
+  const auto desired_projection = installation_->path->project(desired_point);
+  const double along_speed = along_path_speed(
+    start.along,
+    strict_vector_limits_ ? desired_projection.along : installation_->path->length(),
+    dt, advance, ceiling);
   const Point2 tangent = path_tangent(start.along);
 
   Point2 desired_velocity{tangent.first * along_speed, tangent.second * along_speed};
@@ -612,13 +755,64 @@ Point2 PathCommandLimiter::update_join(double dt, bool advance, double ceiling)
     throw std::invalid_argument("path rejoin would leave the projection tolerance band");
   }
   progress_ = projection.along;
-  // Complete on geometry alone. The old velocity condition is what forced the
-  // stop; the command point is already on the path here, and `speed_` carries
-  // the along-path rate straight into the ordinary advance.
+  // In strict mode a geometric crossing is not enough: snapping the point to
+  // the path would make the published velocity differ from its position
+  // secant, and carrying a residual normal rate into the ordinary path update
+  // would step the full velocity vector. Complete only when the projection
+  // handoff itself is reachable and the next tangent is compatible. Otherwise
+  // remain in the bounded join; the caller's swept-chord clearance gate still
+  // validates every such tick.
   if (projection.cross_track <= join_tolerance_) {
-    position_ = projection.point;
-    progress_ = projection.along;
-    join_target_.reset();
+    const Point2 tangent = segment_tangent(projection.along);
+    const Point2 handoff_delta{
+      projection.point.first - old_position.first,
+      projection.point.second - old_position.second};
+    const Point2 handoff_velocity{handoff_delta.first / dt, handoff_delta.second / dt};
+    const double handoff_speed = std::max(
+      0.0, handoff_velocity.first * tangent.first + handoff_velocity.second * tangent.second);
+    const Point2 tangent_velocity{
+      tangent.first * handoff_speed, tangent.second * handoff_speed};
+    const bool handoff_reachable = std::hypot(
+      handoff_velocity.first - old_velocity.first,
+      handoff_velocity.second - old_velocity.second) <= max_acceleration_ * dt + 1.0e-10;
+    const bool tangent_compatible = std::hypot(
+      handoff_velocity.first - tangent_velocity.first,
+      handoff_velocity.second - tangent_velocity.second) <= max_acceleration_ * dt + 1.0e-10;
+    const bool handoff_within_speed =
+      std::hypot(handoff_velocity.first, handoff_velocity.second) <= max_speed_ + kEpsilon;
+    bool ordinary_handoff_reachable = true;
+    if (strict_vector_limits_ && handoff_reachable && tangent_compatible && handoff_within_speed) {
+      // The handoff tick itself is valid, but the next on-path secant may not
+      // be.  In particular, a positive residual normal component consumes part
+      // of the next tick's acceleration disk while the ordinary path update
+      // also tries to change speed.  Preview that exact next update from the
+      // handoff state; leave the bounded join open when it would reject.  The
+      // next join tick can remove the residual at the same vector limit.
+      auto next = *this;
+      next.position_ = projection.point;
+      next.progress_ = projection.along;
+      next.velocity_ = handoff_velocity;
+      next.speed_ = handoff_speed;
+      next.join_target_.reset();
+      next.waiting_vertex_.reset();
+      try {
+        (void)next.update(desired_point, dt, advance, std::nullopt, ceiling);
+      } catch (const std::invalid_argument &) {
+        ordinary_handoff_reachable = false;
+      }
+    }
+    if (!strict_vector_limits_ ||
+      (handoff_reachable && tangent_compatible && handoff_within_speed &&
+      ordinary_handoff_reachable))
+    {
+      position_ = projection.point;
+      progress_ = projection.along;
+      if (strict_vector_limits_) {
+        velocity_ = handoff_velocity;
+        speed_ = handoff_speed;
+      }
+      join_target_.reset();
+    }
   }
   return *position_;
 }
@@ -628,7 +822,10 @@ double PathCommandLimiter::next_motion_target(double desired_progress) const
   // With corner blending on, only the path end is a stop; bends become speed
   // limits in corner_speed_limit() instead.
   const double length = installation_->path->length();
-  if (!corner_blending_) {
+  // Strict vector mode deliberately stops at every sharp polyline vertex.
+  // Carrying speed through an unfilleted bend would require a velocity vector
+  // that is not the derivative of the exact, clearance-checked command path.
+  if (!corner_blending_ || strict_vector_limits_) {
     for (const double vertex : installation_->bends) {
       if (progress_ + kEpsilon < vertex && vertex < desired_progress - kEpsilon) {
         return vertex;
@@ -699,13 +896,19 @@ Point2 PathCommandLimiter::update(
   const double ceiling = speed_ceiling(speed_cap);
 
   const Point2 old_position = *position_;
+  const Point2 old_velocity = velocity_;
   if (join_target_) {
-    return update_join(dt, advance, ceiling);
+    return update_join(desired_point, dt, advance, ceiling);
   }
   if (waiting_vertex_) {
     const Point2 vertex = installation_->path->point_at(*waiting_vertex_);
     if (!reference_point || distance(*reference_point, vertex) > corner_tolerance_) {
       speed_ = 0.0;
+      if (strict_vector_limits_ && std::hypot(velocity_.first, velocity_.second) >
+        max_acceleration_ * dt + 1.0e-10)
+      {
+        throw std::invalid_argument("strict vector limit cannot enter a corner hold");
+      }
       velocity_ = {0.0, 0.0};
       return *position_;
     }
@@ -725,9 +928,14 @@ Point2 PathCommandLimiter::update(
         break;
       }
     }
-    progress_ = std::min(progress_ + step, next_vertex);
+    const double planned_progress = std::min(progress_ + step, next_vertex);
+    progress_ = strict_vector_limits_ ?
+      strict_progress(planned_progress, dt, old_position) : planned_progress;
     if (progress_ >= next_vertex - kEpsilon) {
       next_speed = 0.0;
+    }
+    if (strict_vector_limits_) {
+      next_speed = std::max(0.0, progress_ - (planned_progress - step)) / dt;
     }
     speed_ = next_speed;
   } else {
@@ -737,6 +945,17 @@ Point2 PathCommandLimiter::update(
     const double remaining = std::max(0.0, target_progress - progress_);
     if (remaining <= kEpsilon) {
       speed_ = 0.0;
+      if (strict_vector_limits_) {
+        // A scalar target can fall behind a still-moving command (for example
+        // when a carrot retreats during recovery).  Let strict_progress()
+        // choose the nearest acceleration-reachable on-path braking secant
+        // instead of forcing an instantaneous zero vector.
+        const double previous_progress = progress_;
+        progress_ = strict_progress(progress_, dt, old_position);
+        if (progress_ > previous_progress + kEpsilon) {
+          speed_ = (progress_ - previous_progress) / dt;
+        }
+      }
     } else {
       // Bound this step and the remaining braking distance. The discrete form
       // prevents overshooting a corner at finite dt.
@@ -757,8 +976,17 @@ Point2 PathCommandLimiter::update(
       // stepping the velocity and then clipping only its acceleration FF.
       speed_ = std::clamp(speed_ + delta, 0.0, max_speed_);
       const double step = std::min(remaining, speed_ * dt);
-      progress_ += step;
-      if (remaining - step <= kEpsilon) {
+      const double planned_progress = progress_ + step;
+      const double previous_progress = progress_;
+      progress_ = strict_vector_limits_ ?
+        strict_progress(planned_progress, dt, old_position) : planned_progress;
+      if (strict_vector_limits_) {
+        speed_ = std::max(0.0, progress_ - previous_progress) / dt;
+      }
+      if (progress_ <= planned_progress + kEpsilon &&
+        remaining - (progress_ - (planned_progress - step)) <= kEpsilon &&
+        progress_ >= target_progress - kEpsilon)
+      {
         progress_ = target_progress;
         speed_ = 0.0;
         for (const double vertex : installation_->bends) {
@@ -775,6 +1003,13 @@ Point2 PathCommandLimiter::update(
   velocity_ = {
     (position_->first - old_position.first) / dt,
     (position_->second - old_position.second) / dt};
+  if (strict_vector_limits_) {
+    if (std::hypot(velocity_.first - old_velocity.first,
+      velocity_.second - old_velocity.second) > max_acceleration_ * dt + 1.0e-9)
+    {
+      throw std::invalid_argument("strict vector limit was exceeded by the path secant");
+    }
+  }
   return *position_;
 }
 

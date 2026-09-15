@@ -1,5 +1,20 @@
 # Trajectory smoothness and wall strikes — handoff, 2026-09-07
 
+> **Follow-up, 12:56/12:57 flights:** [retreating-target braking fix](CLUTTER_TRACKING_FOLLOWUP_20260913.md). Full-vector command improvement is visible in both logs; straight route plus wallward actual drift remains. Fixed feasible braking being rejected when a soft target retreats. No gain, margin or speed changes.
+
+> **Latest work, 2026-09-13:** [strict command-vector fix and unresolved physical response](CLUTTER_TRACKING_FIX_20260913.md). C++ global adapter enables strict vector acceleration limits and stops at unrounded corners; joins cannot snap small offsets. Added and loaded estimator diagnostic topics over NSH. No further gain/tolerance changes or physical tests. This is not demonstrated tunnel readiness.
+
+> **225 ms trial flown, 2026-09-13 12:11:** [results](ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/ANALYSIS.md). Three legs, third hold timed out; longest joint gate pass 0.848 s at 0.06 m/s versus 1.598 s at 0.08 m/s. Third-leg initial overshoot 9.7 cm, hold swing 16.3 cm, first reversal 2.03 s after brake marker. Reduced overspeed is not proof of corrected braking. EV delay stays 225; no further writes.
+
+> **Current trial, 2026-09-13:** [EV_DELAY_TRIAL_20260913.md](EV_DELAY_TRIAL_20260913.md).
+> Existing smooth lateral-stop tests establish oscillation independent of the
+> planner. Four recent ULogs place residual VIO/gyro timing at 205–230 ms, versus
+> configured 270 ms. Saved **EKF2_EV_DELAY=225 ms** while disarmed; readback
+> verified. All PID gains stay unchanged, roll P=0.150. Power-cycle before
+> repeating the same open-area lateral-stop test. No flight started; braking
+> improvement is not yet demonstrated. Historical 270 ms statements below are
+> superseded for the current native-VIO trial only.
+
 > **Yaw/motor investigation:** [YAW_MOTOR_DIAGNOSIS_20260908.md](YAW_MOTOR_DIAGNOSIS_20260908.md).
 > Reconstructed yaw P+I and 2 Hz filter agree with torque; diagonal motor split
 > agrees with allocation. Net gyro/attitude yaw changes agree within ≈1°, without

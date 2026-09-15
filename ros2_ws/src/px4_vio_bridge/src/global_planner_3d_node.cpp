@@ -35,6 +35,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "px4_vio_bridge/grid_planner_3d.hpp"
+#include "px4_vio_bridge/navigation_snapshot.hpp"
 
 namespace px4_vio_bridge
 {
@@ -146,13 +147,20 @@ public:
     metadata_sub_ = create_subscription<std_msgs::msg::String>(
       map_metadata_topic_, map_qos,
       [this](std_msgs::msg::String::ConstSharedPtr message) {on_metadata(*message);});
+    snapshot_topic_ = declare_parameter<std::string>("pose_snapshot_topic", "");
+    if (!snapshot_topic_.empty()) {
+      snapshot_sub_ = create_subscription<std_msgs::msg::String>(snapshot_topic_, 10,
+        [this](std_msgs::msg::String::ConstSharedPtr message) {on_snapshot(*message);});
+    } else {
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       pose_topic_, 10,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr message) {on_pose(*message);});
+    }
     goal_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
       goal_topic_, 10,
       [this](geometry_msgs::msg::PointStamped::ConstSharedPtr message) {on_goal(*message);});
 
+    path_snapshot_pub_ = create_publisher<std_msgs::msg::String>("/planner3d/path_snapshot", 10);
     path_pub_ = create_publisher<nav_msgs::msg::Path>("/planner3d/path", 10);
     candidate_pub_ = create_publisher<nav_msgs::msg::Path>("/planner3d/candidate_path", 10);
     status_pub_ = create_publisher<std_msgs::msg::String>("/planner3d/status", 10);
@@ -245,7 +253,8 @@ private:
     if (pending_metadata_->stamp_ns != pending_map_stamp_.nanoseconds() ||
       pending_metadata_->frame_id != frame_id_ ||
       std::abs(pending_metadata_->resolution - pending_octree_->getResolution()) > 1.0e-9 ||
-      pending_metadata_->generation <= 0)
+      pending_metadata_->generation <= map_generation_ ||
+      !fresh_stamp(pending_metadata_->stamp_ns, now().nanoseconds(), map_timeout_))
     {
       publish_status("MAP_METADATA_MISMATCH");
       return;
@@ -262,13 +271,33 @@ private:
     plan_dirty_ = true;
   }
 
+  void on_snapshot(const std_msgs::msg::String & message)
+  {
+    try {
+      const auto value = nlohmann::json::parse(message.data);
+      const auto stamp = value.at("stamp_ns").get<std::int64_t>();
+      if (value.at("frame_id") != frame_id_ ||
+        !fresh_stamp(stamp, now().nanoseconds(), pose_timeout_) || stamp <= pose_stamp_) {return;}
+      const auto pose = snapshot_pose(value.at("pose"));
+      geometry_msgs::msg::PoseStamped msg;
+      msg.header.frame_id = frame_id_; msg.header.stamp = rclcpp::Time(stamp);
+      msg.pose.position.x = pose.position.x; msg.pose.position.y = pose.position.y;
+      msg.pose.position.z = pose.position.z;
+      pose_generation_ = value.at("map_generation");
+      pose_map_stamp_ = value.at("map_stamp_ns");
+      on_pose(msg);
+    } catch (const std::exception &) {publish_status("POSE_SNAPSHOT_REJECTED");}
+  }
+
   void on_pose(const geometry_msgs::msg::PoseStamped & message)
   {
     const Point3 point{message.pose.position.x, message.pose.position.y, message.pose.position.z};
-    if (message.header.frame_id != frame_id_ || !finite(point)) {
+    if (message.header.frame_id != frame_id_ || !finite(point) ||
+      !fresh_stamp(rclcpp::Time(message.header.stamp).nanoseconds(), now().nanoseconds(), pose_timeout_)) {
       publish_status("POSE_REJECTED");
       return;
     }
+    pose_stamp_ = rclcpp::Time(message.header.stamp).nanoseconds();
     pose_ = point;
     pose_received_ = steady_seconds();
     if (!takeoff_center_) {
@@ -298,11 +327,19 @@ private:
   void tick()
   {
     const auto now = steady_seconds();
-    if (!octree_ || now - map_received_ > map_timeout_) {fail_closed("MAP_STALE"); return;}
-    if (!pose_ || now - pose_received_ > pose_timeout_) {fail_closed("POSE_STALE"); return;}
+    if (!octree_ || now - map_received_ > map_timeout_ ||
+      !fresh_stamp(map_stamp_.nanoseconds(), this->now().nanoseconds(), map_timeout_)) {fail_closed("MAP_STALE"); return;}
+    if (!pose_ || now - pose_received_ > pose_timeout_ ||
+      !fresh_stamp(pose_stamp_, this->now().nanoseconds(), pose_timeout_)) {fail_closed("POSE_STALE"); return;}
+    if (!snapshot_topic_.empty() && (pose_generation_ != map_generation_ ||
+      pose_map_stamp_ != map_stamp_.nanoseconds())) {fail_closed("POSE_MAP_MISMATCH"); return;}
     if (!goal_) {fail_closed("WAITING_FOR_GOAL"); return;}
     if (!takeoff_center_) {fail_closed("WAITING_FOR_TAKEOFF_ORIGIN"); return;}
     if (!inside_geofence(*goal_)) {fail_closed("GOAL_OUTSIDE_GEOFENCE"); return;}
+    if (!inside_start_envelope(*pose_)) {
+      fail_closed("START_ENVELOPE_OUTSIDE_GEOFENCE");
+      return;
+    }
     if (!plan_dirty_) {
       publish_path(accepted_path_, path_pub_);
       std_msgs::msg::Int32 path_generation;
@@ -322,6 +359,8 @@ private:
       fail_closed(result.reason);
       return;
     }
+    accepted_goal_exact_ = result.goal && result.goal->exact;
+    accepted_goal_terminal_ = result.goal && result.goal->terminal;
     publish_path(result.path, path_pub_);
     accepted_path_ = result.path;
     last_planned_pose_ = pose_;
@@ -338,6 +377,25 @@ private:
     return takeoff_center_ &&
            std::hypot(point.x - takeoff_center_->x, point.y - takeoff_center_->y) <=
            planning_radius_xy_ + 1.0e-12 && point.z >= min_z_ && point.z <= max_z_;
+  }
+
+  bool inside_start_envelope(const Point3 & point) const
+  {
+    const auto radius = config_.lethal_radius;
+    return takeoff_center_ && point.z - radius >= min_z_ && point.z + radius <= max_z_ &&
+      std::hypot(point.x - takeoff_center_->x, point.y - takeoff_center_->y) + radius <=
+      planning_radius_xy_;
+  }
+
+  void add_geofence_status(nlohmann::ordered_json & status) const
+  {
+    status["geofence"] = {{"min_z", min_z_}, {"max_z", max_z_},
+      {"planning_radius_xy", planning_radius_xy_},
+      {"min_center_z", min_z_ + config_.lethal_radius},
+      {"max_center_z", max_z_ - config_.lethal_radius}};
+    status["lethal_radius"] = config_.lethal_radius;
+    if (pose_) {status["start"] = {pose_->x, pose_->y, pose_->z};}
+    if (goal_) {status["requested_goal"] = {goal_->x, goal_->y, goal_->z};}
   }
 
   std::optional<VoxelGrid> make_planning_grid() const
@@ -426,6 +484,17 @@ private:
       message.poses.push_back(pose);
     }
     publisher->publish(message);
+    if (publisher == path_pub_) {
+      nlohmann::json points_json = nlohmann::json::array();
+      for (const auto & point : points) {points_json.push_back({point.x, point.y, point.z});}
+      std_msgs::msg::String snapshot;
+      snapshot.data = nlohmann::json{{"stamp_ns", rclcpp::Time(message.header.stamp).nanoseconds()},
+        {"frame_id", frame_id_}, {"map_generation", map_generation_},
+        {"map_stamp_ns", map_stamp_.nanoseconds()}, {"lethal_radius", config_.lethal_radius},
+        {"points", points_json}, {"goal_exact", accepted_goal_exact_},
+        {"goal_terminal", accepted_goal_terminal_}}.dump();
+      path_snapshot_pub_->publish(snapshot);
+    }
   }
 
   void publish_candidate(const std::vector<Point3> & points)
@@ -435,7 +504,9 @@ private:
 
   void fail_closed(const std::string & reason)
   {
+    plan_dirty_ = true;
     accepted_path_.clear();
+    accepted_goal_exact_ = accepted_goal_terminal_ = false;
     publish_path({}, path_pub_);
     publish_status(reason);
   }
@@ -452,6 +523,7 @@ private:
     status["source_pose_generation"] = source_pose_generation_;
     status["lethal_radius"] = config_.lethal_radius;
     std_msgs::msg::String message;
+    add_geofence_status(status);
     message.data = status.dump();
     status_pub_->publish(message);
   }
@@ -474,6 +546,7 @@ private:
     status["goal_terminal"] = result.goal && result.goal->terminal;
     status["reachable_voxels"] = result.goal ? result.goal->reachable_voxels : 0;
     std_msgs::msg::String message;
+    add_geofence_status(status);
     message.data = status.dump();
     status_pub_->publish(message);
   }
@@ -540,6 +613,11 @@ private:
   std::string pose_topic_;
   std::string goal_topic_;
   std::string frame_id_;
+  std::string snapshot_topic_;
+  bool accepted_goal_exact_{false}, accepted_goal_terminal_{false};
+  std::int64_t pose_stamp_{}, pose_generation_{}, pose_map_stamp_{};
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr snapshot_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr path_snapshot_pub_;
   double voxel_size_{};
   double robot_radius_{};
   double safety_margin_{};

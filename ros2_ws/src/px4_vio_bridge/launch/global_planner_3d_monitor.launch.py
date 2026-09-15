@@ -23,6 +23,7 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from px4_vio_bridge.log_paths import timestamped_bag
+from px4_vio_bridge.process_monitor import NATIVE_3D_TARGETS
 
 
 def typed(name, value_type):
@@ -62,6 +63,9 @@ def generate_launch_description():
         DeclareLaunchArgument("simulate", default_value="false"),
         DeclareLaunchArgument("fixture_resolution", default_value="0.10"),
         DeclareLaunchArgument("fixture_loop_correction_after", default_value="5.0"),
+        DeclareLaunchArgument("pose_snapshot_topic", default_value=""),
+        DeclareLaunchArgument("vio_frame_id", default_value="continuous_vio"),
+        DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("pose_topic", default_value="/rtabmap/pose"),
         DeclareLaunchArgument("goal_topic", default_value="/waypoint/clicked"),
         DeclareLaunchArgument("frame_id", default_value="world"),
@@ -97,11 +101,14 @@ def generate_launch_description():
         DeclareLaunchArgument("foxglove", default_value="false"),
         DeclareLaunchArgument("foxglove_port", default_value="8765"),
         DeclareLaunchArgument("record_bag", default_value="false"),
+        DeclareLaunchArgument("process_monitor", default_value="true"),
         DeclareLaunchArgument(
             "bag_output", default_value=timestamped_bag("global_planner_3d_monitor")
         ),
     ]
     parameters = [{
+        "use_sim_time": typed("use_sim_time", bool),
+        "pose_snapshot_topic": typed("pose_snapshot_topic", str),
         "map_topic": LaunchConfiguration("map_topic"),
         "map_metadata_topic": LaunchConfiguration("map_metadata_topic"),
         "require_map_metadata": True,
@@ -142,6 +149,7 @@ def generate_launch_description():
         emulate_tty=True,
         condition=IfCondition(LaunchConfiguration("octomap_producer")),
         parameters=[{
+            "use_sim_time": typed("use_sim_time", bool),
             "map_data_topic": LaunchConfiguration("map_data_topic"),
             "frame_id": LaunchConfiguration("frame_id"),
             "max_marker_voxels": typed("max_marker_voxels", int),
@@ -155,6 +163,11 @@ def generate_launch_description():
         emulate_tty=True,
         condition=IfCondition(LaunchConfiguration("route_follower")),
         parameters=[{
+            "use_sim_time": typed("use_sim_time", bool),
+            "pose_snapshot_topic": typed("pose_snapshot_topic", str),
+            "vio_frame_id": LaunchConfiguration("vio_frame_id"),
+            "map_timeout": typed("map_timeout", float),
+            "pose_timeout": typed("pose_timeout", float),
             "frame_id": LaunchConfiguration("frame_id"),
             "map_topic": LaunchConfiguration("map_topic"),
             "map_metadata_topic": LaunchConfiguration("map_metadata_topic"),
@@ -188,6 +201,7 @@ def generate_launch_description():
         output="screen",
         condition=IfCondition(LaunchConfiguration("simulate")),
         parameters=[{
+            "raw_frame_id": LaunchConfiguration("vio_frame_id"),
             "resolution": typed("fixture_resolution", float),
             "loop_correction_after": typed("fixture_loop_correction_after", float),
         }],
@@ -197,6 +211,8 @@ def generate_launch_description():
             "ros2", "bag", "record", "--storage", "mcap",
             "--storage-preset-profile", "fastwrite",
             "--disable-keyboard-controls", "--topics",
+            "/clock", "/tf", "/tf_static", "/rtabmap/vio_odometry",
+            "/planner3d/pose_snapshot", "/planner3d/pose_status", "/planner3d/path_snapshot",
             "/rtabmap/mapData", "/rtabmap/octomap", "/rtabmap/octomap_metadata",
             "/rtabmap/octomap_markers",
             "/rtabmap/octomap_ground_markers", "/rtabmap/octomap_obstacle_markers",
@@ -204,11 +220,16 @@ def generate_launch_description():
             "/rtabmap/odom_correction", "/waypoint/clicked",
             "/planner3d/path", "/planner3d/candidate_path",
             "/planner3d/status", "/planner3d/markers",
+            "/planner3d/test_start_clear",
             "/planner3d/map_generation", "/planner3d/path_map_generation",
             "/planner3d/follower/displacement", "/planner3d/follower/velocity",
             "/planner3d/follower/acceleration", "/planner3d/follower/carrot",
             "/planner3d/follower/lookahead", "/planner3d/follower/valid",
             "/planner3d/follower/goal_reached", "/planner3d/follower/status",
+            "/perf/cpu_percent", "/perf/mem_percent", "/perf/cpu_temp_c",
+            "/perf/load1", "/perf/throttled", "/perf/processes",
+            *[f"/perf/process/{label}/{metric}" for label in NATIVE_3D_TARGETS
+              for metric in ("cpu_percent", "mem_mb")],
             "--output", LaunchConfiguration("bag_output"),
         ],
         output="screen",
@@ -227,8 +248,8 @@ def generate_launch_description():
             "port": LaunchConfiguration("foxglove_port"),
             "topic_whitelist": (
                 "['^/tf(_static)?$', "
-                "'^/rtabmap/(octomap_(ground_|obstacle_)?markers|octomap_metadata|pose|vio_pose|odom_correction)$', "
-                "'^/planner3d/.*$', '^/waypoint/clicked$']"
+                "'^/rtabmap/(octomap_(ground_|obstacle_)?markers|octomap_metadata|pose|vio_pose|vio_odometry|odom_correction)$', "
+                "'^/planner3d/.*$', '^/perf/.*$', '^/waypoint/clicked$']"
             ),
             "service_whitelist": "['^$']",
             "param_whitelist": "['^$']",
@@ -248,6 +269,10 @@ def generate_launch_description():
         RegisterEventHandler(OnProcessExit(target_action=follower, on_exit=required_node_exited)),
         RegisterEventHandler(OnProcessExit(target_action=recorder, on_exit=recorder_exited)),
         recorder,
+        Node(package="px4_vio_bridge", executable="process_monitor", output="screen",
+             condition=IfCondition(LaunchConfiguration("process_monitor")),
+             parameters=[PathJoinSubstitution([FindPackageShare("px4_vio_bridge"),
+                         "config", "planner3d_process_monitor.yaml"])]),
         foxglove,
         producer,
         fixture,

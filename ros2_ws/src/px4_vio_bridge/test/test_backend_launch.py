@@ -22,11 +22,12 @@ def test_pi_backend_library_loading_from_already_sourced_shell(source_count):
         'source /home/john/autonomous_drone_px4_vio/ros2_ws/install/setup.bash && '
     )
     result = subprocess.run(
-        ['bash', '-c', preamble * source_count + 'exec bash "$1" --check-environment',
+        ['bash', '-c', preamble * source_count + 'export ROS_DOMAIN_ID=178; exec bash "$1" --check-environment',
          'backend-env-test', str(ROOT/'scripts'/'ros_rtabmap_backend')],
         capture_output=True, text=True, timeout=25)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'environment verified (no graph started)' in result.stdout
+    assert 'ROS_DOMAIN_ID=178' in result.stdout
 
 
 def load(name):
@@ -82,3 +83,54 @@ def test_foxglove_exposes_ros_octomap_and_raw_odometry():
     assert any(re.fullmatch(p, '/foxglove/camera/image/compressed') for p in patterns)
     for topic in ['/oak/left/image_rect', '/oak/left/image_rect/compressed']:
         assert not any(re.fullmatch(p, topic) for p in patterns)
+
+
+def test_ros_navigation_monitor_uses_one_map_producer_and_atomic_body_pose():
+    ld = load('ros_planner_3d_monitor.launch.py')
+    monitor = next(a for a in ld.entities if isinstance(a, IncludeLaunchDescription))
+    args = dict(monitor.launch_arguments)
+    assert args['octomap_producer'] == 'false'
+    assert args['pose_snapshot_topic'] == '/planner3d/pose_snapshot'
+    assert args['vio_frame_id'] == 'rtabmap_odom'
+    defaults = {a.name: a for a in ld.entities if isinstance(a, DeclareLaunchArgument)}
+    context = LaunchContext()
+    defaults['start_backend'].execute(context)
+    assert context.launch_configurations['start_backend'] == 'false'
+    assert not any('offboard' in str(a) for a in ld.entities)
+
+
+def test_test_clear_requires_owned_backend_and_is_disabled_by_default():
+    from launch.actions import OpaqueFunction
+    ld = load('ros_planner_3d_monitor.launch.py')
+    context = LaunchContext()
+    for action in ld.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    validate = next(a for a in ld.entities if isinstance(a, OpaqueFunction))
+    assert context.launch_configurations['test_start_clear_radius'] == '0.0'
+    validate.execute(context)
+    context.launch_configurations['test_start_clear_radius'] = '0.5'
+    with pytest.raises(RuntimeError, match='requires start_backend'):
+        validate.execute(context)
+    context.launch_configurations['start_backend'] = 'true'
+    validate.execute(context)
+    for radius in ('0.6', '-0.1', 'nan'):
+        context.launch_configurations['test_start_clear_radius'] = radius
+        with pytest.raises(RuntimeError, match='between 0 and 0.5'):
+            validate.execute(context)
+
+
+def test_3d_recording_includes_cpu_and_artificial_start_evidence():
+    from launch.utilities import perform_substitutions
+    ld = load('global_planner_3d_monitor.launch.py')
+    context = LaunchContext()
+    for action in ld.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    assert context.launch_configurations['process_monitor'] == 'true'
+    recorder = next(a for a in ld.entities if type(a) is ExecuteProcess)
+    command = [perform_substitutions(context, part) for part in recorder.cmd]
+    for topic in ('/perf/processes', '/perf/cpu_percent', '/perf/throttled',
+                  '/perf/process/rtabmap_octomap_node/cpu_percent',
+                  '/perf/process/cpp_astar_planner_3d/cpu_percent', '/planner3d/test_start_clear'):
+        assert topic in command

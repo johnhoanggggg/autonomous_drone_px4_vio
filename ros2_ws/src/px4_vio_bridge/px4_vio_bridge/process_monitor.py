@@ -74,6 +74,32 @@ DEFAULT_TARGETS = {
     "px4_pos": "px4_local_position_to_ros",
 }
 
+# The observation-only native 3D graph has a different process topology from
+# the flight/2D graph above.  Keep this list deliberately small and bounded:
+# composable camera+odometry, an optional separate mapper container, the
+# OctoMap converter, the three native planner nodes, recorder, and Foxglove.
+# Container names are part of the ROS process command line (``__node``), while
+# installed executable paths distinguish nodes from their ros2 launch parent.
+NATIVE_3D_TARGETS = {
+    "oak_container": "component_container --ros-args -r __node:=oak_container",
+    "mapper_container": (
+        "component_container --ros-args -r __node:=rtabmap_mapper_container"
+    ),
+    "rtabmap_octomap_node": "lib/px4_vio_bridge/rtabmap_octomap_node",
+    "cpp_ros_planner_pose": "lib/px4_vio_bridge/cpp_ros_planner_pose",
+    "cpp_astar_planner_3d": "lib/px4_vio_bridge/cpp_astar_planner_3d",
+    "cpp_route_follower_3d": "lib/px4_vio_bridge/cpp_route_follower_3d",
+    "bag_record": "ros2 bag record",
+    # Match the installed bridge executable, rather than the package name:
+    # ros2 launch command lines include ``foxglove_bridge_launch.xml`` too.
+    "foxglove": "lib/foxglove_bridge/foxglove_bridge",
+}
+
+TARGET_PROFILES = {
+    "default": DEFAULT_TARGETS,
+    "native_3d": NATIVE_3D_TARGETS,
+}
+
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
 
 
@@ -103,6 +129,37 @@ def match_label(cmdline, pattern):
     return all(token in cmdline for token in pattern.split())
 
 
+def resolve_targets(profile, labels, patterns):
+    """Resolve a profile and explicit label/pattern parameters.
+
+    ROS parameters always provide the built-in default labels and patterns, so
+    a non-default profile replaces those values while still allowing callers
+    to provide a fully custom list.  Keeping this policy pure makes profile
+    selection testable without starting a ROS node.
+    """
+    try:
+        profile_targets = TARGET_PROFILES[profile]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown target_profile {profile!r}; choose one of "
+            f"{', '.join(sorted(TARGET_PROFILES))}"
+        ) from exc
+    labels = [str(x) for x in labels]
+    patterns = [str(x) for x in patterns]
+    if profile != "default" and labels == sorted(DEFAULT_TARGETS) and patterns == [
+        DEFAULT_TARGETS[k] for k in sorted(DEFAULT_TARGETS)
+    ]:
+        labels = sorted(profile_targets)
+        patterns = [profile_targets[k] for k in labels]
+    if len(labels) != len(patterns):
+        raise ValueError("labels and patterns must have the same length")
+    if len(set(labels)) != len(labels):
+        raise ValueError("labels must be unique")
+    if any(not pattern for pattern in patterns):
+        raise ValueError("patterns must not be empty")
+    return dict(zip(labels, patterns))
+
+
 class ProcessMonitor(Node):
     def __init__(self):
         super().__init__("process_monitor")
@@ -112,6 +169,7 @@ class ProcessMonitor(Node):
         # we publish. Between scans the cached handles are reused, which is
         # also what makes psutil's per-object cpu_percent() meaningful.
         self.declare_parameter("scan_period", 5.0)
+        self.declare_parameter("target_profile", "default")
         self.declare_parameter("labels", sorted(DEFAULT_TARGETS))
         self.declare_parameter("patterns", [DEFAULT_TARGETS[k] for k in sorted(DEFAULT_TARGETS)])
         self.declare_parameter("include_self", False)
@@ -119,11 +177,12 @@ class ProcessMonitor(Node):
 
         self.publish_period = float(self.get_parameter("publish_period").value)
         self.scan_period = float(self.get_parameter("scan_period").value)
-        labels = [str(x) for x in self.get_parameter("labels").value]
-        patterns = [str(x) for x in self.get_parameter("patterns").value]
-        if len(labels) != len(patterns):
-            raise ValueError("labels and patterns must have the same length")
-        self.targets = dict(zip(labels, patterns))
+        profile = str(self.get_parameter("target_profile").value)
+        self.targets = resolve_targets(
+            profile,
+            self.get_parameter("labels").value,
+            self.get_parameter("patterns").value,
+        )
         self.include_self = bool(self.get_parameter("include_self").value)
         self.use_vcgencmd = bool(self.get_parameter("vcgencmd").value)
 
@@ -164,12 +223,13 @@ class ProcessMonitor(Node):
                 "Install with: sudo apt install python3-psutil"
             )
         else:
-            psutil.cpu_percent(None)  # prime the machine-wide counter
+            psutil.cpu_percent(None)  # prime machine-wide and per-core counters
+            psutil.cpu_percent(None, percpu=True)
             self.scan()
 
         self.create_timer(self.publish_period, self.tick)
         self.get_logger().info(
-            f"process_monitor: {len(self.targets)} labels "
+            f"process_monitor: profile {profile!r}, {len(self.targets)} labels "
             f"({', '.join(sorted(self.targets))}) on {self.cores} cores, "
             f"publish {self.publish_period:.1f}s / scan {self.scan_period:.1f}s"
         )

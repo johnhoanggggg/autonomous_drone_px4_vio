@@ -113,7 +113,11 @@ public:
     double max_connector_error = 0.20,
     double suffix_tolerance = 0.01,
     bool corner_blending = false,
-    double junction_deviation = 0.05);
+    double junction_deviation = 0.05,
+    /// When true, every published velocity is the exact command-point secant
+    /// and its full vector change is acceleration bounded. Polyline corners
+    /// become stops; future fillets must be clearance checked before use.
+    bool strict_vector_limits = false);
 
   void clear();
   [[nodiscard]] Snapshot snapshot() const;
@@ -198,13 +202,18 @@ private:
     std::shared_ptr<const Polyline> path, PathFingerprint fingerprint);
   [[nodiscard]] std::optional<double> shared_suffix_offset(const Polyline & new_path) const;
   void install(std::shared_ptr<const PathInstallation> installation, double progress);
-  Point2 update_join(double dt, bool advance, double ceiling);
+  Point2 update_join(
+    const Point2 & desired_point, double dt, bool advance, double ceiling);
   /// The on-path speed for this tick, shared by the advance and the join so a
   /// lane change is braked by corners and the path end exactly as motion is.
-  double along_path_speed(double along, double dt, bool advance, double ceiling);
+  double along_path_speed(
+    double along, double desired_progress, double dt, bool advance, double ceiling);
   /// `max_speed_`, or the caller's lower ceiling for this tick.
   [[nodiscard]] double speed_ceiling(std::optional<double> speed_cap) const;
   [[nodiscard]] Point2 path_tangent(double along) const;
+  [[nodiscard]] Point2 segment_tangent(double along) const;
+  [[nodiscard]] double strict_progress(
+    double target_progress, double dt, const Point2 & old_position) const;
   /// Direction over the upcoming route horizon (point tangent at zero).
   [[nodiscard]] std::optional<Point2> advance_tangent(double lookahead) const;
   [[nodiscard]] double next_motion_target(double desired_progress) const;
@@ -236,6 +245,10 @@ private:
   /// and 0.048 m on 20260906T120129Z and T120238Z -- nothing changes.
   bool corner_blending_;
   double junction_deviation_;
+  /// Preserve exact path secants and bound the full velocity vector. Sharp
+  /// corners stop in this mode; rounded, clearance-checked geometry can be
+  /// added later without weakening this invariant.
+  bool strict_vector_limits_;
 
   std::shared_ptr<const PathInstallation> installation_;
   double progress_{0.0};

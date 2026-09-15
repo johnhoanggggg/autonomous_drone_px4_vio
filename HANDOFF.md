@@ -1,5 +1,9 @@
 # Autonomous Drone PX4 VIO — Handoff
 
+> **After the 12:56/12:57 flights:** [follow-up change and evidence](CLUTTER_TRACKING_FOLLOWUP_20260913.md). Strict command steps are confirmed bounded in both bags. Fixed retreating-target braking/rejoin rejection; physical wallward drift starts before that rejection and remains a validation concern. Same C++ flight launch selects the rebuilt code after restart.
+
+> **Latest clutter-flight work, 2026-09-13:** [implementation, evidence and validation](CLUTTER_TRACKING_FIX_20260913.md). C++ global adapter enables strict vector command limits and stops at unrounded corners. Weak physical braking remains unresolved; no further gain or tolerance changes. Added estimator diagnostic logging is loaded. Props-off confirmation remains pending before any motor test.
+
 Authoritative current-state doc. Full chronological history is in `HANDOFF_ARCHIVE.md`
 (kept for forensics; some of it is superseded — trust this file).
 
@@ -9,6 +13,13 @@ built, never armed, and parked), and `HANDOFF_GLOBAL_PLANNER.md` (global A*
 monitor — built and simulator-verified, not wired to PX4).
 
 Last updated: 2026-08-04.
+
+> **Timing trial update, 2026-09-13:**
+> [EV_DELAY_TRIAL_20260913.md](EV_DELAY_TRIAL_20260913.md) supersedes the older
+> `EKF2_EV_DELAY=270 ms` setting below. Saved 225 ms after four recent native-VIO
+> flight logs measured 205–230 ms against onboard gyro. Gains remain unchanged.
+> Power-cycle before the next lateral-stop validation; no flight improvement
+> has yet been demonstrated. Older sections below retain their historical context.
 
 ## What this project is
 

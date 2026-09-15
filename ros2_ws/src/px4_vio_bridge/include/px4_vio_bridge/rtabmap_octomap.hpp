@@ -15,6 +15,10 @@
 namespace px4_vio_bridge
 {
 
+// Deep clone without the upstream custom-node copy constructor slicing children.
+std::unique_ptr<rtabmap::RtabmapColorOcTree> clone_rtabmap_tree(
+  const rtabmap::RtabmapColorOcTree & source);
+
 struct LocalGridObservation
 {
   int node_id{};
@@ -66,6 +70,13 @@ public:
   [[nodiscard]] const rtabmap::RtabmapColorOcTree * tree() const;
   [[nodiscard]] const OctomapBuildMetadata & metadata() const {return metadata_;}
 
+  // Keep one exact map checkpoint so a transient newest node can be removed
+  // by restoring the stable prefix and replaying only newer observations.
+  // This is enabled by default and can be disabled for A/B replay.
+  void set_use_checkpoints(bool enabled);
+  [[nodiscard]] std::size_t checkpoint_restores() const {return checkpoint_restores_;}
+  [[nodiscard]] std::size_t full_rebuilds() const {return full_rebuilds_;}
+
   [[nodiscard]] static std::uint64_t pose_generation(
     const std::map<int, rtabmap::Transform> & optimized_poses);
 
@@ -74,12 +85,25 @@ private:
     const std::map<int, rtabmap::Transform> & optimized_poses,
     std::string * error);
 
+  void invalidate_checkpoint();
+  bool capture_checkpoint();
+  bool can_restore_checkpoint(
+    const std::map<int, rtabmap::Transform> & optimized_poses) const;
+
   rtabmap::LocalGridCache cache_;
   std::unique_ptr<rtabmap::OctoMap> octomap_;
   OctomapBuildMetadata metadata_;
   float resolution_{};
   float pose_update_tolerance_m_{};
   float pose_update_tolerance_rad_{};
+  std::unique_ptr<rtabmap::RtabmapColorOcTree> checkpoint_tree_;
+  std::map<int, rtabmap::Transform> checkpoint_poses_;
+  double checkpoint_min_[3]{};
+  double checkpoint_max_[3]{};
+  bool checkpoint_valid_{false};
+  bool use_checkpoints_{true};
+  std::size_t checkpoint_restores_{};
+  std::size_t full_rebuilds_{};
 };
 
 }  // namespace px4_vio_bridge

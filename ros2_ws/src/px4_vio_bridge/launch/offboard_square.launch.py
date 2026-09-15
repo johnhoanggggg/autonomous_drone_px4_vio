@@ -89,6 +89,16 @@ def generate_launch_description():
         DeclareLaunchArgument("turn_settle_time", default_value="1.0"),
         DeclareLaunchArgument("leg_timeout_margin", default_value="6.0"),
         DeclareLaunchArgument("turn_timeout_margin", default_value="4.0"),
+        DeclareLaunchArgument("use_loop_corrections", default_value="false"),
+        DeclareLaunchArgument(
+            "correction_topic", default_value="/rtabmap/odom_correction"
+        ),
+        DeclareLaunchArgument("map_pose_topic", default_value="/rtabmap/body_pose"),
+        DeclareLaunchArgument("correction_timeout", default_value="1.0"),
+        DeclareLaunchArgument("map_pose_timeout", default_value="1.0"),
+        DeclareLaunchArgument("max_correction_m", default_value="0.50"),
+        DeclareLaunchArgument("max_correction_yaw_deg", default_value="15.0"),
+        DeclareLaunchArgument("loop_command_tolerance", default_value="0.02"),
         DeclareLaunchArgument("velocity_feedforward", default_value="false"),
         DeclareLaunchArgument("transit_horizontal_error", default_value="0.60"),
         DeclareLaunchArgument("transit_settle_time", default_value="1.0"),
@@ -146,6 +156,18 @@ def generate_launch_description():
                 "turn_settle_time": typed("turn_settle_time", float),
                 "leg_timeout_margin": typed("leg_timeout_margin", float),
                 "turn_timeout_margin": typed("turn_timeout_margin", float),
+                "use_loop_corrections": typed("use_loop_corrections", bool),
+                "correction_topic": typed("correction_topic", str),
+                "map_pose_topic": typed("map_pose_topic", str),
+                "correction_timeout": typed("correction_timeout", float),
+                "map_pose_timeout": typed("map_pose_timeout", float),
+                "max_correction_m": typed("max_correction_m", float),
+                "max_correction_yaw_deg": typed(
+                    "max_correction_yaw_deg", float
+                ),
+                "loop_command_tolerance": typed(
+                    "loop_command_tolerance", float
+                ),
                 "velocity_feedforward": typed("velocity_feedforward", bool),
                 "transit_horizontal_error": typed(
                     "transit_horizontal_error", float

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cmath>
 #include <map>
 #include <vector>
 
@@ -47,6 +49,74 @@ bool occupied(const rtabmap::RtabmapColorOcTree & tree, float x, float y, float 
 {
   const auto * node = tree.search(x, y, z);
   return node != nullptr && tree.isNodeOccupied(node);
+}
+
+struct LeafState
+{
+  std::array<unsigned short, 3> key{};
+  unsigned depth{};
+  float log_odds{};
+  int node_ref{};
+  int occupancy_type{};
+  std::array<float, 3> point_ref{};
+  std::array<unsigned char, 3> color{};
+
+  bool operator==(const LeafState & other) const
+  {
+    return key == other.key && depth == other.depth && log_odds == other.log_odds &&
+           node_ref == other.node_ref && occupancy_type == other.occupancy_type &&
+           point_ref == other.point_ref && color == other.color;
+  }
+};
+
+std::vector<LeafState> leaf_states(const rtabmap::RtabmapColorOcTree & tree)
+{
+  std::vector<LeafState> states;
+  for (auto leaf = tree.begin_leafs(), end = tree.end_leafs(); leaf != end; ++leaf) {
+    const auto point = leaf->getPointRef();
+    const auto color = leaf->getColor();
+    LeafState state;
+    state.key = {leaf.getKey()[0], leaf.getKey()[1], leaf.getKey()[2]};
+    state.depth = leaf.getDepth();
+    state.log_odds = leaf->getLogOdds();
+    state.node_ref = leaf->getNodeRefId();
+    state.occupancy_type = leaf->getOccupancyType();
+    state.point_ref = {point.x(), point.y(), point.z()};
+    state.color = {color.r, color.g, color.b};
+    states.push_back(state);
+  }
+  return states;
+}
+
+void expect_same_tree(
+  const rtabmap::RtabmapColorOcTree & expected,
+  const rtabmap::RtabmapColorOcTree & actual)
+{
+  const auto expected_leaves = leaf_states(expected);
+  const auto actual_leaves = leaf_states(actual);
+  ASSERT_EQ(actual_leaves.size(), expected_leaves.size());
+  for (std::size_t index = 0; index < expected_leaves.size(); ++index) {
+    EXPECT_EQ(actual_leaves[index].key, expected_leaves[index].key);
+    EXPECT_EQ(actual_leaves[index].depth, expected_leaves[index].depth);
+    EXPECT_FLOAT_EQ(actual_leaves[index].log_odds, expected_leaves[index].log_odds);
+    EXPECT_EQ(actual_leaves[index].node_ref, expected_leaves[index].node_ref);
+    EXPECT_EQ(actual_leaves[index].occupancy_type, expected_leaves[index].occupancy_type);
+    EXPECT_EQ(actual_leaves[index].point_ref, expected_leaves[index].point_ref);
+    EXPECT_EQ(actual_leaves[index].color, expected_leaves[index].color);
+  }
+
+  double expected_min[3];
+  double expected_max[3];
+  double actual_min[3];
+  double actual_max[3];
+  expected.getMetricMin(expected_min[0], expected_min[1], expected_min[2]);
+  expected.getMetricMax(expected_max[0], expected_max[1], expected_max[2]);
+  actual.getMetricMin(actual_min[0], actual_min[1], actual_min[2]);
+  actual.getMetricMax(actual_max[0], actual_max[1], actual_max[2]);
+  for (int axis = 0; axis < 3; ++axis) {
+    EXPECT_DOUBLE_EQ(actual_min[axis], expected_min[axis]);
+    EXPECT_DOUBLE_EQ(actual_max[axis], expected_max[axis]);
+  }
 }
 
 }  // namespace
@@ -179,6 +249,198 @@ TEST(RtabmapOctomap, IncrementalUpdateRebuildsAfterPureRotationCorrection)
   ASSERT_TRUE(assembler.update({observation}, poses, 0.01F, 0.01F, &error)) << error;
   EXPECT_FALSE(occupied(*assembler.tree(), 1.0F, 0.0F, 0.5F));
   EXPECT_TRUE(occupied(*assembler.tree(), 0.0F, 1.0F, 0.5F));
+}
+
+TEST(RtabmapOctomap, PureRollCorrectionRebuildsMap)
+{
+  p::RtabmapOctomapAssembler assembler;
+  p::LocalGridObservation observation;
+  observation.node_id = 1;
+  observation.cell_size = 0.1F;
+  observation.obstacles = points({{1.0F, 0.0F, 0.5F}});
+  std::map<int, rtabmap::Transform> poses{{1, rtabmap::Transform::getIdentity()}};
+  std::string error;
+  ASSERT_TRUE(assembler.update({observation}, poses, 0.01F, 0.01F, &error)) << error;
+  poses.at(1) = rtabmap::Transform(0.0F, 0.0F, 0.0F, 1.5707963F, 0.0F, 0.0F);
+  ASSERT_TRUE(assembler.update({observation}, poses, 0.01F, 0.01F, &error)) << error;
+  EXPECT_FALSE(occupied(*assembler.tree(), 1.0F, 0.0F, 0.5F));
+  EXPECT_TRUE(occupied(*assembler.tree(), 1.0F, -0.5F, 0.0F));
+  EXPECT_EQ(assembler.full_rebuilds(), 2U);
+}
+
+TEST(RtabmapOctomap, CheckpointRemovalMatchesCompleteRebuildIncludingBounds)
+{
+  p::LocalGridObservation first;
+  first.node_id = 1;
+  first.cell_size = 0.1F;
+  first.view_point = {0.0F, 0.0F, 0.5F};
+  first.obstacles = points({{0.0F, 0.0F, 0.5F}});
+  first.empty = points({{0.2F, 0.0F, 0.5F}});
+  p::LocalGridObservation second = first;
+  second.node_id = 2;
+  second.obstacles = points({{0.0F, 0.0F, 0.5F}});
+  p::LocalGridObservation transient = first;
+  transient.node_id = 3;
+  transient.obstacles = points({{0.0F, 0.0F, 0.5F}});
+  p::LocalGridObservation replacement = transient;
+  replacement.node_id = 4;
+  replacement.obstacles = points({{0.0F, 0.0F, 0.5F}});
+
+  p::RtabmapOctomapAssembler optimized;
+  p::RtabmapOctomapAssembler complete_rebuild;
+  complete_rebuild.set_use_checkpoints(false);
+  std::string optimized_error;
+  std::string complete_error;
+  const auto tolerance_m = 0.01F;
+  const auto tolerance_rad = 0.01F;
+  std::map<int, rtabmap::Transform> poses{{1, rtabmap::Transform::getIdentity()}};
+  ASSERT_TRUE(optimized.update({first}, poses, tolerance_m, tolerance_rad, &optimized_error))
+    << optimized_error;
+  ASSERT_TRUE(complete_rebuild.update({first}, poses, tolerance_m, tolerance_rad, &complete_error))
+    << complete_error;
+
+  poses.emplace(2, rtabmap::Transform(1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F));
+  ASSERT_TRUE(optimized.update({first, second}, poses, tolerance_m, tolerance_rad, &optimized_error))
+    << optimized_error;
+  ASSERT_TRUE(complete_rebuild.update({first, second}, poses, tolerance_m, tolerance_rad, &complete_error))
+    << complete_error;
+  poses.emplace(3, rtabmap::Transform(2.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F));
+  ASSERT_TRUE(optimized.update({first, second, transient}, poses, tolerance_m, tolerance_rad, &optimized_error))
+    << optimized_error;
+  ASSERT_TRUE(complete_rebuild.update({first, second, transient}, poses, tolerance_m, tolerance_rad, &complete_error))
+    << complete_error;
+
+  // Node 3 disappears without a replacement observation. The checkpoint is
+  // the exact prefix containing nodes 1 and 2, so this update must restore it
+  // and leave no occupied or free evidence contributed only by node 3.
+  poses.erase(3);
+  ASSERT_TRUE(optimized.update({first, second, transient}, poses, tolerance_m, tolerance_rad, &optimized_error))
+    << optimized_error;
+  ASSERT_TRUE(complete_rebuild.update({first, second, transient}, poses, tolerance_m, tolerance_rad, &complete_error))
+    << complete_error;
+  ASSERT_NE(optimized.tree(), nullptr);
+  ASSERT_NE(complete_rebuild.tree(), nullptr);
+  expect_same_tree(*complete_rebuild.tree(), *optimized.tree());
+  EXPECT_EQ(optimized.checkpoint_restores(), 1U);
+  EXPECT_EQ(complete_rebuild.checkpoint_restores(), 0U);
+  EXPECT_EQ(optimized.full_rebuilds(), 1U);
+  EXPECT_EQ(complete_rebuild.full_rebuilds(), 2U);
+
+  poses.emplace(4, rtabmap::Transform(3.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F));
+  ASSERT_TRUE(optimized.update(
+      {first, second, transient, replacement}, poses, tolerance_m, tolerance_rad,
+      &optimized_error)) << optimized_error;
+  ASSERT_TRUE(complete_rebuild.update(
+      {first, second, transient, replacement}, poses, tolerance_m, tolerance_rad,
+      &complete_error)) << complete_error;
+  expect_same_tree(*complete_rebuild.tree(), *optimized.tree());
+  EXPECT_TRUE(occupied(*optimized.tree(), 3.0F, 0.0F, 0.5F));
+}
+
+TEST(RtabmapOctomap, ReplacingNewestAndChangingStableGraphMatchesUncachedMap)
+{
+  p::RtabmapOctomapAssembler optimized, baseline;
+  baseline.set_use_checkpoints(false);
+  std::vector<p::LocalGridObservation> observations;
+  std::map<int, rtabmap::Transform> poses;
+  auto add = [&](int id, float x) {
+      p::LocalGridObservation grid;
+      grid.node_id = id; grid.cell_size = 0.1F; grid.view_point = {0.0F, 0.0F, 0.5F};
+      grid.ground = points({{0.3F, 0.0F, 0.0F}});
+      grid.obstacles = points({{0.6F, 0.0F, 0.5F}, {0.7F, 0.1F, 0.6F}});
+      grid.empty = points({{0.2F, 0.0F, 0.5F}, {0.3F, 0.1F, 0.6F}});
+      observations.push_back(grid);
+      poses[id] = rtabmap::Transform(x, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+    };
+  auto compare = [&]() {
+      std::string error;
+      ASSERT_TRUE(optimized.update(observations, poses, 0.01F, 0.01F, &error)) << error;
+      ASSERT_TRUE(baseline.update(observations, poses, 0.01F, 0.01F, &error)) << error;
+      expect_same_tree(*baseline.tree(), *optimized.tree());
+      p::RtabmapOctomapAssembler reference;
+      ASSERT_TRUE(reference.rebuild(observations, poses, &error)) << error;
+      expect_same_tree(*reference.tree(), *optimized.tree());
+      EXPECT_EQ(optimized.metadata().source_nodes, baseline.metadata().source_nodes);
+      EXPECT_EQ(optimized.metadata().source_pose_generation, baseline.metadata().source_pose_generation);
+    };
+  add(1, 0.0F); compare();
+  add(2, 0.4F); compare();
+  add(3, 0.8F); compare();
+  for (int id = 4; id <= 7; ++id) {
+    poses.erase(id - 1);
+    add(id, static_cast<float>(id) * 0.4F);
+    compare();
+  }
+  EXPECT_EQ(optimized.checkpoint_restores(), 4U);
+  EXPECT_EQ(optimized.full_rebuilds(), 1U);
+  EXPECT_EQ(baseline.full_rebuilds(), 5U);
+  // Removing persistent evidence cannot use the old prefix checkpoint.
+  poses.erase(1);
+  compare();
+  EXPECT_EQ(optimized.full_rebuilds(), 2U);
+  poses[2] = rtabmap::Transform(0.4F, 0.0F, 0.0F, 0.0F, 0.0F, 0.3F);
+  compare();
+  EXPECT_EQ(optimized.full_rebuilds(), 3U);
+  poses[2] = rtabmap::Transform(0.6F, 0.0F, 0.0F, 0.0F, 0.0F, 0.3F);
+  compare();
+  EXPECT_EQ(optimized.full_rebuilds(), 4U);
+}
+
+TEST(RtabmapOctomap, RebuildSeedsExactCheckpointAfterToleratedPoseChanges)
+{
+  p::LocalGridObservation observation;
+  observation.cell_size = 0.05F;
+  observation.obstacles = points({{1.0F, 0.0F, 0.5F}});
+  observation.empty = points({{0.6F, 0.0F, 0.5F}});
+  std::vector<p::LocalGridObservation> grids;
+  std::map<int, rtabmap::Transform> poses;
+  p::RtabmapOctomapAssembler optimized, baseline;
+  baseline.set_use_checkpoints(false);
+  std::string error;
+  for (int id = 1; id <= 7; ++id) {
+    observation.node_id = id;
+    grids.push_back(observation);
+    poses[id] = rtabmap::Transform(id * 0.2F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+    if (id == 3) {
+      poses.at(1) = rtabmap::Transform(0.203F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+    }
+    if (id >= 5) {poses.erase(id - 1);}
+    ASSERT_TRUE(optimized.update(grids, poses, 0.01F, 0.01F, &error)) << error;
+    ASSERT_TRUE(baseline.update(grids, poses, 0.01F, 0.01F, &error)) << error;
+    expect_same_tree(*optimized.tree(), *baseline.tree());
+  }
+  EXPECT_EQ(optimized.full_rebuilds(), 2U);
+  EXPECT_EQ(optimized.checkpoint_restores(), 2U);
+  EXPECT_EQ(baseline.full_rebuilds(), 4U);
+}
+
+TEST(RtabmapOctomap, LowerIdRetrievalFallsBackInsteadOfChangingRayOrder)
+{
+  p::RtabmapOctomapAssembler optimized, baseline;
+  baseline.set_use_checkpoints(false);
+  std::vector<p::LocalGridObservation> observations;
+  std::map<int, rtabmap::Transform> poses;
+  auto add = [&](int id) {
+      p::LocalGridObservation grid;
+      grid.node_id = id; grid.cell_size = 0.1F; grid.view_point = {0.0F, 0.0F, 0.5F};
+      grid.obstacles = points({{0.8F, 0.0F, 0.5F}});
+      grid.empty = points({{0.4F, 0.0F, 0.5F}});
+      observations.push_back(grid);
+      poses[id] = rtabmap::Transform(static_cast<float>(id) * 0.03F,
+        0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+    };
+  std::string error;
+  for (const int id : {10, 20, 30}) {
+    add(id);
+    ASSERT_TRUE(optimized.update(observations, poses, 0.01F, 0.01F, &error)) << error;
+    ASSERT_TRUE(baseline.update(observations, poses, 0.01F, 0.01F, &error)) << error;
+  }
+  poses.erase(30); add(5); add(31);
+  ASSERT_TRUE(optimized.update(observations, poses, 0.01F, 0.01F, &error)) << error;
+  ASSERT_TRUE(baseline.update(observations, poses, 0.01F, 0.01F, &error)) << error;
+  expect_same_tree(*baseline.tree(), *optimized.tree());
+  EXPECT_EQ(optimized.checkpoint_restores(), 0U);
+  EXPECT_EQ(optimized.full_rebuilds(), 2U);
 }
 
 TEST(RtabmapOctomap, PoseGenerationIsDeterministicAndOrderIndependent)

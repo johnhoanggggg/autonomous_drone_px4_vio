@@ -109,10 +109,9 @@ struct PlanResult3D
   double heuristic_weight = 1.0, double cost_weight = 2.0,
   double timeout_ms = 150.0);
 
-// Conservative continuous proof: the segment must remain in the map and may
-// not intersect any non-free voxel expanded by the spherical envelope. The
-// box expansion is conservative at voxel corners (safe, potentially rejecting
-// a geometrically valid chord).
+// Conservative continuous proof: the segment must remain in the map and its
+// minimum distance from every non-free voxel box must exceed the spherical
+// envelope radius. Unknown voxels are treated as non-free.
 [[nodiscard]] bool swept_sphere_clear(
   const VoxelGrid & raw, const Point3 & start, const Point3 & end,
   double radius);

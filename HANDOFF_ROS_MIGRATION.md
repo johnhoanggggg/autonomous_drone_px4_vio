@@ -1,5 +1,41 @@
 # ROS-native RTAB-Map Migration — Results Handoff
 
+## Latest waypoint follow-up — September 15 at 05:15
+
+The stationary test failed because its configured floor boundary clipped the
+35 cm drone envelope. Test bounds, per-click artificial-start anchoring, and
+explicit partial-route versus requested-goal completion are covered in
+[the latest diagnosis](WAYPOINT_START_DIAGNOSIS_20260915.md) and the top of the
+[3D handoff](HANDOFF_3D_NAVIGATION.md). This supersedes the startup-only anchor
+and earlier successful-goal interpretations below.
+
+## Planner continuation — September 15
+
+Latest follow-up: an optional 50 cm test-start sphere and default CPU recording
+are implemented. Checkpoint reuse reduces late wider-room map processing from
+344 ms to 85 ms median with identical binary maps. Final checks: 739 tests,
+zero failures. The stationary-start diagnostic passes an artificial-map route
+audit; live physical clearance remains unvalidated. See the
+[performance/test report](PLANNER3D_START_PERF_20260915.md) and top of the
+[3D handoff](HANDOFF_3D_NAVIGATION.md) for the next test command.
+
+Three earlier live carries have been assessed. None accepted a route.
+The latest bag has valid tracking but insufficient mapped start clearance,
+plus measured map lag from latest-node replacement/rebuilds and an input/TF
+timing spike. See [the carry assessment](CARRY_3D_ASSESSMENT_20260915.md) and
+the latest section of the 3D handoff; the earlier next-carry paragraph below
+describes the pre-carry state.
+
+The ROS-native OctoMap-to-3D-planner pose interface is now implemented and
+verified offline. See [the current 3D handoff](HANDOFF_3D_NAVIGATION.md) for
+launches, atomic pose/path contracts, regression results and the next props-off
+carry procedure. The new `ros_planner_3d_monitor.launch.py` can start the pinned
+ROS perception stack directly with `start_backend:=true`, with no PX4 publishers.
+A saved stationary camera replay produced 680 valid body snapshots and 37 map
+updates but correctly refused routes because the airframe start voxel was
+unknown. The next required user intervention is a live carry into scanned space.
+This does not qualify ROS visual odometry or the 3D follower for flight.
+
 ## Latest integration update — September 13: selectable ROS-to-PX4 mode
 
 Foxglove bandwidth follow-up: live compressed image traffic measured 24.424

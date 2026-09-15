@@ -81,7 +81,8 @@ int main()
     config.at("max_connector_error").get<double>(),
     config.at("suffix_tolerance").get<double>(),
     config.at("corner_blending").get<bool>(),
-    config.at("junction_deviation").get<double>());
+    config.at("junction_deviation").get<double>(),
+    config.value("strict_vector_limits", false));
   HorizontalCommandLimiter horizontal_limiter(
     config.at("max_speed").get<double>(),
     config.at("max_acceleration").get<double>());
@@ -102,6 +103,7 @@ int main()
     const auto op = step.at("op").get<std::string>();
     json result;
     result["op"] = op;
+    const auto before = path_limiter.snapshot();
     try {
       if (op == "set_path") {
         result["changed"] = path_limiter.set_path(
@@ -153,7 +155,9 @@ int main()
           step.value("advance", true),
           step.contains("reference") && !step.at("reference").is_null()
           ? std::optional<Point2>{point_of(step.at("reference"))}
-          : std::nullopt);
+          : std::nullopt,
+          step.contains("speed_cap") && !step.at("speed_cap").is_null()
+          ? std::optional<double>{step.at("speed_cap").get<double>()} : std::nullopt);
       } else if (op == "clear") {
         path_limiter.clear();
       } else if (op == "horizontal_reset") {
@@ -169,6 +173,11 @@ int main()
       }
       result["ok"] = true;
     } catch (const std::exception & error) {
+      // Match the flight adapter's rejected-command transaction in strict
+      // mode; legacy parity retains its historical exception behavior.
+      if (config.value("strict_vector_limits", false)) {
+        path_limiter.restore(before);
+      }
       result["ok"] = false;
       result["error"] = error.what();
     }

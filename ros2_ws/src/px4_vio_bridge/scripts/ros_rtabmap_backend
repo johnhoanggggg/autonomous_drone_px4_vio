@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Pi-specific isolated dependency setup. No arming/offboard node is created.
 set -eo pipefail
+# The Pi base environment sets domain 42; preserve an explicitly isolated replay domain.
+ros_backend_domain="${ROS_DOMAIN_ID:-42}"
 source /home/john/rtabmap_parity_0_21_12/base_ros_env.bash
 source /home/john/rtabmap_latest_frame_overlay/install/local_setup.bash
+export ROS_DOMAIN_ID="$ros_backend_domain"
 # setup.bash deduplicates paths without moving existing entries to the front.
 # In an already-sourced launch shell this can leave the unpacked (newer ABI)
 # messages ahead of our Jazzy rebuild. Explicitly prioritize the compatible
@@ -30,6 +33,7 @@ ctypes.CDLL('libdepthai_ros_msgs_v3__rosidl_typesupport_fastrtps_cpp.so')
 PY
 if [[ "${1:-}" == --check-environment ]]; then
   echo "ROS backend environment verified (no graph started)."
+  echo "ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
   exit 0
 fi
 export RTABMAP_CACHE_CAMERA_INFO=1

@@ -228,7 +228,232 @@ double speed_of(const px4_vio_bridge::PathCommandLimiter & limiter)
 {
   return std::hypot(limiter.velocity().first, limiter.velocity().second);
 }
+
+px4_vio_bridge::PathCommandLimiter strict_limiter()
+{
+  px4_vio_bridge::PathCommandLimiter limiter(
+    0.20, 0.30, 0.10, 0.05, 0.30, 0.20, 0.01, true, 0.05, true);
+  limiter.set_path({{0.0, 0.0}, {3.0, 0.0}}, {0.0, 0.0});
+  for (int tick = 0; tick < 40; ++tick) {
+    limiter.update({3.0, 0.0}, 0.05, true, limiter.position());
+  }
+  return limiter;
+}
 }  // namespace
+
+TEST(PathCommandLimiter, StrictModeBoundsSecantsAtSharpAndShallowCorners)
+{
+  for (const auto & path : {
+      std::vector<Point2>{{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}},
+      std::vector<Point2>{{0.0, 0.0}, {1.0, 0.0}, {1.98, 0.17}}})
+  {
+    PathCommandLimiter limiter(
+      0.20, 0.30, 0.10, 0.05, 0.30, 0.20, 0.01, true, 0.05, true);
+    ASSERT_TRUE(limiter.set_path(path, {0.0, 0.0}));
+    Point2 previous_velocity{0.0, 0.0};
+    bool saw_corner = false;
+    bool reached_end = false;
+    for (int tick = 0; tick < 1200; ++tick) {
+      const double dt = tick % 3 == 0 ? 0.02 : (tick % 3 == 1 ? 0.05 : 0.08);
+      limiter.update(path.back(), dt, true, limiter.position());
+      const auto velocity = limiter.velocity();
+      EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+        velocity.second - previous_velocity.second), 0.30 * dt + 1.0e-8);
+      previous_velocity = velocity;
+      if (limiter.waiting_vertex()) {
+        saw_corner = true;
+      }
+      if (limiter.snapshot().progress >= limiter.path()->length() - 1.0e-8) {
+        if (reached_end) {
+          break;
+        }
+        reached_end = true;
+      }
+      if (reached_end && speed_of(limiter) <= 1.0e-8) {
+        break;
+      }
+    }
+    EXPECT_TRUE(saw_corner);
+    EXPECT_GE(limiter.snapshot().progress, limiter.path()->length() - 1.0e-8);
+    EXPECT_LT(speed_of(limiter), 1.0e-8);
+  }
+}
+
+TEST(PathCommandLimiter, StrictModeDoesNotSnapAReplacementJoin)
+{
+  auto limiter = strict_limiter();
+  const auto before = *limiter.position();
+  ASSERT_TRUE(limiter.set_path(
+    {{0.0, 0.002}, {3.0, 0.002}}, {0.0, 0.002}));
+  EXPECT_TRUE(limiter.joining());
+  EXPECT_NEAR(limiter.position()->first, before.first, 1.0e-12);
+  EXPECT_NEAR(limiter.position()->second, before.second, 1.0e-12);
+}
+
+TEST(PathCommandLimiter, StrictModeTransitionsAChangedJoinTangent)
+{
+  auto limiter = strict_limiter();
+  const Point2 before = *limiter.position();
+  ASSERT_TRUE(limiter.set_path(
+    {{before.first, 0.0}, {before.first, 3.0}}, {before.first, 0.0}));
+  ASSERT_TRUE(limiter.joining()) << "a tangent change must use the bounded join";
+  Point2 previous_velocity = limiter.velocity();
+  for (int tick = 0; tick < 300 && limiter.joining(); ++tick) {
+    const double dt = tick % 2 == 0 ? 0.05 : 0.08;
+    limiter.update({before.first, 3.0}, dt, true, limiter.position());
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.30 * dt + 1.0e-8);
+    previous_velocity = velocity;
+  }
+  EXPECT_FALSE(limiter.joining());
+}
+
+TEST(PathCommandLimiter, StrictModeBoundsJoinThroughCompletionAndPause)
+{
+  auto limiter = strict_limiter();
+  ASSERT_TRUE(limiter.set_path(
+    {{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030}));
+  Point2 previous_velocity = limiter.velocity();
+  Point2 previous_position = *limiter.position();
+  for (int tick = 0; tick < 300; ++tick) {
+    const double dt = tick % 2 == 0 ? 0.05 : 0.08;
+    limiter.update({3.0, 0.030}, dt, tick < 80, limiter.position());
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.30 * dt + 1.0e-8);
+    EXPECT_NEAR((limiter.position()->first - previous_position.first) / dt,
+      velocity.first, 1.0e-8);
+    EXPECT_NEAR((limiter.position()->second - previous_position.second) / dt,
+      velocity.second, 1.0e-8);
+    previous_velocity = velocity;
+    previous_position = *limiter.position();
+    if (!limiter.joining() && tick > 80) {
+      break;
+    }
+  }
+  EXPECT_FALSE(limiter.joining());
+}
+
+TEST(PathCommandLimiter, StrictModeBrakesOnPathWhenTheRequestedPointRetreats)
+{
+  auto limiter = strict_limiter();
+  const double speed_before = speed_of(limiter);
+  const double progress_before = limiter.snapshot().progress;
+  ASSERT_GT(speed_before, 0.15);
+  Point2 previous_velocity = limiter.velocity();
+  Point2 previous_position = *limiter.position();
+  for (int tick = 0; tick < 30; ++tick) {
+    // First put the carrot just inside the stopping distance, then retreat it
+    // behind the command. Both requests must brake on the exact path rather
+    // than forcing a zero secant or allowing the join to cruise onward.
+    const Point2 target = tick == 0 ?
+      Point2{previous_position.first + 0.01, previous_position.second} :
+      Point2{0.0, 0.0};
+    ASSERT_NO_THROW(limiter.update(target, 0.05, true, limiter.position(), 0.03));
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.30 * 0.05 + 1.0e-8);
+    EXPECT_NEAR((limiter.position()->first - previous_position.first) / 0.05,
+      velocity.first, 1.0e-8);
+    EXPECT_NEAR((limiter.position()->second - previous_position.second) / 0.05,
+      velocity.second, 1.0e-8);
+    EXPECT_GE(limiter.snapshot().progress, 0.0);
+    previous_velocity = velocity;
+    previous_position = *limiter.position();
+    if (speed_of(limiter) <= 1.0e-8) {
+      break;
+    }
+  }
+  EXPECT_LE(speed_of(limiter), 1.0e-8);
+  EXPECT_LE(
+    limiter.snapshot().progress - progress_before,
+    speed_before * speed_before / (2.0 * 0.30) + speed_before * 0.05 + 1.0e-6);
+}
+
+TEST(PathCommandLimiter, StrictModeJoinHonorsARetreatedTarget)
+{
+  auto limiter = strict_limiter();
+  const double progress_before = limiter.snapshot().progress;
+  ASSERT_TRUE(limiter.set_path(
+    {{0.0, 0.030}, {3.0, 0.030}}, {0.0, 0.030}));
+  ASSERT_TRUE(limiter.joining());
+  Point2 previous_velocity = limiter.velocity();
+  for (int tick = 0; tick < 100; ++tick) {
+    ASSERT_NO_THROW(limiter.update({0.0, 0.0}, 0.05, true, limiter.position(), 0.03));
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.30 * 0.05 + 1.0e-8);
+    previous_velocity = velocity;
+  }
+  EXPECT_LE(speed_of(limiter), 1.0e-8);
+  EXPECT_LE(
+    limiter.snapshot().progress - progress_before,
+    0.20 * 0.20 / (2.0 * 0.30) + 0.20 * 0.05 + 1.0e-6);
+}
+
+TEST(PathCommandLimiter, StrictModeBrakesPastASoftTargetAcrossCollinearWaypoints)
+{
+  PathCommandLimiter limiter(
+    0.20, 0.30, 0.10, 0.05, 0.30, 0.20, 0.01, true, 0.05, true);
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.0}, {0.50, 0.0}, {2.0, 0.0}}, {0.0, 0.0}));
+  for (int tick = 0; tick < 51; ++tick) {
+    limiter.update({2.0, 0.0}, 0.05, true, limiter.position());
+  }
+  ASSERT_GT(speed_of(limiter), 0.19);
+  const auto start = *limiter.position();
+  // The soft carrot is only 1 mm ahead; the 0.50 m waypoint is straight,
+  // so braking must remain continuous through it rather than freeze there.
+  const Point2 target{start.first + 0.001, 0.0};
+  Point2 previous_velocity = limiter.velocity();
+  Point2 previous_position = start;
+  for (int tick = 0; tick < 30; ++tick) {
+    ASSERT_NO_THROW(limiter.update(target, 0.05, true, limiter.position()));
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.015 + 1.0e-8);
+    EXPECT_NEAR((limiter.position()->first - previous_position.first) / 0.05,
+      velocity.first, 1.0e-8);
+    EXPECT_NEAR(limiter.position()->second, 0.0, 1.0e-10);
+    previous_velocity = velocity;
+    previous_position = *limiter.position();
+  }
+  EXPECT_LE(speed_of(limiter), 1.0e-8);
+  EXPECT_GT(limiter.position()->first, 0.50);
+  EXPECT_LE(limiter.position()->first - start.first, 0.077);
+}
+
+TEST(PathCommandLimiter, StrictModeJitteredDtAndReplansReachTheRouteEnd)
+{
+  PathCommandLimiter limiter(
+    0.20, 0.30, 0.10, 0.05, 0.30, 0.20, 0.01, true, 0.05, true);
+  std::vector<Point2> path{{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}};
+  ASSERT_TRUE(limiter.set_path(path, {0.0, 0.0}));
+  Point2 previous_velocity{0.0, 0.0};
+  for (int tick = 0; tick < 1800; ++tick) {
+    // Replan a coordinate-shifted copy a few times, as the flight adapter does.
+    if (tick == 140 || tick == 520) {
+      const double shift = tick == 140 ? 0.002 : -0.002;
+      path = {{0.0, shift}, {1.0, shift}, {1.0, 1.0 + shift}};
+      ASSERT_TRUE(limiter.set_path(path, *limiter.position()));
+    }
+    const double dt = 0.02 + 0.01 * ((37 * tick + 11) % 7);
+    const Point2 reference = limiter.waiting_vertex() && tick % 5 < 3 ?
+      Point2{0.0, 2.0} : *limiter.position();
+    ASSERT_NO_THROW(limiter.update(path.back(), dt, true, reference));
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.30 * dt + 1.0e-8);
+    previous_velocity = velocity;
+    if (limiter.snapshot().progress >= limiter.path()->length() - 1.0e-8 &&
+      speed_of(limiter) <= 1.0e-8)
+    {
+      break;
+    }
+  }
+  ASSERT_GE(limiter.snapshot().progress, limiter.path()->length() - 1.0e-8);
+  EXPECT_LT(speed_of(limiter), 1.0e-8);
+}
 
 TEST(PathCommandLimiter, JoinKeepsMovingThroughAReplacementPath)
 {

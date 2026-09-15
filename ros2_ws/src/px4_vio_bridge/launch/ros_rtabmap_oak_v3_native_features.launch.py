@@ -17,6 +17,11 @@ def generate_launch_description():
         "start_camera": "true",
         "start_mapper": "true",
         "start_octomap": "true",
+        "test_start_clear_radius": "0.0",
+        "octomap_use_checkpoints": "true",
+        "camera_position_frd_x": "0.100",
+        "camera_position_frd_y": "-0.036",
+        "camera_position_frd_z": "0.056",
         "multithreaded_container": "false",
         # Mapping and OctoMap must not share the odometry executor on the Pi.
         "separate_mapper_container": "true",

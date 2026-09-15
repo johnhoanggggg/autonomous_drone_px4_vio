@@ -8,6 +8,7 @@
 #include <queue>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
 
 namespace px4_vio_bridge
 {
@@ -29,37 +30,180 @@ double voxel_distance(const Voxel & a, const Voxel & b)
   return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-// Slab test against an axis-aligned box. Expanding the voxel box in XYZ by a
-// sphere radius encloses the exact rounded Minkowski sum and is conservative.
-bool segment_intersects_box(
-  const Point3 & start, const Point3 & end, const Point3 & lower, const Point3 & upper)
+double point_box_distance_squared(
+  const Point3 & point, const Point3 & lower, const Point3 & upper)
 {
-  double t_min = 0.0;
-  double t_max = 1.0;
-  const std::array<double, 3> a{start.x, start.y, start.z};
-  const std::array<double, 3> b{end.x, end.y, end.z};
+  const std::array<double, 3> p{point.x, point.y, point.z};
   const std::array<double, 3> lo{lower.x, lower.y, lower.z};
   const std::array<double, 3> hi{upper.x, upper.y, upper.z};
+  double result = 0.0;
   for (std::size_t axis = 0; axis < 3; ++axis) {
-    const auto delta = b[axis] - a[axis];
-    if (std::abs(delta) < 1.0e-15) {
-      if (a[axis] < lo[axis] || a[axis] > hi[axis]) {
-        return false;
+    const auto delta = p[axis] < lo[axis] ? lo[axis] - p[axis] :
+      (p[axis] > hi[axis] ? p[axis] - hi[axis] : 0.0);
+    result += delta * delta;
+  }
+  return result;
+}
+
+// Squared Euclidean distance transform of a 1D line. Only finite entries are
+// sites; the lower envelope of their parabolas is evaluated in linear time.
+void squared_distance_transform_1d(
+  const std::vector<double> & input, std::vector<double> & output)
+{
+  const auto infinity = std::numeric_limits<double>::infinity();
+  output.assign(input.size(), infinity);
+  if (input.empty()) {return;}
+  std::vector<std::size_t> envelope(input.size());
+  std::vector<double> boundaries(input.size() + 1);
+  std::size_t first = 0;
+  while (first < input.size() && !std::isfinite(input[first])) {++first;}
+  if (first == input.size()) {return;}
+  std::size_t k = 0;
+  envelope[0] = first;
+  boundaries[0] = -infinity;
+  boundaries[1] = infinity;
+  for (std::size_t q = first + 1; q < input.size(); ++q) {
+    if (!std::isfinite(input[q])) {continue;}
+    double intersection =
+      ((input[q] + static_cast<double>(q) * static_cast<double>(q)) -
+      (input[envelope[k]] + static_cast<double>(envelope[k]) *
+      static_cast<double>(envelope[k]))) /
+      (2.0 * static_cast<double>(q) - 2.0 * static_cast<double>(envelope[k]));
+    while (k > 0 && intersection <= boundaries[k]) {
+      --k;
+      intersection =
+        ((input[q] + static_cast<double>(q) * static_cast<double>(q)) -
+        (input[envelope[k]] + static_cast<double>(envelope[k]) *
+        static_cast<double>(envelope[k]))) /
+        (2.0 * static_cast<double>(q) -
+        2.0 * static_cast<double>(envelope[k]));
+    }
+    ++k;
+    envelope[k] = q;
+    boundaries[k] = intersection;
+    boundaries[k + 1] = infinity;
+  }
+  k = 0;
+  for (std::size_t q = 0; q < input.size(); ++q) {
+    while (boundaries[k + 1] < static_cast<double>(q)) {++k;}
+    const auto difference = static_cast<double>(q) -
+      static_cast<double>(envelope[k]);
+    output[q] = difference * difference + input[envelope[k]];
+  }
+}
+
+std::vector<double> squared_distance_transform(const VoxelGrid & grid)
+{
+  const auto infinity = std::numeric_limits<double>::infinity();
+  std::vector<double> distances(grid.size(), infinity);
+  for (int z = 0; z < static_cast<int>(grid.depth()); ++z) {
+    for (int y = 0; y < static_cast<int>(grid.height()); ++y) {
+      for (int x = 0; x < static_cast<int>(grid.width()); ++x) {
+        const Voxel voxel{x, y, z};
+        if (grid.at(voxel) != VoxelState::Free) {
+          distances[grid.index(voxel)] = 0.0;
+        }
       }
-      continue;
-    }
-    auto near = (lo[axis] - a[axis]) / delta;
-    auto far = (hi[axis] - a[axis]) / delta;
-    if (near > far) {
-      std::swap(near, far);
-    }
-    t_min = std::max(t_min, near);
-    t_max = std::min(t_max, far);
-    if (t_min > t_max) {
-      return false;
     }
   }
-  return true;
+  std::vector<double> line;
+  std::vector<double> transformed;
+  line.resize(grid.width());
+  for (int z = 0; z < static_cast<int>(grid.depth()); ++z) {
+    for (int y = 0; y < static_cast<int>(grid.height()); ++y) {
+      for (std::size_t x = 0; x < grid.width(); ++x) {
+        line[x] = distances[(static_cast<std::size_t>(z) * grid.height() +
+          static_cast<std::size_t>(y)) * grid.width() + x];
+      }
+      squared_distance_transform_1d(line, transformed);
+      for (std::size_t x = 0; x < grid.width(); ++x) {
+        distances[(static_cast<std::size_t>(z) * grid.height() +
+          static_cast<std::size_t>(y)) * grid.width() + x] = transformed[x];
+      }
+    }
+  }
+  line.resize(grid.height());
+  for (int z = 0; z < static_cast<int>(grid.depth()); ++z) {
+    for (int x = 0; x < static_cast<int>(grid.width()); ++x) {
+      for (std::size_t y = 0; y < grid.height(); ++y) {
+        line[y] = distances[(static_cast<std::size_t>(z) * grid.height() + y) *
+          grid.width() + static_cast<std::size_t>(x)];
+      }
+      squared_distance_transform_1d(line, transformed);
+      for (std::size_t y = 0; y < grid.height(); ++y) {
+        distances[(static_cast<std::size_t>(z) * grid.height() + y) *
+          grid.width() + static_cast<std::size_t>(x)] = transformed[y];
+      }
+    }
+  }
+  line.resize(grid.depth());
+  for (int y = 0; y < static_cast<int>(grid.height()); ++y) {
+    for (int x = 0; x < static_cast<int>(grid.width()); ++x) {
+      for (std::size_t z = 0; z < grid.depth(); ++z) {
+        line[z] = distances[(z * grid.height() + static_cast<std::size_t>(y)) *
+          grid.width() + static_cast<std::size_t>(x)];
+      }
+      squared_distance_transform_1d(line, transformed);
+      for (std::size_t z = 0; z < grid.depth(); ++z) {
+        distances[(z * grid.height() + static_cast<std::size_t>(y)) *
+          grid.width() + static_cast<std::size_t>(x)] = transformed[z];
+      }
+    }
+  }
+  return distances;
+}
+
+double segment_box_distance_squared(
+  const Point3 & start, const Point3 & end, const Point3 & lower, const Point3 & upper)
+{
+  const std::array<double, 3> a{start.x, start.y, start.z};
+  const std::array<double, 3> delta{end.x - start.x, end.y - start.y, end.z - start.z};
+  const std::array<double, 3> lo{lower.x, lower.y, lower.z};
+  const std::array<double, 3> hi{upper.x, upper.y, upper.z};
+  std::vector<double> cuts{0.0, 1.0};
+  for (std::size_t axis = 0; axis < 3; ++axis) {
+    if (delta[axis] == 0.0) {continue;}
+    for (const auto plane : {lo[axis], hi[axis]}) {
+      const auto t = (plane - a[axis]) / delta[axis];
+      if (t > 0.0 && t < 1.0 && std::isfinite(t)) {cuts.push_back(t);}
+    }
+  }
+  std::sort(cuts.begin(), cuts.end());
+  cuts.erase(std::unique(cuts.begin(), cuts.end(), [](double lhs, double rhs) {
+      return std::abs(lhs - rhs) <= 1.0e-14;
+    }), cuts.end());
+  double minimum = std::min(
+    point_box_distance_squared(start, lower, upper),
+    point_box_distance_squared(end, lower, upper));
+  for (std::size_t segment = 1; segment < cuts.size(); ++segment) {
+    const auto left = cuts[segment - 1];
+    const auto right = cuts[segment];
+    if (right <= left) {continue;}
+    const auto midpoint = 0.5 * (left + right);
+    double coefficient_a = 0.0;
+    double coefficient_b = 0.0;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      const auto value = a[axis] + delta[axis] * midpoint;
+      if (value < lo[axis]) {
+        coefficient_a += delta[axis] * delta[axis];
+        coefficient_b += delta[axis] * (a[axis] - lo[axis]);
+      } else if (value > hi[axis]) {
+        coefficient_a += delta[axis] * delta[axis];
+        coefficient_b += delta[axis] * (a[axis] - hi[axis]);
+      }
+    }
+    auto candidate = left;
+    if (coefficient_a > 0.0) {
+      candidate = std::clamp(-coefficient_b / coefficient_a, left, right);
+    }
+    minimum = std::min(minimum, point_box_distance_squared(
+      {start.x + delta[0] * candidate, start.y + delta[1] * candidate,
+        start.z + delta[2] * candidate}, lower, upper));
+    minimum = std::min(minimum, point_box_distance_squared(
+      {start.x + delta[0] * right, start.y + delta[1] * right,
+        start.z + delta[2] * right}, lower, upper));
+  }
+  return minimum;
 }
 
 std::size_t flat_index(
@@ -137,47 +281,10 @@ CostVoxelGrid inflate_voxels(
     throw std::invalid_argument("invalid 3D inflation parameters");
   }
   CostVoxelGrid result(grid);
-  // Multi-source 26-neighbour distance transform. Chebyshev distance is a
-  // lower bound on Euclidean distance, so using it for clearance is
-  // conservative. Crucially, unknown is a distance source as well as occupied:
-  // a spherical envelope may not overlap an unobserved voxel.
-  const auto unset = std::numeric_limits<int>::max();
-  std::vector<int> distance_steps(grid.size(), unset);
-  std::deque<Voxel> queue;
-  for (int z = 0; z < static_cast<int>(grid.depth()); ++z) {
-    for (int y = 0; y < static_cast<int>(grid.height()); ++y) {
-      for (int x = 0; x < static_cast<int>(grid.width()); ++x) {
-        const Voxel voxel{x, y, z};
-        if (grid.at(voxel) != VoxelState::Free) {
-          distance_steps[grid.index(voxel)] = 0;
-          queue.push_back(voxel);
-        }
-      }
-    }
-  }
-  const auto max_steps = static_cast<int>(
-    std::ceil((inflation_radius + std::sqrt(3.0) * grid.resolution()) /
-    grid.resolution()));
-  while (!queue.empty()) {
-    const auto current = queue.front();
-    queue.pop_front();
-    const auto next_distance = distance_steps[grid.index(current)] + 1;
-    if (next_distance > max_steps) {continue;}
-    for (int dz = -1; dz <= 1; ++dz) {
-      for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-          if (dx == 0 && dy == 0 && dz == 0) {continue;}
-          const Voxel next{current.x + dx, current.y + dy, current.z + dz};
-          if (!grid.in_bounds(next) || distance_steps[grid.index(next)] <= next_distance) {
-            continue;
-          }
-          distance_steps[grid.index(next)] = next_distance;
-          queue.push_back(next);
-        }
-      }
-    }
-  }
-
+  // Unknown is a distance source as well as occupied. The transform is in
+  // voxel-index units and is converted to metres only after all three
+  // separable dimensions have been processed.
+  const auto squared_distances = squared_distance_transform(grid);
   const auto half_diagonal = std::sqrt(3.0) * grid.resolution() * 0.5;
   const auto upper = grid.upper_bound();
   for (int z = 0; z < static_cast<int>(grid.depth()); ++z) {
@@ -193,10 +300,10 @@ CostVoxelGrid inflate_voxels(
             center.y - grid.origin().y, upper.y - center.y,
             center.z - grid.origin().z, upper.z - center.z});
         double obstacle_clearance = std::numeric_limits<double>::infinity();
-        const auto steps = distance_steps[grid.index(voxel)];
-        if (steps != unset) {
+        const auto squared_distance = squared_distances[grid.index(voxel)];
+        if (std::isfinite(squared_distance)) {
           obstacle_clearance = std::max(
-            0.0, static_cast<double>(steps) * grid.resolution() - half_diagonal);
+            0.0, std::sqrt(squared_distance) * grid.resolution() - half_diagonal);
         }
         const auto clearance = std::min(boundary_clearance, obstacle_clearance);
         if (clearance <= lethal_radius + 1.0e-12) {
@@ -439,7 +546,12 @@ SearchResult3D astar_3d(
 bool swept_sphere_clear(
   const VoxelGrid & raw, const Point3 & start, const Point3 & end, double radius)
 {
-  if (!std::isfinite(radius) || radius < 0.0) {return false;}
+  if (!std::isfinite(radius) || radius < 0.0 ||
+    !std::isfinite(start.x) || !std::isfinite(start.y) || !std::isfinite(start.z) ||
+    !std::isfinite(end.x) || !std::isfinite(end.y) || !std::isfinite(end.z))
+  {
+    return false;
+  }
   const auto upper = raw.upper_bound();
   const auto inside = [&](const Point3 & point) {
       return point.x >= raw.origin().x + radius && point.y >= raw.origin().y + radius &&
@@ -450,38 +562,50 @@ bool swept_sphere_clear(
   // chord remains inside the hard planning bounds.
   if (!inside(start) || !inside(end)) {return false;}
   const auto resolution = raw.resolution();
+  const auto range_tolerance = 1.0e-12 * std::max({1.0, radius, resolution});
   const auto clamp_index = [](int value, int limit) {return std::clamp(value, 0, limit - 1);};
   const auto low_x = clamp_index(
-    static_cast<int>(std::floor((std::min(start.x, end.x) - radius - raw.origin().x) / resolution)),
+    static_cast<int>(std::floor((std::min(start.x, end.x) - radius - raw.origin().x -
+      range_tolerance) / resolution)),
     static_cast<int>(raw.width()));
   const auto high_x = clamp_index(
-    static_cast<int>(std::floor((std::max(start.x, end.x) + radius - raw.origin().x) / resolution)),
+    static_cast<int>(std::floor((std::max(start.x, end.x) + radius - raw.origin().x +
+      range_tolerance) / resolution)),
     static_cast<int>(raw.width()));
   const auto low_y = clamp_index(
-    static_cast<int>(std::floor((std::min(start.y, end.y) - radius - raw.origin().y) / resolution)),
+    static_cast<int>(std::floor((std::min(start.y, end.y) - radius - raw.origin().y -
+      range_tolerance) / resolution)),
     static_cast<int>(raw.height()));
   const auto high_y = clamp_index(
-    static_cast<int>(std::floor((std::max(start.y, end.y) + radius - raw.origin().y) / resolution)),
+    static_cast<int>(std::floor((std::max(start.y, end.y) + radius - raw.origin().y +
+      range_tolerance) / resolution)),
     static_cast<int>(raw.height()));
   const auto low_z = clamp_index(
-    static_cast<int>(std::floor((std::min(start.z, end.z) - radius - raw.origin().z) / resolution)),
+    static_cast<int>(std::floor((std::min(start.z, end.z) - radius - raw.origin().z -
+      range_tolerance) / resolution)),
     static_cast<int>(raw.depth()));
   const auto high_z = clamp_index(
-    static_cast<int>(std::floor((std::max(start.z, end.z) + radius - raw.origin().z) / resolution)),
+    static_cast<int>(std::floor((std::max(start.z, end.z) + radius - raw.origin().z +
+      range_tolerance) / resolution)),
     static_cast<int>(raw.depth()));
+  const auto tolerance = 1.0e-12 * std::max({1.0, radius * radius,
+      resolution * resolution});
   for (int z = low_z; z <= high_z; ++z) {
     for (int y = low_y; y <= high_y; ++y) {
       for (int x = low_x; x <= high_x; ++x) {
         const Voxel voxel{x, y, z};
         if (raw.at(voxel) == VoxelState::Free) {continue;}
         const Point3 lower{
-          raw.origin().x + x * resolution - radius,
-          raw.origin().y + y * resolution - radius,
-          raw.origin().z + z * resolution - radius};
-        const Point3 box_upper{lower.x + resolution + 2.0 * radius,
-          lower.y + resolution + 2.0 * radius,
-          lower.z + resolution + 2.0 * radius};
-        if (segment_intersects_box(start, end, lower, box_upper)) {return false;}
+          raw.origin().x + x * resolution,
+          raw.origin().y + y * resolution,
+          raw.origin().z + z * resolution};
+        const Point3 box_upper{lower.x + resolution,
+          lower.y + resolution, lower.z + resolution};
+        if (segment_box_distance_squared(start, end, lower, box_upper) <=
+          radius * radius + tolerance)
+        {
+          return false;
+        }
       }
     }
   }

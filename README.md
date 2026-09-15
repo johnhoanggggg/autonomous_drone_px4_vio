@@ -237,6 +237,13 @@ own bag `<mode>_<UTC>` through `px4_vio_bridge.log_paths`. Set
 
 ## 3D planner monitor
 
+**September 15 ROS integration:** the [current 3D handoff](HANDOFF_3D_NAVIGATION.md)
+contains the implemented pose/map contract, offline results and carry procedure.
+`ros_planner_3d_monitor.launch.py` attaches to an existing ROS backend; adding
+`start_backend:=true` starts a standalone ROS perception + planner graph with no
+PX4 publisher. It consumes body poses paired with exact OctoMap generations.
+The old `rtabmap_slam_px4_3d.launch.py` remains the separate DepthAI hybrid.
+
 The 3D implementation is deliberately a separate, observation-only C++ mode.
 The launch starts a keyframe-grid-to-OctoMap producer, 26-connected A* planner,
 and swept-sphere XYZ follower. The producer consumes `rtabmap_msgs/msg/MapData`
@@ -1122,7 +1129,7 @@ The installed DepthAI 3.5.0 node still publishes only the height-collapsed
 keyframe grids. `rtabmap_slam_px4_3d.launch.py` closes that interface gap with a
 separate ROS RTAB-Map host instead of reconstructing occupancy from point
 clouds, which would lose observed free space and its original viewpoint. Live
-planner pose/correction integration, CPU acceptance, SITL, props-off,
+carry validation of planner poses/corrections, CPU acceptance, SITL, props-off,
 physical-course measurement, and constrained-flight gates remain. There is
 intentionally no `offboard_global_planner_3d.launch.py` yet.
 
@@ -1800,6 +1807,9 @@ computed up front. Foxglove clicks are refused while a square runs.
 ```bash
 ros2 launch px4_vio_bridge offboard_square.launch.py auto_arm:=false climb_timeout:=5.0
 ros2 launch px4_vio_bridge offboard_square.launch.py auto_arm:=true
+# Opt-in loop-corrected square (dry-run this exact configuration first):
+ros2 launch px4_vio_bridge offboard_square.launch.py \
+  side_m:=1.0 use_loop_corrections:=true auto_arm:=false climb_timeout:=5.0
 ```
 
 Defaults `side_m:=0.40`, `turn_deg:=90.0` (positive = right), `sides:=4`.
@@ -1815,6 +1825,14 @@ Defaults `side_m:=0.40`, `turn_deg:=90.0` (positive = right), `sides:=4`.
   position — chaining folds each leg's error into the next corner and walks the
   square across the room. If a square would not fit the geofence the node
   **refuses and lands rather than clamping**, since clamping deforms the shape.
+- `use_loop_corrections:=false` preserves the flown continuous-local behavior.
+  When true, the square is fixed in loop-corrected `world` using
+  `/rtabmap/body_pose`; `/rtabmap/odom_correction` rotates each remaining
+  displacement back into PX4's continuous frame. Position and yaw commands still
+  pass through their existing slew limiters. Arming is inhibited, and an active
+  flight lands, if either input is stale/invalid or exceeds
+  `max_correction_m` / `max_correction_yaw_deg`. A corrected target that leaves
+  the takeoff-centred geofence is refused rather than clamped.
 
 ### PARKED: `offboard_vfh` / VFH2D — never armed
 

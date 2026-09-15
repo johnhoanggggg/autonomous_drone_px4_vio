@@ -2,10 +2,60 @@ import math
 
 from px4_vio_bridge.process_monitor import (
     DEFAULT_TARGETS,
+    NATIVE_3D_TARGETS,
     ProcessMonitor,
     match_label,
     parse_throttled,
+    resolve_targets,
 )
+
+
+def test_native_3d_profile_is_bounded_to_the_graph_processes() -> None:
+    assert list(sorted(NATIVE_3D_TARGETS)) == [
+        "bag_record",
+        "cpp_astar_planner_3d",
+        "cpp_ros_planner_pose",
+        "cpp_route_follower_3d",
+        "foxglove",
+        "mapper_container",
+        "oak_container",
+        "rtabmap_octomap_node",
+    ]
+    assert NATIVE_3D_TARGETS["oak_container"] != NATIVE_3D_TARGETS["mapper_container"]
+
+
+def test_native_3d_profile_resolves_without_changing_default_targets() -> None:
+    defaults = resolve_targets("default", sorted(DEFAULT_TARGETS),
+                               [DEFAULT_TARGETS[k] for k in sorted(DEFAULT_TARGETS)])
+    native = resolve_targets("native_3d", sorted(DEFAULT_TARGETS),
+                             [DEFAULT_TARGETS[k] for k in sorted(DEFAULT_TARGETS)])
+    assert defaults == DEFAULT_TARGETS
+    assert native == NATIVE_3D_TARGETS
+
+
+def test_native_3d_patterns_match_nodes_and_not_launchers() -> None:
+    prefix = "/home/john/autonomous_drone_px4_vio/ros2_ws/install/px4_vio_bridge"
+    cases = {
+        "oak_container": "/opt/ros/jazzy/lib/rclcpp_components/component_container_mt "
+                          "--ros-args -r __node:=oak_container",
+        "mapper_container": "/opt/ros/jazzy/lib/rclcpp_components/component_container "
+                            "--ros-args -r __node:=rtabmap_mapper_container",
+        "rtabmap_octomap_node": f"{prefix}/lib/px4_vio_bridge/rtabmap_octomap_node --ros-args",
+        "cpp_ros_planner_pose": f"{prefix}/lib/px4_vio_bridge/cpp_ros_planner_pose --ros-args",
+        "cpp_astar_planner_3d": f"{prefix}/lib/px4_vio_bridge/cpp_astar_planner_3d --ros-args",
+        "cpp_route_follower_3d": f"{prefix}/lib/px4_vio_bridge/cpp_route_follower_3d --ros-args",
+        "foxglove": "/opt/ros/jazzy/lib/foxglove_bridge/foxglove_bridge --ros-args",
+    }
+    launch = "/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch px4_vio_bridge " \
+             "global_planner_3d_monitor.launch.py"
+    for label, cmdline in cases.items():
+        assert match_label(cmdline, NATIVE_3D_TARGETS[label])
+        assert not match_label(launch, NATIVE_3D_TARGETS[label])
+    foxglove_launch = (
+        "/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch foxglove_bridge "
+        "foxglove_bridge_launch.xml"
+    )
+    assert not match_label(foxglove_launch, NATIVE_3D_TARGETS["foxglove"])
 
 
 def test_throttled_word_parses_the_vcgencmd_format() -> None:

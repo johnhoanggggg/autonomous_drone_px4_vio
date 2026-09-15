@@ -40,6 +40,7 @@ public:
   Rtabmap3DFixtureNode()
   : Node("rtabmap_3d_fixture")
   {
+    raw_frame_id_ = declare_parameter<std::string>("raw_frame_id", "continuous_vio");
     resolution_ = declare_parameter<double>("resolution", 0.10);
     loop_correction_after_ = declare_parameter<double>("loop_correction_after", 5.0);
     const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -115,11 +116,12 @@ private:
     const auto is_corrected = corrected();
     const auto y = is_corrected ? 0.20 : 0.0;
     geometry_msgs::msg::PoseStamped vio;
-    vio.header.stamp = now(); vio.header.frame_id = "world";
+    vio.header.stamp = now(); vio.header.frame_id = raw_frame_id_;
     vio.pose.position.x = -1.0; vio.pose.position.y = 0.0; vio.pose.position.z = 0.8;
     vio.pose.orientation.w = 1.0;
     vio_pub_->publish(vio);
     auto pose = vio;
+    pose.header.frame_id = "world";
     pose.pose.position.y = y;
     pose_pub_->publish(pose);
     geometry_msgs::msg::PoseStamped correction;
@@ -140,6 +142,7 @@ private:
     }
   }
 
+  std::string raw_frame_id_;
   double resolution_{};
   double loop_correction_after_{};
   bool goal_published_{false};

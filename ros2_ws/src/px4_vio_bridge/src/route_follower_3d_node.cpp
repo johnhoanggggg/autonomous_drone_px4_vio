@@ -21,7 +21,6 @@
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
-#include <nav_msgs/msg/path.hpp>
 #include <nlohmann/json.hpp>
 #include <octomap/ColorOcTree.h>
 #include <octomap/OcTree.h>
@@ -29,10 +28,10 @@
 #include <octomap_msgs/msg/octomap.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/string.hpp>
 
 #include "px4_vio_bridge/grid_planner_3d.hpp"
+#include "px4_vio_bridge/navigation_snapshot.hpp"
 #include "px4_vio_bridge/route_follower_3d.hpp"
 
 namespace px4_vio_bridge
@@ -149,7 +148,7 @@ public:
   {
     frame_id_ = declare_parameter<std::string>("frame_id", "world");
     vio_frame_id_ = declare_parameter<std::string>("vio_frame_id", "continuous_vio");
-    path_topic_ = declare_parameter<std::string>("path_topic", "/planner3d/path");
+    path_snapshot_topic_ = declare_parameter<std::string>("path_snapshot_topic", "/planner3d/path_snapshot");
     map_topic_ = declare_parameter<std::string>("map_topic", "/rtabmap/octomap");
     metadata_topic_ = declare_parameter<std::string>(
       "map_metadata_topic", "/rtabmap/octomap_metadata");
@@ -196,21 +195,24 @@ public:
     metadata_sub_ = create_subscription<std_msgs::msg::String>(
       metadata_topic_, qos,
       [this](std_msgs::msg::String::ConstSharedPtr message) {on_metadata(*message);});
-    path_sub_ = create_subscription<nav_msgs::msg::Path>(
-      path_topic_, 10,
-      [this](nav_msgs::msg::Path::ConstSharedPtr message) {on_path(*message);});
-    path_generation_sub_ = create_subscription<std_msgs::msg::Int32>(
-      "/planner3d/path_map_generation", qos,
-      [this](std_msgs::msg::Int32::ConstSharedPtr message) {
-        pending_path_generation_ = message->data;
-        try_accept_path();
-      });
+    path_snapshot_sub_ = create_subscription<std_msgs::msg::String>(
+      path_snapshot_topic_, 10,
+      [this](std_msgs::msg::String::ConstSharedPtr message) {on_path_snapshot(*message);});
+    snapshot_topic_ = declare_parameter<std::string>("pose_snapshot_topic", "");
+    if (!snapshot_topic_.empty()) {
+      snapshot_sub_ = create_subscription<std_msgs::msg::String>(snapshot_topic_, 10,
+        [this](std_msgs::msg::String::ConstSharedPtr message) {on_snapshot(*message);});
+    } else {
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       pose_topic_, 10,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr message) {on_pose(*message);});
     vio_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       raw_vio_topic_, 10,
-      [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr) {
+      [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr message) {
+        const auto stamp = rclcpp::Time(message->header.stamp).nanoseconds();
+        if (message->header.frame_id != vio_frame_id_ ||
+          !fresh_stamp(stamp, now().nanoseconds(), vio_timeout_)) {return;}
+        vio_stamp_ = stamp;
         vio_received_ = steady_seconds();
       });
     correction_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -218,6 +220,7 @@ public:
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr message) {
         on_correction(*message);
       });
+    }
     displacement_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
       "/planner3d/follower/displacement", 10);
     velocity_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
@@ -273,12 +276,15 @@ private:
     if (!pending_octree_ || !pending_metadata_) {return;}
     if (pending_metadata_->stamp_ns != pending_map_stamp_.nanoseconds() ||
       pending_metadata_->frame_id != frame_id_ ||
-      std::abs(pending_metadata_->resolution - pending_octree_->getResolution()) > 1.0e-9)
+      std::abs(pending_metadata_->resolution - pending_octree_->getResolution()) > 1.0e-9 ||
+      pending_metadata_->generation <= map_generation_ ||
+      !fresh_stamp(pending_metadata_->stamp_ns, now().nanoseconds(), map_timeout_))
     {
       return;
     }
     octree_ = std::move(pending_octree_);
     map_generation_ = pending_metadata_->generation;
+    map_stamp_ = pending_metadata_->stamp_ns;
     pending_metadata_.reset();
     map_received_ = steady_seconds();
     follower_->clear();
@@ -286,30 +292,96 @@ private:
     try_accept_path();
   }
 
-  void on_path(const nav_msgs::msg::Path & message)
+  void on_path_snapshot(const std_msgs::msg::String & message)
   {
-    pending_path_.clear();
-    if (message.header.frame_id != frame_id_ || message.poses.size() < 2) {return;}
-    for (const auto & pose : message.poses) {
-      const Point3 point{pose.pose.position.x, pose.pose.position.y, pose.pose.position.z};
-      if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
-        pending_path_.clear();
+    try {
+      const auto value = nlohmann::json::parse(message.data);
+      const auto stamp = value.at("stamp_ns").get<std::int64_t>();
+      // A delayed old packet cannot supersede or refresh an accepted path.
+      if (stamp <= path_stamp_) {return;}
+      if (value.at("frame_id") != frame_id_ ||
+        !fresh_stamp(stamp, now().nanoseconds(), path_timeout_))
+      {
+        follower_->clear(); active_path_generation_.reset(); pending_path_.clear();
         return;
       }
-      pending_path_.push_back(point);
+      std::vector<Point3> points;
+      for (const auto & item : value.at("points")) {
+        if (!item.is_array() || item.size() != 3) {throw std::invalid_argument("path point");}
+        Point3 point{item[0], item[1], item[2]};
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+          throw std::invalid_argument("nonfinite path point");
+        }
+        points.push_back(point);
+      }
+      pending_goal_exact_ = value.value("goal_exact", false);
+      pending_goal_terminal_ = value.value("goal_terminal", false);
+      if (pending_goal_exact_ && !pending_goal_terminal_) {
+        throw std::invalid_argument("exact goal must be terminal");
+      }
+      pending_path_ = std::move(points);
+      pending_path_generation_ = value.at("map_generation").get<std::int64_t>();
+      path_map_stamp_ = value.at("map_stamp_ns");
+      path_stamp_ = stamp;
+      path_received_ = steady_seconds();
+      // An empty path is an explicit veto. Never retain the previous route.
+      if (pending_path_.size() < 2 || *pending_path_generation_ != map_generation_ ||
+        path_map_stamp_ != map_stamp_) {follower_->clear(); active_path_generation_.reset();}
+      try_accept_path();
+    } catch (const std::exception &) {
+      follower_->clear(); active_path_generation_.reset(); pending_path_.clear();
     }
-    path_received_ = steady_seconds();
-    try_accept_path();
+  }
+
+  void on_snapshot(const std_msgs::msg::String & message)
+  {
+    try {
+      const auto value = nlohmann::json::parse(message.data);
+      const auto stamp = value.at("stamp_ns").get<std::int64_t>();
+      if (value.at("frame_id") != frame_id_ || value.at("odom_frame_id") != vio_frame_id_ ||
+        !fresh_stamp(stamp, now().nanoseconds(), std::min(pose_timeout_, vio_timeout_)) ||
+        stamp <= pose_stamp_) {return;}
+      const auto pose = snapshot_pose(value.at("pose"));
+      snapshot_pose(value.at("raw_pose"));
+      const auto correction = snapshot_pose(value.at("correction"));
+      geometry_msgs::msg::PoseStamped msg;
+      msg.header.frame_id = frame_id_; msg.header.stamp = rclcpp::Time(stamp);
+      msg.pose.position.x = correction.position.x; msg.pose.position.y = correction.position.y;
+      msg.pose.position.z = correction.position.z;
+      msg.pose.orientation.x = correction.orientation.x; msg.pose.orientation.y = correction.orientation.y;
+      msg.pose.orientation.z = correction.orientation.z; msg.pose.orientation.w = correction.orientation.w;
+      pose_generation_ = value.at("map_generation"); pose_map_stamp_ = value.at("map_stamp_ns");
+      on_correction(msg);
+      vio_received_ = steady_seconds(); vio_stamp_ = stamp;
+      msg.pose.position.x = pose.position.x; msg.pose.position.y = pose.position.y;
+      msg.pose.position.z = pose.position.z;
+      on_pose(msg);
+    } catch (const std::exception &) {correction_.reset();}
   }
 
   void try_accept_path()
   {
     if (!pose_ || pending_path_.size() < 2 || !pending_path_generation_ ||
-      *pending_path_generation_ != map_generation_ || !octree_)
+      *pending_path_generation_ != map_generation_ || path_map_stamp_ != map_stamp_ || !octree_ ||
+      (!snapshot_topic_.empty() && (pose_generation_ != map_generation_ || pose_map_stamp_ != map_stamp_)))
     {
       return;
     }
+    if (accepted_path_stamp_ == path_stamp_ && active_path_generation_) {return;}
+    if (active_path_generation_ && active_points_.size() == pending_path_.size() &&
+      std::equal(active_points_.begin(), active_points_.end(), pending_path_.begin(),
+        [](const Point3 & a, const Point3 & b) {return a.x == b.x && a.y == b.y && a.z == b.z;}))
+    {
+      active_goal_exact_ = pending_goal_exact_;
+      active_goal_terminal_ = pending_goal_terminal_;
+      accepted_path_stamp_ = path_stamp_;
+      return;
+    }
     if (follower_->set_path(pending_path_, *pose_)) {
+      active_points_ = pending_path_;
+      active_goal_exact_ = pending_goal_exact_;
+      active_goal_terminal_ = pending_goal_terminal_;
+      accepted_path_stamp_ = path_stamp_;
       active_path_generation_ = pending_path_generation_;
     }
   }
@@ -318,10 +390,12 @@ private:
   {
     const Point3 point{message.pose.position.x, message.pose.position.y, message.pose.position.z};
     if (message.header.frame_id != frame_id_ || !std::isfinite(point.x) ||
-      !std::isfinite(point.y) || !std::isfinite(point.z))
+      !std::isfinite(point.y) || !std::isfinite(point.z) ||
+      !fresh_stamp(rclcpp::Time(message.header.stamp).nanoseconds(), now().nanoseconds(), pose_timeout_))
     {
       return;
     }
+    pose_stamp_ = rclcpp::Time(message.header.stamp).nanoseconds();
     pose_ = point;
     pose_received_ = steady_seconds();
     if (!takeoff_center_) {takeoff_center_ = point;}
@@ -330,6 +404,11 @@ private:
 
   void on_correction(const geometry_msgs::msg::PoseStamped & message)
   {
+    if (message.header.frame_id != frame_id_ ||
+      !fresh_stamp(rclcpp::Time(message.header.stamp).nanoseconds(), now().nanoseconds(), correction_timeout_) ||
+      !std::isfinite(message.pose.position.x) || !std::isfinite(message.pose.position.y) ||
+      !std::isfinite(message.pose.position.z)) {correction_.reset(); return;}
+    correction_stamp_ = rclcpp::Time(message.header.stamp).nanoseconds();
     correction_ = correction_from_pose(message);
     correction_received_ = steady_seconds();
   }
@@ -339,14 +418,22 @@ private:
     const auto tick_time = steady_seconds();
     const auto dt = std::clamp(tick_time - last_tick_, 0.001, 0.5);
     last_tick_ = tick_time;
-    if (!octree_ || tick_time - map_received_ > map_timeout_) {invalid("MAP_STALE"); return;}
-    if (!pose_ || tick_time - pose_received_ > pose_timeout_) {invalid("POSE_STALE"); return;}
-    if (tick_time - vio_received_ > vio_timeout_) {invalid("VIO_STALE"); return;}
-    if (!correction_ || tick_time - correction_received_ > correction_timeout_) {
+    if (!octree_ || tick_time - map_received_ > map_timeout_ ||
+      !fresh_stamp(map_stamp_, now().nanoseconds(), map_timeout_)) {invalid("MAP_STALE"); return;}
+    if (!pose_ || tick_time - pose_received_ > pose_timeout_ ||
+      !fresh_stamp(pose_stamp_, now().nanoseconds(), pose_timeout_)) {invalid("POSE_STALE"); return;}
+    if (tick_time - vio_received_ > vio_timeout_ ||
+      !fresh_stamp(vio_stamp_, now().nanoseconds(), vio_timeout_)) {invalid("VIO_STALE"); return;}
+    if (!correction_ || tick_time - correction_received_ > correction_timeout_ ||
+      !fresh_stamp(correction_stamp_, now().nanoseconds(), correction_timeout_)) {
       invalid("CORRECTION_STALE"); return;
     }
+    if (!snapshot_topic_.empty() && (pose_generation_ != map_generation_ || pose_map_stamp_ != map_stamp_)) {
+      invalid("POSE_MAP_MISMATCH"); return;
+    }
     if (!active_path_generation_ || *active_path_generation_ != map_generation_ ||
-      tick_time - path_received_ > path_timeout_)
+      tick_time - path_received_ > path_timeout_ ||
+      !fresh_stamp(path_stamp_, now().nanoseconds(), path_timeout_))
     {
       invalid("PATH_STALE"); return;
     }
@@ -375,8 +462,14 @@ private:
     publish_pose(result.carrot, carrot_pub_);
     publish_pose(result.lookahead, lookahead_pub_);
     std_msgs::msg::Bool valid; valid.data = true; valid_pub_->publish(valid);
-    std_msgs::msg::Bool reached; reached.data = result.reached; reached_pub_->publish(reached);
-    publish_status(result.reason, result);
+    std_msgs::msg::Bool reached;
+    reached.data = result.reached && active_goal_exact_;
+    reached_pub_->publish(reached);
+    auto reason = result.reason;
+    if (result.reached && !active_goal_exact_) {
+      reason = active_goal_terminal_ ? "SAFE_APPROACH_REACHED" : "EXPLORATION_ENDPOINT_REACHED";
+    }
+    publish_status(reason, result);
   }
 
   bool chord_clear(const Point3 & start, const Point3 & end) const
@@ -436,6 +529,10 @@ private:
 
   void invalid(const std::string & reason)
   {
+    // Resuming after a watchdog must start from the current pose with zero
+    // internal feedforward, not revive the pre-fault carrot/velocity.
+    follower_->clear();
+    active_path_generation_.reset();
     publish_vector({}, displacement_pub_, vio_frame_id_);
     publish_vector({}, velocity_pub_, vio_frame_id_);
     publish_vector({}, acceleration_pub_, vio_frame_id_);
@@ -474,20 +571,36 @@ private:
     status["state"] = reason;
     status["observation_only"] = true;
     status["map_generation"] = map_generation_;
+    status["map_stamp_ns"] = map_stamp_;
+    status["pose_stamp_ns"] = pose_stamp_;
+    status["pose_map_generation"] = snapshot_topic_.empty() ? map_generation_ : pose_generation_;
+    status["path_stamp_ns"] = path_stamp_;
+    status["pose"] = pose_ ? nlohmann::json{pose_->x, pose_->y, pose_->z} : nlohmann::json();
+    status["carrot"] = {result.carrot.x, result.carrot.y, result.carrot.z};
+    status["lookahead"] = {result.lookahead.x, result.lookahead.y, result.lookahead.z};
+    status["lethal_radius"] = required_clearance_;
     status["path_map_generation"] = active_path_generation_.value_or(0);
     status["cross_track"] = result.projection.horizontal_distance;
     status["vertical_track"] = result.projection.vertical_distance;
     status["remaining"] = result.remaining;
+    status["goal_exact"] = active_goal_exact_;
+    status["goal_terminal"] = active_goal_terminal_;
+    status["path_endpoint_reached"] = result.reached;
+    status["requested_goal_reached"] = result.reached && active_goal_exact_;
     std_msgs::msg::String message; message.data = status.dump(); status_pub_->publish(message);
   }
 
   ProcessSingleton singleton_;
   std::string frame_id_;
   std::string vio_frame_id_;
-  std::string path_topic_;
+  std::string path_snapshot_topic_;
   std::string map_topic_;
   std::string metadata_topic_;
   std::string pose_topic_;
+  std::string snapshot_topic_;
+  std::int64_t pose_stamp_{}, vio_stamp_{}, correction_stamp_{}, map_stamp_{};
+  std::int64_t pose_generation_{}, pose_map_stamp_{}, path_stamp_{}, path_map_stamp_{}, accepted_path_stamp_{};
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr snapshot_sub_, path_snapshot_sub_;
   std::string raw_vio_topic_;
   std::string correction_topic_;
   double path_timeout_{};
@@ -512,6 +625,9 @@ private:
   std::optional<std::int64_t> pending_path_generation_;
   std::optional<std::int64_t> active_path_generation_;
   std::vector<Point3> pending_path_;
+  std::vector<Point3> active_points_;
+  bool pending_goal_exact_{false}, pending_goal_terminal_{false};
+  bool active_goal_exact_{false}, active_goal_terminal_{false};
   std::optional<Point3> pose_;
   std::optional<Point3> takeoff_center_;
   std::optional<Correction3D> correction_;
@@ -523,8 +639,6 @@ private:
   double last_tick_{};
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr map_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr metadata_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr path_generation_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr vio_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr correction_sub_;

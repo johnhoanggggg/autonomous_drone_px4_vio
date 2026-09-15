@@ -85,6 +85,11 @@ target_compile_features(cpp_slam_pose_relay PUBLIC cxx_std_17)
 target_link_libraries(cpp_slam_pose_relay slam_pose_relay_cpp)
 ament_target_dependencies(cpp_slam_pose_relay geometry_msgs rclcpp tf2 tf2_ros)
 
+add_executable(cpp_ros_planner_pose src/ros_planner_pose_node.cpp)
+target_compile_features(cpp_ros_planner_pose PUBLIC cxx_std_17)
+target_link_libraries(cpp_ros_planner_pose slam_pose_relay_cpp nlohmann_json::nlohmann_json)
+ament_target_dependencies(cpp_ros_planner_pose geometry_msgs nav_msgs rclcpp std_msgs)
+
 add_library(rtabmap_octomap_cpp src/rtabmap_octomap.cpp)
 target_compile_features(rtabmap_octomap_cpp PUBLIC cxx_std_17)
 target_include_directories(rtabmap_octomap_cpp PUBLIC
@@ -96,10 +101,10 @@ target_link_libraries(rtabmap_octomap_cpp PUBLIC rtabmap::core ${OCTOMAP_LIBRARI
 add_executable(rtabmap_octomap_node src/rtabmap_octomap_node.cpp)
 target_compile_features(rtabmap_octomap_node PUBLIC cxx_std_17)
 target_link_libraries(
-  rtabmap_octomap_node rtabmap_octomap_cpp nlohmann_json::nlohmann_json
+  rtabmap_octomap_node rtabmap_octomap_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json
   rtabmap_conversions::rtabmap_conversions ${OCTOMAP_LIBRARIES})
 ament_target_dependencies(rtabmap_octomap_node
-  geometry_msgs octomap_msgs rclcpp rtabmap_conversions rtabmap_msgs std_msgs
+  geometry_msgs nav_msgs octomap_msgs rclcpp rtabmap_conversions rtabmap_msgs std_msgs
   visualization_msgs
 )
 
@@ -111,13 +116,19 @@ ament_target_dependencies(rtabmap_3d_fixture
   geometry_msgs rclcpp rtabmap_conversions rtabmap_msgs
 )
 
+add_executable(octomap_path_audit src/octomap_path_audit.cpp)
+target_compile_features(octomap_path_audit PUBLIC cxx_std_17)
+target_include_directories(octomap_path_audit PRIVATE ${OCTOMAP_INCLUDE_DIRS})
+target_link_libraries(octomap_path_audit planner_3d_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
+ament_target_dependencies(octomap_path_audit octomap_msgs)
+
 # Observation-only OctoMap adapter and 3D A* monitor. It deliberately has no
 # px4_msgs dependency and no commanding publisher.
 add_executable(cpp_astar_planner_3d src/global_planner_3d_node.cpp)
 target_compile_features(cpp_astar_planner_3d PUBLIC cxx_std_17)
 target_include_directories(cpp_astar_planner_3d PRIVATE ${OCTOMAP_INCLUDE_DIRS})
 target_link_libraries(
-  cpp_astar_planner_3d planner_3d_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
+  cpp_astar_planner_3d planner_3d_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
 ament_target_dependencies(cpp_astar_planner_3d
   geometry_msgs nav_msgs octomap_msgs rclcpp std_msgs visualization_msgs
 )
@@ -126,7 +137,7 @@ add_executable(cpp_route_follower_3d src/route_follower_3d_node.cpp)
 target_compile_features(cpp_route_follower_3d PUBLIC cxx_std_17)
 target_include_directories(cpp_route_follower_3d PRIVATE ${OCTOMAP_INCLUDE_DIRS})
 target_link_libraries(
-  cpp_route_follower_3d planner_3d_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
+  cpp_route_follower_3d planner_3d_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
 ament_target_dependencies(cpp_route_follower_3d
   geometry_msgs nav_msgs octomap_msgs rclcpp std_msgs
 )
@@ -195,6 +206,8 @@ install(TARGETS
   planner_flight_cpp
   slam_pose_relay_cpp
   cpp_slam_pose_relay
+  cpp_ros_planner_pose
+  octomap_path_audit
   planner_3d_cpp
   rtabmap_octomap_cpp
   cpp_astar_planner
@@ -260,15 +273,20 @@ if(BUILD_TESTING)
   target_link_libraries(test_grid_planner_cpp planner_flight_cpp)
   ament_add_gtest(test_grid_planner_3d_cpp test/test_grid_planner_3d.cpp)
   target_link_libraries(test_grid_planner_3d_cpp planner_3d_cpp)
+  ament_add_gtest(test_navigation_snapshot_cpp test/test_navigation_snapshot.cpp)
+  target_link_libraries(test_navigation_snapshot_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json)
   ament_add_gtest(test_slam_pose_relay_cpp test/test_slam_pose_relay.cpp)
   target_link_libraries(test_slam_pose_relay_cpp slam_pose_relay_cpp)
   ament_add_gtest(test_rtabmap_octomap_cpp test/test_rtabmap_octomap.cpp)
   target_link_libraries(test_rtabmap_octomap_cpp rtabmap_octomap_cpp planner_3d_cpp)
+  ament_add_gtest(test_test_start_clear_cpp test/test_test_start_clear.cpp)
+  target_link_libraries(test_test_start_clear_cpp rtabmap_octomap_cpp)
   ament_add_gtest(test_route_follower_3d_cpp test/test_route_follower_3d.cpp)
   target_link_libraries(test_route_follower_3d_cpp planner_3d_cpp)
   ament_add_pytest_test(test_planner_flight_parity test/test_planner_flight_parity.py)
   ament_add_pytest_test(test_route_follower_parity test/test_route_follower_parity.py)
   ament_add_pytest_test(test_grid_planner_parity test/test_grid_planner_parity.py)
+  ament_add_pytest_test(test_ros_planner_3d_integration test/test_ros_planner_3d_integration.py TIMEOUT 120)
   ament_add_pytest_test(test_planner_3d_replay test/test_planner_3d_replay.py)
   ament_add_pytest_test(test_battery_to_ros test/test_battery_to_ros.py)
   ament_add_pytest_test(test_camera_to_body_pose test/test_camera_to_body_pose.py)
