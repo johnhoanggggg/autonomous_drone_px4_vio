@@ -1,5 +1,11 @@
 # Trajectory smoothness and wall strikes — handoff, 2026-09-07
 
+> **September 16 separate branch:** [correction/route-frame consistency fix](NON_BRAKING_FIX_20260916.md).
+> The 2D C++ planner, follower and adapter pair localization by exact source stamp
+> and preserve each path's source correction. Restart all three nodes together;
+> older publication-stamped paths are incompatible. This fixes reference pulses,
+> not the unresolved physical braking response. No hardware flight performed.
+
 > **Follow-up, 12:56/12:57 flights:** [retreating-target braking fix](CLUTTER_TRACKING_FOLLOWUP_20260913.md). Full-vector command improvement is visible in both logs; straight route plus wallward actual drift remains. Fixed feasible braking being rejected when a soft target retreats. No gain, margin or speed changes.
 
 > **Latest work, 2026-09-13:** [strict command-vector fix and unresolved physical response](CLUTTER_TRACKING_FIX_20260913.md). C++ global adapter enables strict vector acceleration limits and stops at unrounded corners; joins cannot snap small offsets. Added and loaded estimator diagnostic topics over NSH. No further gain/tolerance changes or physical tests. This is not demonstrated tunnel readiness.

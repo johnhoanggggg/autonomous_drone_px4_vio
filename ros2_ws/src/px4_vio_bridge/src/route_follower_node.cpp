@@ -38,6 +38,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include "px4_vio_bridge/localization_pair.hpp"
 #include "px4_vio_bridge/grid_clearance.hpp"
 #include "px4_vio_bridge/path_geometry.hpp"
 #include "px4_vio_bridge/route_follower.hpp"
@@ -333,7 +334,8 @@ private:
   void publish_config()
   {
     nlohmann::json config{
-      {"implementation", "cpp"}, {"path_topic", path_topic_}, {"map_topic", map_topic_},
+      {"implementation", "cpp"}, {"localization_pairing", "exact_source_stamp"},
+      {"path_stamp", "localization_source_stamp"}, {"path_topic", path_topic_}, {"map_topic", map_topic_},
       {"pose_topic", pose_topic_}, {"raw_vio_topic", raw_vio_topic_},
       {"goal_topic", goal_topic_}, {"goal_terminal_topic", goal_terminal_topic_},
       {"correction_topic", correction_topic_}, {"frame_id", frame_id_},
@@ -383,13 +385,13 @@ private:
 
   void on_pose(const geometry_msgs::msg::PoseStamped & message)
   {
-    if (message.header.frame_id != frame_id_) {
-      return;
-    }
-    const auto & position = message.pose.position;
-    if (std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z)) {
-      pose_ = std::array<double, 3>{position.x, position.y, position.z};
-      pose_received_ = monotonic_seconds();
+    if (message.header.frame_id != frame_id_) {return;}
+    const auto & p = message.pose.position;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {return;}
+    const auto stamp = static_cast<std::int64_t>(message.header.stamp.sec) * 1000000000LL +
+      message.header.stamp.nanosec;
+    if (const auto pair = localization_pairs_.pose(stamp, {p.x, p.y, p.z}, monotonic_seconds())) {
+      accept_localization(*pair);
     }
   }
 
@@ -457,6 +459,7 @@ private:
     if (message.header.frame_id != frame_id_) {
       return;
     }
+    pending_path_.reset();
     follower_->reset_route_progress();
     follower_->clear_path();
     follower_->set_escape(false);
@@ -471,10 +474,25 @@ private:
         message.header.frame_id.c_str(), frame_id_.c_str());
       return;
     }
+    const auto stamp = static_cast<std::int64_t>(message.header.stamp.sec) * 1000000000LL +
+      message.header.stamp.nanosec;
+    if (stamp <= 0 || stamp < latest_path_stamp_) {return;}
+    pending_path_ = message;
+    pending_path_received_ = monotonic_seconds();
+    accept_pending_path();
+  }
+
+  void accept_pending_path()
+  {
+    if (!pending_path_) {return;}
+    const auto & message = *pending_path_;
     const double now = monotonic_seconds();
-    path_received_ = now;
-    if (message.poses.empty()) {
-      follower_->clear_path();
+    const auto stamp = static_cast<std::int64_t>(message.header.stamp.sec) * 1000000000LL +
+      message.header.stamp.nanosec;
+    const auto source = localization_pairs_.at(stamp);
+    if (!source) {return;}
+    if (now - pending_path_received_ > path_timeout_) {
+      pending_path_.reset();
       return;
     }
     if (!correction_ || !correction_valid_) {
@@ -485,11 +503,29 @@ private:
         get_logger(), *get_clock(), 5000, "path deferred: no valid map correction yet");
       return;
     }
+    if (message.poses.empty()) {
+      latest_path_stamp_ = stamp;
+      path_received_ = pending_path_received_;
+      pending_path_.reset();
+      follower_->clear_path();
+      return;
+    }
     std::vector<Point2> points;
     points.reserve(message.poses.size());
     for (const auto & pose : message.poses) {
-      points.emplace_back(pose.pose.position.x, pose.pose.position.y);
+      if (!std::isfinite(pose.pose.position.x) || !std::isfinite(pose.pose.position.y)) {
+        pending_path_.reset();
+        return;
+      }
+      points.push_back(reexpress_point(
+          {pose.pose.position.x, pose.pose.position.y}, source->correction, *correction_));
     }
+    // A complete, paired receipt refreshes path health even if the existing
+    // correction episode defers installing it. Never replay that deferred path
+    // automatically when the gate settles: wait for a genuinely fresh path.
+    path_received_ = pending_path_received_;
+    latest_path_stamp_ = stamp;
+    pending_path_.reset();
     // Deferred while a correction episode is settling: this path may have been
     // planned from the pre-correction grid, and installing it would be exactly
     // the frame mismatch the episode exists to prevent. The accepted route is
@@ -497,7 +533,7 @@ private:
     // every tick, so continuing to fly it is safe -- what must wait is taking a
     // NEW path on trust. Receipt is still recorded, so the gate can settle and
     // path_timeout cannot fire on the deferral.
-    correction_gate_->path_received(now);
+    correction_gate_->path_received(path_received_);
     if (defer_path_for_correction(
         correction_gate_->pending(), follower_->path() != nullptr))
     {
@@ -508,13 +544,8 @@ private:
       return;
     }
     const Point2 anchor = pose_ ? Point2{(*pose_)[0], (*pose_)[1]} : points.front();
-    // The path is paired with this node's newest correction rather than with a
-    // snapshot travelling alongside the message, so at most the corrections in
-    // flight between the planner's publish and this receipt can slip. That
-    // window is sub-millimetre while the correction is quiet, and the material
-    // case -- a loop closure -- is exactly what the gate below holds through:
-    // the path that finally releases the hold is one received after the episode
-    // settled, when the two nodes' corrections agree.
+    // The source correction is recovered by exact stamp; geometry is then
+    // expressed in the active pair's frame before canonical VIO storage.
     try {
       const bool changed = follower_->set_path(points, anchor, *correction_);
       if (changed) {
@@ -529,24 +560,38 @@ private:
 
   void on_correction(const geometry_msgs::msg::PoseStamped & message)
   {
-    const double now = monotonic_seconds();
     const auto & p = message.pose.position;
     const auto & q = message.pose.orientation;
     const Correction4 correction{
       p.x, p.y, p.z, yaw_from_quaternion(q.w, q.x, q.y, q.z)};
-    const auto reason = correction_rejection_reason(
-      correction, max_correction_m_, max_correction_yaw_deg_ * kPi / 180.0);
+    const auto stamp = static_cast<std::int64_t>(message.header.stamp.sec) * 1000000000LL +
+      message.header.stamp.nanosec;
+    auto reason = correction_rejection_reason(correction, max_correction_m_, max_correction_yaw_deg_ * kPi / 180.0);
+    if (message.header.frame_id != frame_id_ || stamp <= 0) {
+      reason = "correction frame or source stamp is invalid";
+    }
     correction_seen_ = true;
-    correction_received_ = now;
-    correction_valid_ = !reason;
-    correction_reason_ = reason.value_or("");
     if (reason) {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 1000, "native correction rejected: %s",
-        reason->c_str());
+      localization_pairs_.reject(stamp);
+      correction_valid_ = false;
+      correction_reason_ = *reason;
       return;
     }
-    correction_ = correction;
+    if (const auto pair = localization_pairs_.correction(stamp, correction, monotonic_seconds())) {
+      accept_localization(*pair);
+    }
+  }
+
+  void accept_localization(const LocalizationPairBuffer::Pair & pair)
+  {
+    pose_ = pair.pose;
+    pose_received_ = pair.pose_received;
+    correction_ = pair.correction;
+    correction_received_ = pair.correction_received;
+    correction_valid_ = true;
+    correction_reason_.clear();
+    const auto & correction = pair.correction;
+    const double now = monotonic_seconds();
     const bool opened = correction_gate_->observe(correction, now);
     if (correction_epoch_published_ != correction_gate_->epoch()) {
       correction_epoch_published_ = correction_gate_->epoch();
@@ -562,6 +607,7 @@ private:
         "waiting for one fresh path",
         translation, yaw * 180.0 / kPi);
     }
+    accept_pending_path();
   }
 
   geometry_msgs::msg::PoseStamped pose_message(
@@ -819,12 +865,16 @@ private:
   bool raw_vio_seen_{false}, raw_vio_valid_{false};
   std::string raw_vio_reason_;
   double raw_vio_received_{};
+  LocalizationPairBuffer localization_pairs_;
   bool correction_seen_{false}, correction_valid_{false};
   std::string correction_reason_;
   double correction_received_{};
   std::optional<Correction4> correction_;
   bool goal_terminal_{false};
   double path_received_{};
+  std::optional<nav_msgs::msg::Path> pending_path_;
+  std::int64_t latest_path_stamp_{0};
+  double pending_path_received_{};
   std::int64_t correction_epoch_published_{0};
   std::optional<GridMap> grid_;
   double map_received_{};

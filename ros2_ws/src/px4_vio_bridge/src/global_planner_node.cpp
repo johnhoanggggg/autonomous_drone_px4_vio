@@ -35,6 +35,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include "px4_vio_bridge/localization_pair.hpp"
 #include "px4_vio_bridge/grid_planner.hpp"
 #include "px4_vio_bridge/path_geometry.hpp"
 
@@ -220,6 +221,8 @@ private:
     nlohmann::ordered_json config;
     config["correction_timeout"] = correction_timeout_;
     config["correction_topic"] = correction_topic_;
+    config["localization_pairing"] = "exact_source_stamp";
+    config["path_stamp"] = "localization_source_stamp";
     config["cost_weight"] = cost_weight_;
     config["frame_id"] = frame_id_;
     config["goal_topic"] = goal_topic_;
@@ -300,11 +303,14 @@ private:
 
   void on_pose(const geometry_msgs::msg::PoseStamped & msg)
   {
-    if (msg.header.frame_id != frame_id_) {
-      return;
+    if (msg.header.frame_id != frame_id_) {return;}
+    const auto & p = msg.pose.position;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {return;}
+    const auto stamp = static_cast<std::int64_t>(msg.header.stamp.sec) * 1000000000LL +
+      msg.header.stamp.nanosec;
+    if (const auto pair = localization_pairs_.pose(stamp, {p.x, p.y, p.z}, monotonic_seconds())) {
+      accept_localization(*pair);
     }
-    pose_ = {msg.pose.position.x, msg.pose.position.y, msg.pose.position.z};
-    pose_received_ = monotonic_seconds();
   }
 
   void on_goal(const geometry_msgs::msg::PointStamped & msg)
@@ -332,18 +338,33 @@ private:
     const auto & q = msg.pose.orientation;
     const Correction4 correction{
       p.x, p.y, p.z, yaw_from_quaternion(q.w, q.x, q.y, q.z)};
-    const auto reason = correction_rejection_reason(
-      correction, max_correction_m_, max_correction_yaw_deg_ * kPi / 180.0);
+    const auto stamp = static_cast<std::int64_t>(msg.header.stamp.sec) * 1000000000LL +
+      msg.header.stamp.nanosec;
+    auto reason = correction_rejection_reason(correction, max_correction_m_, max_correction_yaw_deg_ * kPi / 180.0);
+    if (msg.header.frame_id != frame_id_ || stamp <= 0) {
+      reason = "correction frame or source stamp is invalid";
+    }
     correction_seen_ = true;
-    correction_received_ = monotonic_seconds();
-    correction_valid_ = !reason.has_value();
-    correction_reason_ = reason.value_or("");
     if (reason) {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 1000, "native correction rejected: %s", reason->c_str());
+      localization_pairs_.reject(stamp);
+      correction_valid_ = false;
+      correction_reason_ = *reason;
       return;
     }
-    correction_ = correction;
+    if (const auto pair = localization_pairs_.correction(stamp, correction, monotonic_seconds())) {
+      accept_localization(*pair);
+    }
+  }
+
+  void accept_localization(const LocalizationPairBuffer::Pair & pair)
+  {
+    localization_stamp_ = pair.stamp;
+    pose_ = pair.pose;
+    pose_received_ = pair.pose_received;
+    correction_ = pair.correction;
+    correction_received_ = pair.correction_received;
+    correction_valid_ = true;
+    correction_reason_.clear();
   }
 
   // The accepted route lives in continuous VIO coordinates. Rendering it into
@@ -443,7 +464,9 @@ private:
   nav_msgs::msg::Path make_path(const std::vector<Point2> & points, double z) const
   {
     nav_msgs::msg::Path message;
-    message.header.stamp = now();
+    // Coordinate provenance, not publication time: consumers require the
+    // matching pose/correction pair before interpreting these map points.
+    message.header.stamp = rclcpp::Time(localization_stamp_);
     message.header.frame_id = frame_id_;
     for (const auto & point : points) {
       geometry_msgs::msg::PoseStamped pose;
@@ -625,7 +648,17 @@ private:
 
     const PlanKey key{grid_generation_, goal_generation_, *start_cell, goal_cell};
     if (last_planned_key_.has_value() && *last_planned_key_ == key) {
-      return;
+      // Republish a revalidated canonical route with the current source stamp.
+      // A consumer that missed one localization sample must not stay starved
+      // until a new map/goal happens to force another A* search.
+      const auto retained = accepted_in_map();
+      if (retained.empty()) {return;}
+      if (path_valid(retained)) {
+        path_pub_->publish(make_path(retained, (*pose_)[2]));
+        publish_path_map_generation();
+        return;
+      }
+      // Even without a cell/key change, a correction can invalidate the route.
     }
     last_planned_key_ = key;
 
@@ -807,6 +840,8 @@ private:
   std::optional<Point2> accepted_effective_goal_vio_;
   long accepted_generation_{0};
   long path_map_generation_{0};
+  std::int64_t localization_stamp_{0};
+  LocalizationPairBuffer localization_pairs_;
   bool correction_seen_{false}, correction_valid_{false};
   std::string correction_reason_;
   double correction_received_{0.0};

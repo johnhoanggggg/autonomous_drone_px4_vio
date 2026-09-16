@@ -29,6 +29,7 @@
 #include "std_msgs/msg/string.hpp"
 
 #include "offboard_hover_node.hpp"
+#include "px4_vio_bridge/localization_pair.hpp"
 #include "px4_vio_bridge/command_limiter.hpp"
 #include "px4_vio_bridge/grid_clearance.hpp"
 #include "px4_vio_bridge/route_follower.hpp"
@@ -540,6 +541,27 @@ private:
     if (msg.header.frame_id != frame_id_) {
       return;
     }
+    const auto stamp = static_cast<std::int64_t>(msg.header.stamp.sec) * 1000000000LL +
+      msg.header.stamp.nanosec;
+    if (stamp <= 0 || stamp < latest_path_stamp_ || msg.poses.empty()) {return;}
+    pending_path_ = msg;
+    pending_path_received_ = monotonic_time();
+    accept_pending_path();
+  }
+
+  void accept_pending_path()
+  {
+    if (!pending_path_ || !correction_valid_) {return;}
+    const auto & msg = *pending_path_;
+    const auto stamp = static_cast<std::int64_t>(msg.header.stamp.sec) * 1000000000LL +
+      msg.header.stamp.nanosec;
+    const auto source = localization_pairs_.at(stamp);
+    if (!source) {return;}
+    // A delayed match must not renew a path's original receipt age.
+    if (monotonic_time() - pending_path_received_ > path_timeout_) {
+      pending_path_.reset();
+      return;
+    }
     std::vector<Point2> points;
     points.reserve(msg.poses.size());
     for (const auto & pose : msg.poses) {
@@ -554,19 +576,22 @@ private:
       }
     }
     path_points_ = std::move(points);
+    path_frame_ = source->correction;
+    latest_path_stamp_ = stamp;
     ++path_input_id_;
-    path_received_ = monotonic_time();
+    path_received_ = pending_path_received_;
+    pending_path_.reset();
   }
 
   void on_map_pose(const geometry_msgs::msg::PoseStamped & msg)
   {
-    if (msg.header.frame_id != frame_id_) {
-      return;
-    }
-    const Point2 point{msg.pose.position.x, msg.pose.position.y};
-    if (finite(point)) {
-      map_pose_ = point;
-      map_pose_received_ = monotonic_time();
+    if (msg.header.frame_id != frame_id_) {return;}
+    const auto & p = msg.pose.position;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {return;}
+    const auto stamp = static_cast<std::int64_t>(msg.header.stamp.sec) * 1000000000LL +
+      msg.header.stamp.nanosec;
+    if (const auto pair = localization_pairs_.pose(stamp, {p.x, p.y, p.z}, monotonic_time())) {
+      accept_localization(*pair);
     }
   }
 
@@ -602,21 +627,37 @@ private:
 
   void on_correction(const geometry_msgs::msg::PoseStamped & msg)
   {
-    const auto & position = msg.pose.position;
-    const auto & orientation = msg.pose.orientation;
-    const std::array<double, 4> correction{
-      position.x, position.y, position.z,
-      yaw_from_quaternion(orientation.w, orientation.x, orientation.y, orientation.z)};
-    const auto reason =
-      correction_rejection_reason(correction, max_correction_m_, max_correction_yaw_);
-    correction_valid_ = !reason.has_value();
-    correction_reason_ = reason.value_or("");
-    if (reason) {
-      correction_.reset();
-    } else {
-      correction_ = correction;
+    const auto & p = msg.pose.position;
+    const auto & q = msg.pose.orientation;
+    const Correction4 correction{
+      p.x, p.y, p.z, yaw_from_quaternion(q.w, q.x, q.y, q.z)};
+    const auto stamp = static_cast<std::int64_t>(msg.header.stamp.sec) * 1000000000LL +
+      msg.header.stamp.nanosec;
+    auto reason = correction_rejection_reason(correction, max_correction_m_, max_correction_yaw_);
+    if (msg.header.frame_id != frame_id_ || stamp <= 0) {
+      reason = "correction frame or source stamp is invalid";
     }
-    correction_received_ = monotonic_time();
+    if (reason) {
+      localization_pairs_.reject(stamp);
+      correction_valid_ = false;
+      correction_reason_ = *reason;
+      correction_.reset();
+      return;
+    }
+    if (const auto pair = localization_pairs_.correction(stamp, correction, monotonic_time())) {
+      accept_localization(*pair);
+    }
+  }
+
+  void accept_localization(const LocalizationPairBuffer::Pair & pair)
+  {
+    map_pose_ = Point2{pair.pose[0], pair.pose[1]};
+    map_pose_received_ = pair.pose_received;
+    correction_ = pair.correction;
+    correction_received_ = pair.correction_received;
+    correction_valid_ = true;
+    correction_reason_.clear();
+    accept_pending_path();
   }
 
   // --- health -------------------------------------------------------------
@@ -687,7 +728,7 @@ private:
       return format("follower goal state stale for >%.2fs", follower_timeout_);
     }
     if (!displacement_received_ || now - *displacement_received_ > follower_timeout_) {
-      return format("VIO displacement stale for >%.2fs", follower_timeout_);
+      return format("follower VIO-frame displacement stale for >%.2fs", follower_timeout_);
     }
     if (!vio_displacement_) {
       return std::string("VIO displacement is invalid");
@@ -713,7 +754,7 @@ private:
         return format("%s stale for >%.2fs", label, timeout);
       }
     }
-    if (path_points_.empty() || !grid_ || !map_pose_) {
+    if (path_points_.empty() || !path_frame_ || !grid_ || !map_pose_) {
       return std::string("path-clearance validation inputs are invalid");
     }
     if (*displacement_received_ <= require_follower_after_) {
@@ -807,6 +848,8 @@ private:
     config["corner_blending"] = corner_blending_;
     config["strict_vector_limits"] = true;
     config["path_target_retreat"] = "brake_on_validated_segment";
+    config["localization_pairing"] = "exact_source_stamp";
+    config["path_stamp"] = "localization_source_stamp";
     config["sharp_corner_policy"] = "decelerate_to_zero_on_polyline";
     config["junction_deviation"] = junction_deviation_;
     config["path_corner_tolerance"] = path_corner_tolerance_;
@@ -914,6 +957,14 @@ private:
   {
     fault_escape_clearance_.reset();
     if (state_ != State::Route || !is_armed() || !map_pose_ || !correction_ || !pos_) {
+      return false;
+    }
+    const double now = monotonic_time();
+    if (!correction_valid_ || !map_pose_received_ || !correction_received_ ||
+      now - *map_pose_received_ > map_pose_timeout_ ||
+      now - *correction_received_ > correction_timeout_ || !map_received_ ||
+      now - *map_received_ > map_timeout_)
+    {
       return false;
     }
     if (!x0_ || !y0_ || !std::isfinite(pos_->x) || !std::isfinite(pos_->y)) {
@@ -1228,7 +1279,14 @@ private:
     // replacement is exactly what is down.
     if (!speed_cap && (!yaw_holding_ || replan_during_yaw_align_ || !route_limiter_->path())) {
       try {
-        if (route_limiter_->set_path(path_points_, *map_pose_, clearance_check)) {
+        // A correction alone must not reinstall yesterday's map coordinates.
+        // The path's source transform travels with its exact localization stamp.
+        std::vector<Point2> current_path;
+        current_path.reserve(path_points_.size());
+        for (const auto & point : path_points_) {
+          current_path.push_back(reexpress_point(point, *path_frame_, *correction_));
+        }
+        if (route_limiter_->set_path(current_path, *map_pose_, clearance_check)) {
           ++path_installation_id_;
           accepted_path_input_id_ = path_input_id_;
         }
@@ -1468,11 +1526,16 @@ private:
   std::optional<double> goal_received_;
   std::optional<Point2> vio_displacement_;
   std::optional<double> displacement_received_;
+  LocalizationPairBuffer localization_pairs_;
   bool correction_valid_{false};
   std::string correction_reason_{"not received"};
   std::optional<double> correction_received_;
   std::optional<std::array<double, 4>> correction_;
   std::vector<Point2> path_points_;
+  std::optional<Correction4> path_frame_;
+  std::optional<nav_msgs::msg::Path> pending_path_;
+  std::int64_t latest_path_stamp_{0};
+  double pending_path_received_{};
   std::optional<double> path_received_;
   std::optional<GridMap> grid_;
   std::optional<double> map_received_;
