@@ -2,7 +2,7 @@
 
 ROS 2 Jazzy workspace flying a Raspberry Pi 5 + Pixhawk 4 quadrotor on OAK-D Lite
 visual odometry, with a flown 2D global planner over an RTAB-Map occupancy grid
-and an observation-only 3D OctoMap planner under development.
+and a 3D OctoMap planner with an experimental unknown-allowed flight adapter.
 
 RTAB-Map VIO/SLAM on the OAK-D Lite publishes its continuous VIO pose on
 `/rtabmap/vio_pose`; `px4_vio_bridge` converts that into PX4 `VehicleOdometry` on
@@ -236,6 +236,30 @@ own bag `<mode>_<UTC>` through `px4_vio_bridge.log_paths`. Set
 `PX4_VIO_FLIGHT_LOGS` to record somewhere other than `ros2_ws/flight_logs`.
 
 ## 3D planner monitor
+
+**3D flight:** [unknown-allowed adapter setup and handoff](HANDOFF_3D_FLIGHT_ADAPTER.md).
+The separate `offboard_planner_3d_unknown.launch.py` connects the full amber
+proposal to PX4 using the existing flight sequencer; automatic arming defaults
+off. The monitor itself remains observation-only.
+
+Current behavior: [level-camera exploration routes](PLANNER3D_LEVEL_CAMERA_20260915.md).
+The amber proposal can cross unknown space; the follower uses a separately
+verified local path. No up/down camera scan or robot shape change is required.
+
+See [the latest 06:34:47 bag diagnosis](PLANNER3D_LATEST_BAG_20260915.md) for
+the confirmed 25 cm robot radius, start-connection fix, preparation cache,
+fresh verification, and the remaining camera-coverage limitation.
+
+See the [guided scan handoff](PLANNER3D_SCAN_HANDOFF_20260915.md) for the latest
+carry procedure. Purple unknown-cell markers and an orange forward-clearance
+probe explain partial routes. Use `goal_height_mode:=current` to latch clicked
+XY at the current body height; the default `clicked` mode preserves full XYZ.
+
+The [voxel branch comparison](VOXEL_BRANCH_COMPARISON_20260915.md) explains the
+current short-path failure and the settings missing from the earlier working
+3D setup. ROS launch now forwards `grid_depth_decimation`, `range_min`,
+`range_max`, `mapping_rate_hz` and the `grid_noise_*` / `grid_cluster_*` /
+`grid_min_cluster_size` controls to the mapper. Defaults remain unchanged.
 
 **September 15 ROS integration:** the [current 3D handoff](HANDOFF_3D_NAVIGATION.md)
 contains the implemented pose/map contract, offline results and carry procedure.

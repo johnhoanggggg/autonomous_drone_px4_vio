@@ -9,9 +9,45 @@
 #include <rtabmap/core/Transform.h>
 
 #include "px4_vio_bridge/grid_planner_3d.hpp"
+#include "px4_vio_bridge/octomap_grid.hpp"
+#include <octomap/OcTree.h>
 #include "px4_vio_bridge/rtabmap_octomap.hpp"
 
 namespace p = px4_vio_bridge;
+
+TEST(NativeOctomapGrid, MatchesPointQueriesIncludingPrunedLeavesAndNegativeKeys)
+{
+  octomap::OcTree tree(0.05);
+  for (int z = -8; z < 12; ++z) {
+    for (int y = -12; y < 8; ++y) {
+      for (int x = -10; x < 10; ++x) {
+        tree.setNodeValue((x + 0.5) * 0.05, (y + 0.5) * 0.05, (z + 0.5) * 0.05, -2.0F, true);
+      }
+    }
+  }
+  tree.setNodeValue(0.125, 0.125, 0.125, 2.0F, true);
+  tree.updateInnerOccupancy(); tree.prune();
+  bool coarse = false;
+  for (auto it = tree.begin_leafs(); it != tree.end_leafs(); ++it) {coarse |= it.getSize() > 0.05;}
+  ASSERT_TRUE(coarse);
+  for (const auto dims : {std::array<int, 3>{31, 29, 27}, std::array<int, 3>{1, 1, 1}}) {
+    p::VoxelGrid grid(dims[0], dims[1], dims[2], 0.05, {-0.45, -0.55, -0.35});
+    p::fill_native_octomap_grid(tree, grid);
+    for (int z = 0; z < dims[2]; ++z) {
+      for (int y = 0; y < dims[1]; ++y) {
+        for (int x = 0; x < dims[0]; ++x) {
+          const p::Voxel v{x, y, z}; const auto c = grid.voxel_center(v);
+          const auto * n = tree.search(c.x, c.y, c.z);
+          const auto expected = !n ? p::VoxelState::Unknown :
+            tree.isNodeOccupied(n) ? p::VoxelState::Occupied : p::VoxelState::Free;
+          ASSERT_EQ(grid.at(v), expected) << x << "," << y << "," << z;
+        }
+      }
+    }
+  }
+  p::VoxelGrid unaligned(2, 2, 2, 0.05, {0.01, 0.0, 0.0});
+  EXPECT_THROW(p::fill_native_octomap_grid(tree, unaligned), std::invalid_argument);
+}
 
 namespace
 {
@@ -362,6 +398,8 @@ TEST(RtabmapOctomap, ReplacingNewestAndChangingStableGraphMatchesUncachedMap)
       expect_same_tree(*reference.tree(), *optimized.tree());
       EXPECT_EQ(optimized.metadata().source_nodes, baseline.metadata().source_nodes);
       EXPECT_EQ(optimized.metadata().source_pose_generation, baseline.metadata().source_pose_generation);
+      EXPECT_EQ(optimized.cached_nodes(), poses.size());
+      EXPECT_EQ(baseline.cached_nodes(), poses.size());
     };
   add(1, 0.0F); compare();
   add(2, 0.4F); compare();

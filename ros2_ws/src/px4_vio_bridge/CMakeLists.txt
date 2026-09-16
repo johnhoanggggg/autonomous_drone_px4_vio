@@ -201,6 +201,12 @@ ament_target_dependencies(cpp_flight_adapter
   geometry_msgs nav_msgs px4_msgs rclcpp std_msgs
 )
 
+add_executable(cpp_flight_adapter_3d src/offboard_hover_node.cpp src/offboard_planner_3d_node.cpp)
+target_compile_features(cpp_flight_adapter_3d PUBLIC cxx_std_17)
+target_include_directories(cpp_flight_adapter_3d PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${OCTOMAP_INCLUDE_DIRS})
+target_link_libraries(cpp_flight_adapter_3d planner_flight_cpp planner_3d_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
+ament_target_dependencies(cpp_flight_adapter_3d geometry_msgs nav_msgs px4_msgs rclcpp std_msgs octomap_msgs rtabmap_msgs)
+
 install(TARGETS
   oak_tracked_rgbd_component
   planner_flight_cpp
@@ -215,6 +221,7 @@ install(TARGETS
   cpp_route_follower_3d
   cpp_clearance_shadow
   cpp_flight_adapter
+  cpp_flight_adapter_3d
   cpp_route_follower
   rtabmap_octomap_node
   rtabmap_3d_fixture
@@ -273,6 +280,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_grid_planner_cpp planner_flight_cpp)
   ament_add_gtest(test_grid_planner_3d_cpp test/test_grid_planner_3d.cpp)
   target_link_libraries(test_grid_planner_3d_cpp planner_3d_cpp)
+  ament_add_gtest(test_flight_geometry_3d_cpp test/test_flight_geometry_3d.cpp)
+  target_include_directories(test_flight_geometry_3d_cpp PRIVATE ${OCTOMAP_INCLUDE_DIRS})
+  target_link_libraries(test_flight_geometry_3d_cpp planner_3d_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json ${OCTOMAP_LIBRARIES})
   ament_add_gtest(test_navigation_snapshot_cpp test/test_navigation_snapshot.cpp)
   target_link_libraries(test_navigation_snapshot_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json)
   ament_add_gtest(test_slam_pose_relay_cpp test/test_slam_pose_relay.cpp)
@@ -286,6 +296,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_planner_flight_parity test/test_planner_flight_parity.py)
   ament_add_pytest_test(test_route_follower_parity test/test_route_follower_parity.py)
   ament_add_pytest_test(test_grid_planner_parity test/test_grid_planner_parity.py)
+  ament_add_pytest_test(test_flight_3d_integration test/test_flight_3d_integration.py TIMEOUT 120)
   ament_add_pytest_test(test_ros_planner_3d_integration test/test_ros_planner_3d_integration.py TIMEOUT 120)
   ament_add_pytest_test(test_planner_3d_replay test/test_planner_3d_replay.py)
   ament_add_pytest_test(test_battery_to_ros test/test_battery_to_ros.py)

@@ -76,7 +76,7 @@ def test_ros_octomap_navigation_faults(tmp_path):
     durable = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     subscribe(MapData, "/rtabmap/mapData", durable)
     for topic in ("/planner3d/pose_snapshot", "/planner3d/path_snapshot", "/planner3d/status",
-                  "/planner3d/follower/status", "/planner3d/pose_status"):
+                  "/planner3d/follower/status", "/planner3d/pose_status", "/planner3d/reference_snapshot"):
         subscribe(String, topic)
     subscribe(String, "/rtabmap/octomap_metadata", durable)
     subscribe(Octomap, "/rtabmap/octomap", durable)
@@ -89,6 +89,7 @@ def test_ros_octomap_navigation_faults(tmp_path):
     map_pub = node.create_publisher(MapData, "/rtabmap/mapData", durable)
     goal_pub = node.create_publisher(PointStamped, "/waypoint/clicked", 10)
     path_pub = node.create_publisher(String, "/planner3d/path_snapshot", 10)
+    snapshot_pub = node.create_publisher(String, "/planner3d/pose_snapshot", 10)
     try:
         # Harvest the production deterministic keyframe fixture, then take over
         # its inputs so each fault controls sensor time and map generation.
@@ -108,14 +109,16 @@ def test_ros_octomap_navigation_faults(tmp_path):
             env={**os.environ, "ROS_DOMAIN_ID": str(domain)}, start_new_session=True)
         processes.append(recorder)
         start("rtabmap_octomap_node")
-        start("cpp_ros_planner_pose")
+        pose_process = start("cpp_ros_planner_pose")
         common = {"pose_snapshot_topic": "/planner3d/pose_snapshot", "min_z": 0.2,
                   "max_z": 2.0, "planning_radius_xy": 3.0}
         planner_process = start("cpp_astar_planner_3d", {**common, "voxel_size": 0.1, "planning_timeout_ms": 1000.0})
         start("cpp_route_follower_3d", {**common, "vio_frame_id": "rtabmap_odom"})
         last_odom = last_map = last_goal = 0.0
         mode, shift, goal_z = "normal", 0.0, 1.1
+        map_pitch = 0.0
         map_enabled = True
+        goal_enabled = True
 
         def pump():
             nonlocal last_odom, last_map, last_goal
@@ -124,12 +127,20 @@ def test_ros_octomap_navigation_faults(tmp_path):
                 msg = copy.deepcopy(template)
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.graph.map_to_odom.translation.y = shift
-                msg.graph.map_to_odom.rotation.w = 1.0
+                msg.graph.map_to_odom.rotation.y = math.sin(map_pitch / 2)
+                msg.graph.map_to_odom.rotation.w = math.cos(map_pitch / 2)
                 for pose in msg.graph.poses:
+                    px, pz = pose.position.x, pose.position.z
+                    pose.position.x = math.cos(map_pitch) * px + math.sin(map_pitch) * pz
+                    pose.position.z = -math.sin(map_pitch) * px + math.cos(map_pitch) * pz
                     pose.position.y += shift
+                    q = copy.deepcopy(pose.orientation)
+                    c, s = math.cos(map_pitch / 2), math.sin(map_pitch / 2)
+                    pose.orientation.x, pose.orientation.y = c*q.x+s*q.z, c*q.y+s*q.w
+                    pose.orientation.z, pose.orientation.w = c*q.z-s*q.x, c*q.w-s*q.y
                 map_pub.publish(msg)
                 last_map = clock
-            if clock - last_goal >= 1.0:
+            if goal_enabled and clock - last_goal >= 1.0:
                 goal = PointStamped()
                 goal.header.frame_id = "world"
                 goal.header.stamp = node.get_clock().now().to_msg()
@@ -147,7 +158,7 @@ def test_ros_octomap_navigation_faults(tmp_path):
                 odom.header.frame_id = "wrong" if mode == "frame" else "rtabmap_odom"
                 odom.child_frame_id = "oak"
                 odom.pose.pose.position.x = -1.0
-                odom.pose.pose.position.z = 0.3 if mode == "low_start" else 0.8
+                odom.pose.pose.position.z = 0.3 if mode == "low_start" else (0.85 if mode == "raised" else 0.8)
                 odom.pose.pose.orientation.w = 1.0
                 if mode == "nan":
                     odom.pose.pose.position.z = math.nan
@@ -166,6 +177,17 @@ def test_ros_octomap_navigation_faults(tmp_path):
         path = value("/planner3d/path_snapshot")
         assert path["points"][-1][2] > 1.0, "clicked height must survive planning"
         assert latest("/rtabmap/vio_pose").header.frame_id == "rtabmap_odom"
+
+        # Repeated goals/poses reuse preparation only within the same map.
+        map_enabled = False
+        wait_for(lambda: value("/planner3d/status").get("last_plan_timing", {}).get(
+            "map_cache_hit") is True, seconds=3, pump=pump)
+        cached_generation = value("/planner3d/status")["last_plan_timing"]["map_generation"]
+        map_enabled = True
+        wait_for(lambda: any(
+            (timing := json.loads(msg.data).get("last_plan_timing", {})).get("map_generation", 0)
+            > cached_generation and timing.get("map_cache_hit") is False
+            for _, msg in received["/planner3d/status"]), pump=pump)
 
         # A free center cannot fit the robot envelope through the floor bound.
         # Report that configuration problem instead of generic START_BLOCKED.
@@ -187,6 +209,20 @@ def test_ros_octomap_navigation_faults(tmp_path):
         wait_for(following, pump=pump)
         assert abs(value("/planner3d/pose_snapshot")["pose"][1] - 0.164) < 1e-6
         assert latest("/rtabmap/vio_pose").pose.position.y == 0.0
+
+        # A stable map-frame pitch beyond the old absolute 5-degree limit
+        # must recover after matching map/pose/path generations arrive.
+        map_pitch = math.radians(6.15)
+        wait_for(lambda: abs(value("/planner3d/pose_snapshot").get("correction", [0]*7)[4]
+                             - math.sin(map_pitch/2)) < 1e-6, pump=pump)
+        tilted_generation = value("/planner3d/pose_snapshot")["map_generation"]
+        wait_for(lambda: value("/planner3d/follower/status").get("state") == "FOLLOWING" and
+                 value("/planner3d/follower/status").get("map_generation", 0) >= tilted_generation,
+                 pump=pump)
+        assert value("/planner3d/follower/status")["correction_policy"] == "matched_map_generation"
+        map_pitch = 0.0
+        wait_for(lambda: abs(value("/planner3d/pose_snapshot")["correction"][4]) < 1e-6, pump=pump)
+        wait_for(following, pump=pump)
 
         for fault in ("stale", "future", "frame", "nan", "lost"):
             wait_for(lambda: following() and latest("/planner3d/follower/velocity") is not None and
@@ -247,7 +283,7 @@ def test_ros_octomap_navigation_faults(tmp_path):
         recorder.wait(timeout=15)
         # Rejected snapshots must not keep an earlier route active. These
         # deliberately invalid publisher messages are injected after recording.
-        for path_fault in ("generation", "frame", "future"):
+        for path_fault in ("generation", "frame", "future", "reference"):
             os.killpg(planner_process.pid, signal.SIGSTOP)
             try:
                 map_enabled = False
@@ -257,6 +293,8 @@ def test_ros_octomap_navigation_faults(tmp_path):
                     invalid_path["map_generation"] = -1
                 elif path_fault == "frame":
                     invalid_path["frame_id"] = "wrong"
+                elif path_fault == "reference":
+                    invalid_path["executable"] = False
                 else:
                     invalid_path["stamp_ns"] += 2_000_000_000
                 path_pub.publish(String(data=json.dumps(invalid_path)))
@@ -267,7 +305,27 @@ def test_ros_octomap_navigation_faults(tmp_path):
                 os.killpg(planner_process.pid, signal.SIGCONT)
                 map_enabled = True
             wait_for(following, pump=pump)
-        report["path_faults"] = ["generation", "frame", "future"]
+        report["path_faults"] = ["generation", "frame", "future", "reference"]
+
+        # A same-generation snapshot with a different correction is not a
+        # valid frame change; it must withdraw commands until pairing recovers.
+        wait_for(following, pump=pump)
+        map_enabled = False
+        os.killpg(pose_process.pid, signal.SIGSTOP)
+        try:
+            bad = value("/planner3d/pose_snapshot")
+            bad["stamp_ns"] = node.get_clock().now().nanoseconds
+            bad["correction"][0] += 0.1
+            before = len(received["/planner3d/follower/status"])
+            snapshot_pub.publish(String(data=json.dumps(bad)))
+            wait_for(lambda: any(json.loads(msg.data).get("state") == "CORRECTION_MAP_MISMATCH"
+                                 for _, msg in received["/planner3d/follower/status"][before:]),
+                     seconds=2, pump=pump)
+            wait_for(lambda: not following(), seconds=1, pump=pump)
+        finally:
+            os.killpg(pose_process.pid, signal.SIGCONT)
+            map_enabled = True
+        wait_for(following, pump=pump)
 
         # Identical route geometry may be a partial endpoint or the actual
         # waypoint. Its atomic goal metadata must update without a path reset.
@@ -297,6 +355,45 @@ def test_ros_octomap_navigation_faults(tmp_path):
             map_enabled = True
         wait_for(following, pump=pump)
 
+
+        # Explicit 2D-click input mode selects a fresh body height once per
+        # click while retaining the fully 3D planner and clearance checks.
+        os.killpg(planner_process.pid, signal.SIGINT)
+        planner_process.wait(timeout=10)
+        planner_process = start("cpp_astar_planner_3d", {
+            **common, "voxel_size": 0.1, "planning_timeout_ms": 1000.0,
+            "goal_height_mode": "current", "exploration_route": True})
+        goal_z = 0.0
+        wait_for(lambda: value("/planner3d/status").get("goal_height_mode") == "current" and
+                 value("/planner3d/status").get("state") == "PATH_VALID", pump=pump)
+        status = value("/planner3d/status")
+        assert status["reference_route"]["fully_verified"]
+        wait_for(lambda: len(value("/planner3d/reference_snapshot").get("points", [])) >= 2, pump=pump)
+        assert value("/planner3d/reference_snapshot")["executable"] is False
+        assert value("/planner3d/path_snapshot")["executable"] is True
+        assert status["clicked_goal"][2] == 0.0
+        assert status["requested_goal"][2] == pytest.approx(0.856)
+        assert status["forward_probe"]["diagnostic_only"]
+        assert status["forward_probe"]["radius"] == pytest.approx(0.35)
+        goal_enabled = False
+        mode = "raised"
+        wait_for(lambda: value("/planner3d/status").get("start", [0, 0, 0])[2] > 0.90 and
+                 value("/planner3d/status").get("state") == "PATH_VALID", pump=pump)
+        assert value("/planner3d/status")["requested_goal"][2] == pytest.approx(0.856)
+        mode = "stale"
+        wait_for(lambda: value("/planner3d/status").get("state") == "POSE_STALE", pump=pump)
+        rejected_before = len(received["/planner3d/status"])
+        goal = PointStamped()
+        goal.header.frame_id = "world"
+        goal.header.stamp = node.get_clock().now().to_msg()
+        goal.point.x = 1.0
+        goal_pub.publish(goal)
+        wait_for(lambda: any(json.loads(msg.data).get("state") == "GOAL_HEIGHT_POSE_UNAVAILABLE"
+                 for _, msg in received["/planner3d/status"][rejected_before:]), pump=pump)
+        mode = "normal"
+        goal_enabled = True
+        wait_for(following, pump=pump)
+        report["current_height_goal"] = "latched; stale pose rejected"
 
         audit_script = Path(__file__).resolve().parents[4] / "scripts/audit_planner_3d_bag.py"
         audit_result = subprocess.run(

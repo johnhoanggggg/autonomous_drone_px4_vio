@@ -37,6 +37,9 @@ def main():
     parser.add_argument('--min-z', type=float, default=-1.5)
     parser.add_argument('--max-z', type=float, default=1.5)
     parser.add_argument('--mapdata', action='store_true', help='Replay recorded MapData and raw odometry instead of running the RGB-D estimator')
+    parser.add_argument('--goal-height-mode', choices=['clicked', 'current'], default='clicked')
+    parser.add_argument('--strict-route', action='store_true', help='Disable the exploration reference route')
+    parser.add_argument('--max-marker-voxels', type=int, default=0)
     parser.add_argument('--disable-checkpoints', action='store_true', help='Use full OctoMap rebuilds as a timing baseline')
     parser.add_argument('--test-start-clear-radius', type=float, default=0.0)
     parser.add_argument('--goal-offset', type=float, default=0.75, help='Diagnostic goal offset in world X from first body snapshot')
@@ -87,7 +90,7 @@ def main():
             if topic == '/planner3d/pose_snapshot':
                 latest_pose = row
     subs = []
-    for topic in ['/planner3d/pose_snapshot', '/planner3d/pose_status', '/planner3d/status', '/planner3d/follower/status', '/planner3d/path_snapshot', '/rtabmap/octomap_metadata', '/perf/processes']:
+    for topic in ['/planner3d/pose_snapshot', '/planner3d/pose_status', '/planner3d/status', '/planner3d/follower/status', '/planner3d/path_snapshot', '/planner3d/reference_snapshot', '/rtabmap/octomap_metadata', '/perf/processes']:
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL) if topic.endswith('metadata') else 10
         if topic.startswith('/perf/'):
             qos = qos_profile_sensor_data
@@ -118,11 +121,11 @@ def main():
                 '-p', f'octomap_use_checkpoints:={str(not args.disable_checkpoints).lower()}'])
         else:
             backend = start('backend', [str(prefix / 'lib/px4_vio_bridge/ros_rtabmap_backend'), 'start_camera:=false', 'use_sim_time:=true', 'foxglove:=false', 'use_imu:=false', 'odometry_rate_hz:=0.0', 'odom_reset_countdown:=0', 'keep_latest_frame:=true', 'odom_key_frame_thr:=0.3', 'odom_vis_keyframe_thr:=150', f'camera_config:={share}/config/oak_v3_rtabmap_tracked.yaml', f'odom_config_path:={share}/config/rtabmap_ros_parity.ini', 'max_marker_voxels:=0', f'test_start_clear_radius:={args.test_start_clear_radius}', f'octomap_use_checkpoints:={str(not args.disable_checkpoints).lower()}'])
-        monitor = start('monitor', ['ros2', 'launch', 'px4_vio_bridge', 'ros_planner_3d_monitor.launch.py', 'use_sim_time:=true', f'min_z:={args.min_z}', f'max_z:={args.max_z}', 'max_marker_voxels:=0'])
+        monitor = start('monitor', ['ros2', 'launch', 'px4_vio_bridge', 'ros_planner_3d_monitor.launch.py', 'use_sim_time:=true', f'min_z:={args.min_z}', f'max_z:={args.max_z}', f'goal_height_mode:={args.goal_height_mode}', f'exploration_route:={str(not args.strict_route).lower()}', f'max_marker_voxels:={args.max_marker_voxels}'])
         from px4_vio_bridge.process_monitor import NATIVE_3D_TARGETS
         perf_topics = ['/perf/cpu_percent', '/perf/mem_percent', '/perf/cpu_temp_c', '/perf/load1', '/perf/throttled', '/perf/processes']
         perf_topics += [f'/perf/process/{label}/{metric}' for label in NATIVE_3D_TARGETS for metric in ('cpu_percent', 'mem_mb')]
-        recorder = start('recorder', ['ros2', 'bag', 'record', '--storage', 'mcap', '--storage-preset-profile', 'fastwrite', '--disable-keyboard-controls', '--output', str(out / 'bag'), '--topics', '/clock', '/tf', '/tf_static', '/rtabmap/mapData', '/rtabmap/octomap', '/rtabmap/octomap_metadata', '/rtabmap/vio_odometry', '/planner3d/pose_snapshot', '/planner3d/path_snapshot', '/planner3d/status', '/planner3d/pose_status', '/planner3d/follower/status', '/waypoint/clicked', '/planner3d/test_start_clear', *perf_topics])
+        recorder = start('recorder', ['ros2', 'bag', 'record', '--storage', 'mcap', '--storage-preset-profile', 'fastwrite', '--disable-keyboard-controls', '--output', str(out / 'bag'), '--topics', '/clock', '/tf', '/tf_static', '/rtabmap/mapData', '/rtabmap/octomap', '/rtabmap/octomap_metadata', '/rtabmap/vio_odometry', '/planner3d/pose_snapshot', '/planner3d/path_snapshot', '/planner3d/reference_path', '/planner3d/reference_snapshot', '/planner3d/status', '/planner3d/pose_status', '/planner3d/follower/status', '/planner3d/follower/velocity', '/planner3d/follower/acceleration', '/planner3d/follower/valid', '/waypoint/clicked', '/planner3d/test_start_clear', '/planner3d/markers', *perf_topics])
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.05)
@@ -171,6 +174,7 @@ def main():
         assert not any((name.startswith('/fmu/in/') for name in topics)), topics
         summary = {'pose_interface_valid': counts['/planner3d/pose_snapshot'] > 0 and counts['/rtabmap/octomap_metadata'] > 0, 'source_bag': str(args.bag), 'domain': args.domain, 'counts': dict(counts), 'states': dict(states), 'goal_sent': sent_goal, 'no_fmu_inputs': True, 'player_returncode': player.returncode, 'latest_pose': latest_pose}
         summary.update({'mapdata_replay': args.mapdata, 'checkpoints_enabled': not args.disable_checkpoints,
+                        'goal_height_mode': args.goal_height_mode, 'exploration_route': not args.strict_route, 'max_marker_voxels': args.max_marker_voxels,
                         'test_start_clear_radius': args.test_start_clear_radius, 'recorded_goals': args.recorded_goals,
                         'synthetic_held_start_pose': args.hold_start_pose})
         (out / 'report.json').write_text(json.dumps(summary, indent=2) + '\n')

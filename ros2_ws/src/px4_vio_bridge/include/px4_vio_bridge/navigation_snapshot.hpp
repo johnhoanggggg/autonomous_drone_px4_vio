@@ -40,6 +40,17 @@ inline nlohmann::json pose_json(const Pose3 & pose)
     pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w};
 }
 
+inline bool same_snapshot_transform(const Pose3 & a, const Pose3 & b)
+{
+  const auto & p = a.position; const auto & q = b.position;
+  if (std::hypot(std::hypot(p.x - q.x, p.y - q.y), p.z - q.z) > 1e-6) {return false;}
+  const auto & u = a.orientation; const auto & v = b.orientation;
+  const double dot = u.x*v.x + u.y*v.y + u.z*v.z + u.w*v.w;
+  const double norms = std::sqrt((u.x*u.x+u.y*u.y+u.z*u.z+u.w*u.w) *
+    (v.x*v.x+v.y*v.y+v.z*v.z+v.w*v.w));
+  return std::isfinite(norms) && norms > 0.0 && std::abs(dot) / norms >= 1.0 - 1e-12;
+}
+
 inline Pose3 camera_to_body(const Pose3 & camera, const Vec3 & offset_frd)
 {
   const auto offset = rotate(camera.orientation, {offset_frd.x, -offset_frd.y, -offset_frd.z});

@@ -366,7 +366,8 @@ bool RtabmapOctomapAssembler::update(
   // update may immediately replace or remove.
   bool has_new_observation = false;
   for (const auto & observation : observations) {
-    if (observation.node_id > 0 && cache_.find(observation.node_id) == cache_.end() &&
+    if (observation.node_id > 0 && optimized_poses.find(observation.node_id) != optimized_poses.end() &&
+      cache_.find(observation.node_id) == cache_.end() &&
       !(observation.ground.empty() && observation.obstacles.empty() && observation.empty.empty()))
     {
       has_new_observation = true;
@@ -389,6 +390,7 @@ bool RtabmapOctomapAssembler::update(
 
   for (const auto & observation : observations) {
     if (observation.node_id <= 0 ||
+      optimized_poses.find(observation.node_id) == optimized_poses.end() ||
       cache_.find(observation.node_id) != cache_.end() ||
       (observation.ground.empty() && observation.obstacles.empty() && observation.empty.empty()))
     {
@@ -513,6 +515,16 @@ bool RtabmapOctomapAssembler::update(
     if (error != nullptr) {*error = "RTAB-Map OctoMap error: unknown exception";}
     return false;
   }
+  // Drop grids only after the graph transition has been assembled. The tree
+  // and checkpoint own their evidence independently of these cv::Mat buffers.
+  // Keep cache_ at the same address: OctoMap retains a pointer to it.
+  rtabmap::LocalGridCache retained;
+  for (const auto & item : cache_.localGrids()) {
+    if (optimized_poses.find(item.first) != optimized_poses.end()) {
+      retained.add(item.first, item.second);
+    }
+  }
+  cache_ = std::move(retained);
   return refresh_metadata(optimized_poses, error);
 }
 

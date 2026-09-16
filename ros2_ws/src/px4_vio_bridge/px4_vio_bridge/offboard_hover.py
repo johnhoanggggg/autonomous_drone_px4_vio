@@ -41,6 +41,7 @@ from px4_msgs.msg import (
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Int32
+from px4_vio_bridge.process_singleton import ProcessSingleton
 
 
 def wrap_pi(angle):
@@ -59,6 +60,7 @@ def yaw_from_quaternion(q):
 class OffboardHover(Node):
     def __init__(self, node_name="offboard_hover"):
         super().__init__(node_name)
+        self._flight_authority = ProcessSingleton("flight_authority", lock_directory="/tmp")
 
         self.declare_parameter("hover_height", 0.30)      # meters up
         self.declare_parameter("hold_time", 10.0)         # seconds at altitude
@@ -265,6 +267,12 @@ class OffboardHover(Node):
         self.setup_keyboard_controls()
 
     # --- keyboard flight controls ----------------------------------------
+    def destroy_node(self):
+        try:
+            return super().destroy_node()
+        finally:
+            self._flight_authority.close()
+
     def setup_keyboard_controls(self):
         if not self.keyboard_kill and not self.keyboard_land:
             self.get_logger().warn("keyboard kill and land controls disabled by parameters")

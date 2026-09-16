@@ -6,6 +6,30 @@
 
 namespace p = px4_vio_bridge;
 
+TEST(RouteFollower3D, TiltedMapLimitsRespectContinuousFrameSpeedAndAcceleration)
+{
+  const p::Follower3DConfig original;
+  for (const double angle : {0.0, 0.1073, 0.5, 1.5707963267948966, 3.141592653589793}) {
+    const double c = std::cos(angle), s = std::sin(angle);
+    const auto adjusted = p::limits_for_map_tilt(original, c);
+    for (int i = 0; i < 32; ++i) {
+      for (const double sign : {-1.0, 1.0}) {
+        const double theta = i * 6.283185307179586 / 32;
+        for (const bool acceleration : {false, true}) {
+          const double h = acceleration ? adjusted.max_horizontal_acceleration : adjusted.max_horizontal_speed;
+          const double v = acceleration ? adjusted.max_vertical_acceleration : adjusted.max_vertical_speed;
+          const double x = h * std::cos(theta), y = h * std::sin(theta), z = sign * v;
+          const double raw_x = c * x - s * z, raw_y = y, raw_z = s * x + c * z;
+          EXPECT_LE(std::hypot(raw_x, raw_y), (acceleration ? original.max_horizontal_acceleration :
+            original.max_horizontal_speed) + 1e-12);
+          EXPECT_LE(std::abs(raw_z), (acceleration ? original.max_vertical_acceleration :
+            original.max_vertical_speed) + 1e-12);
+        }
+      }
+    }
+  }
+}
+
 TEST(PathGeometry3D, ProjectionAndArcLengthUseXYZ)
 {
   p::Polyline3D path({{0.0, 0.0, 0.0}, {1.0, 0.0, 1.0}, {1.0, 1.0, 1.0}});
@@ -88,4 +112,37 @@ TEST(RouteFollower3D, ArrivalUsesActualXYZEndpoint)
     {0.05, 0.0, 0.55}, 0.1, [](const auto &, const auto &) {return true;});
   EXPECT_TRUE(result.valid);
   EXPECT_TRUE(result.reached);
+}
+
+TEST(RouteFollower3D, BrakesAtShortEndpointWithoutAccelerationSpike)
+{
+  const p::Follower3DConfig config;
+  for (const double sign : {-1.0, 1.0}) {
+    p::RouteFollower3D follower(config);
+    const p::Point3 end{sign * 0.11, sign * 0.035, sign * 0.065};
+    ASSERT_TRUE(follower.set_path({{}, end}, {}));
+    p::Point3 previous_velocity{}, previous_carrot{};
+    for (int i = 0; i < 300; ++i) {
+      // Variable timer intervals must preserve the braking guarantee.
+      const double dt = i % 3 == 0 ? 0.03 : (i % 3 == 1 ? 0.07 : 0.05);
+      const auto r = follower.update({}, dt, [](const auto &, const auto &) {return true;});
+      ASSERT_TRUE(r.valid) << r.reason;
+      EXPECT_LE(std::hypot(r.velocity.x, r.velocity.y), config.max_horizontal_speed + 1e-9);
+      EXPECT_LE(std::abs(r.velocity.z), config.max_vertical_speed + 1e-9);
+      EXPECT_LE(std::hypot(r.acceleration.x, r.acceleration.y),
+        config.max_horizontal_acceleration + 1e-9);
+      EXPECT_LE(std::abs(r.acceleration.z), config.max_vertical_acceleration + 1e-9);
+      EXPECT_NEAR((r.velocity.z - previous_velocity.z) / dt, r.acceleration.z, 1e-9);
+      EXPECT_NEAR((r.carrot.z - previous_carrot.z) / dt, r.velocity.z, 1e-9);
+      EXPECT_GE(sign * r.carrot.x, -1e-9);
+      EXPECT_LE(sign * r.carrot.x, sign * end.x + 1e-9);
+      EXPECT_LE(sign * r.carrot.y, sign * end.y + 1e-9);
+      EXPECT_LE(sign * r.carrot.z, sign * end.z + 1e-9);
+      previous_velocity = r.velocity; previous_carrot = r.carrot;
+    }
+    EXPECT_NEAR(previous_carrot.x, end.x, 1e-6);
+    EXPECT_NEAR(previous_carrot.y, end.y, 1e-6);
+    EXPECT_NEAR(previous_carrot.z, end.z, 1e-6);
+    EXPECT_NEAR(p::distance_3d(previous_velocity, {}), 0.0, 1e-6);
+  }
 }

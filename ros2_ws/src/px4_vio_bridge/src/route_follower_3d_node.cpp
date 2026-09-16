@@ -31,6 +31,7 @@
 #include <std_msgs/msg/string.hpp>
 
 #include "px4_vio_bridge/grid_planner_3d.hpp"
+#include "px4_vio_bridge/octomap_grid.hpp"
 #include "px4_vio_bridge/navigation_snapshot.hpp"
 #include "px4_vio_bridge/route_follower_3d.hpp"
 
@@ -53,6 +54,7 @@ struct MapMetadata
   std::int64_t stamp_ns{};
   double resolution{};
   std::string frame_id;
+  std::optional<Pose3> correction;
 };
 
 struct Correction3D
@@ -264,7 +266,9 @@ private:
       }
       pending_metadata_ = MapMetadata{
         json.at("generation").get<std::int64_t>(), json.at("stamp_ns").get<std::int64_t>(),
-        json.at("resolution").get<double>(), json.at("frame_id").get<std::string>()};
+        json.at("resolution").get<double>(), json.at("frame_id").get<std::string>(),
+        json.contains("map_from_odom") ? std::optional<Pose3>(snapshot_pose(json.at("map_from_odom"))) :
+        std::nullopt};
       try_accept_map();
     } catch (const std::exception &) {
       pending_metadata_.reset();
@@ -285,6 +289,7 @@ private:
     octree_ = std::move(pending_octree_);
     map_generation_ = pending_metadata_->generation;
     map_stamp_ = pending_metadata_->stamp_ns;
+    map_correction_ = pending_metadata_->correction;
     pending_metadata_.reset();
     map_received_ = steady_seconds();
     follower_->clear();
@@ -299,6 +304,7 @@ private:
       const auto stamp = value.at("stamp_ns").get<std::int64_t>();
       // A delayed old packet cannot supersede or refresh an accepted path.
       if (stamp <= path_stamp_) {return;}
+      if (!value.value("executable", true)) {throw std::invalid_argument("reference is not executable");}
       if (value.at("frame_id") != frame_id_ ||
         !fresh_stamp(stamp, now().nanoseconds(), path_timeout_))
       {
@@ -344,6 +350,7 @@ private:
       const auto pose = snapshot_pose(value.at("pose"));
       snapshot_pose(value.at("raw_pose"));
       const auto correction = snapshot_pose(value.at("correction"));
+      snapshot_correction_ = correction;
       geometry_msgs::msg::PoseStamped msg;
       msg.header.frame_id = frame_id_; msg.header.stamp = rclcpp::Time(stamp);
       msg.pose.position.x = correction.position.x; msg.pose.position.y = correction.position.y;
@@ -368,6 +375,14 @@ private:
       return;
     }
     if (accepted_path_stamp_ == path_stamp_ && active_path_generation_) {return;}
+    if (!snapshot_topic_.empty()) {
+      if (!correction_ || !map_correction_ || !snapshot_correction_ ||
+        !same_snapshot_transform(*map_correction_, *snapshot_correction_)) {return;}
+      if (configured_map_generation_ != map_generation_) {
+        follower_ = std::make_unique<RouteFollower3D>(limits_for_map_tilt(config_, correction_->rotation[8]));
+        configured_map_generation_ = map_generation_;
+      }
+    }
     if (active_path_generation_ && active_points_.size() == pending_path_.size() &&
       std::equal(active_points_.begin(), active_points_.end(), pending_path_.begin(),
         [](const Point3 & a, const Point3 & b) {return a.x == b.x && a.y == b.y && a.z == b.z;}))
@@ -438,10 +453,17 @@ private:
       invalid("PATH_STALE"); return;
     }
     const auto translation = distance_3d(correction_->translation, {});
-    if (translation > max_correction_translation_ ||
+    if (!snapshot_topic_.empty() && (!map_correction_ || !snapshot_correction_ ||
+      !same_snapshot_transform(*map_correction_, *snapshot_correction_)))
+    {invalid("CORRECTION_MAP_MISMATCH"); return;}
+    // Atomic mode already requires a fresh matched map, pose and path and
+    // resets the follower on every map generation. A stable global frame
+    // offset is not a persistent motion jump. Keep the legacy absolute guard
+    // for independently delivered correction/pose topics.
+    if (snapshot_topic_.empty() && (translation > max_correction_translation_ ||
       std::abs(correction_->yaw) > max_correction_yaw_ ||
       std::abs(correction_->roll) > max_correction_roll_pitch_ ||
-      std::abs(correction_->pitch) > max_correction_roll_pitch_)
+      std::abs(correction_->pitch) > max_correction_roll_pitch_))
     {
       invalid("CORRECTION_LIMIT"); return;
     }
@@ -492,14 +514,10 @@ private:
     const auto depth = dimension(origin.z, std::max(start.z, end.z) + padding);
     if (width * height * depth > 2000000ULL) {return false;}
     VoxelGrid grid(width, height, depth, resolution, origin);
-    for (int z = 0; z < static_cast<int>(depth); ++z) {
-      for (int y = 0; y < static_cast<int>(height); ++y) {
-        for (int x = 0; x < static_cast<int>(width); ++x) {
-          const Voxel voxel{x, y, z};
-          const auto state = octomap_state(grid.voxel_center(voxel));
-          if (state) {grid.set(voxel, *state);}
-        }
-      }
+    if (const auto * tree = dynamic_cast<const octomap::OcTree *>(octree_.get())) {
+      fill_native_octomap_grid(*tree, grid);
+    } else if (const auto * tree = dynamic_cast<const octomap::ColorOcTree *>(octree_.get())) {
+      fill_native_octomap_grid(*tree, grid);
     }
     return swept_sphere_clear(grid, start, end, required_clearance_);
   }
@@ -579,6 +597,7 @@ private:
     status["carrot"] = {result.carrot.x, result.carrot.y, result.carrot.z};
     status["lookahead"] = {result.lookahead.x, result.lookahead.y, result.lookahead.z};
     status["lethal_radius"] = required_clearance_;
+    status["correction_policy"] = snapshot_topic_.empty() ? "absolute_limits" : "matched_map_generation";
     status["path_map_generation"] = active_path_generation_.value_or(0);
     status["cross_track"] = result.projection.horizontal_distance;
     status["vertical_track"] = result.projection.vertical_distance;
@@ -612,6 +631,8 @@ private:
   double min_z_{};
   double max_z_{};
   double required_clearance_{};
+  std::optional<Pose3> map_correction_, snapshot_correction_;
+  std::int64_t configured_map_generation_{};
   double max_correction_translation_{};
   double max_correction_yaw_{};
   double max_correction_roll_pitch_{};

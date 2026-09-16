@@ -51,6 +51,7 @@ struct Planner3DConfig
   double cost_weight{2.0};
   double timeout_ms{150.0};
   double start_recovery_radius{0.20};
+  bool project_blocked_goal{false};
 };
 
 struct SearchResult3D
@@ -86,6 +87,18 @@ struct PlanResult3D
   [[nodiscard]] bool found() const {return !path.empty();}
 };
 
+// Diagnostic only: native non-free boxes touched by a spherical envelope.
+// This never changes occupancy or grants clearance to a path.
+struct SphereBlockers3D
+{
+  bool inside_bounds{};
+  std::vector<Voxel> unknown;
+  std::vector<Voxel> occupied;
+};
+
+[[nodiscard]] SphereBlockers3D sphere_blockers_3d(
+  const VoxelGrid & raw, const Point3 & center, double radius);
+
 [[nodiscard]] CostVoxelGrid inflate_voxels(
   const VoxelGrid & grid, double lethal_radius, double inflation_radius,
   double cost_scaling = 3.0);
@@ -120,6 +133,28 @@ struct PlanResult3D
   const VoxelGrid & raw, const std::vector<Point3> & path, double radius);
 
 [[nodiscard]] double path_length_3d(const std::vector<Point3> & path);
+
+// Own one immutable map and its inflation together. Reuse for pose/goal changes;
+// replace the whole object whenever the map generation or configuration changes.
+class PreparedPlanner3D
+{
+public:
+  PreparedPlanner3D(VoxelGrid raw, const Planner3DConfig & config,
+    const CostVoxelGrid * verified_costs = nullptr);
+  [[nodiscard]] const VoxelGrid & raw() const {return raw_;}
+  [[nodiscard]] const CostVoxelGrid & costs() const {return inflated_;}
+  [[nodiscard]] PlanResult3D plan(const Point3 & start, const Point3 & goal) const;
+
+private:
+  VoxelGrid raw_;
+  Planner3DConfig config_;
+  CostVoxelGrid inflated_;
+};
+
+// Longest continuously verified prefix of a proposed route. Unknown remains
+// blocked here even when the proposal was planned optimistically.
+[[nodiscard]] std::vector<Point3> verified_prefix_3d(
+  const VoxelGrid & observed, const std::vector<Point3> & proposed, double radius);
 
 [[nodiscard]] PlanResult3D plan_path_3d(
   const VoxelGrid & raw, const Point3 & start, const Point3 & requested_goal,

@@ -1,5 +1,53 @@
 # ROS-native RTAB-Map Migration — Results Handoff
 
+## Current flight continuation: unknown-allowed adapter
+
+[The flight adapter handoff](HANDOFF_3D_FLIGHT_ADAPTER.md) describes the dedicated
+PX4 consumer of the unknown-allowed reference, its launch and controls, command
+checks, CPU recording and offline audit. This supersedes historical statements
+that the 3D route has no flight consumer. The monitor remains observation-only;
+flight requires the separate `offboard_planner_3d_unknown.launch.py` launch.
+
+## Current behavior: level-camera exploration route
+
+See [the level-camera planner update](PLANNER3D_LEVEL_CAMERA_20260915.md).
+The sphere stays at 25 cm plus 10 cm margin. Up/down scan instructions are
+withdrawn. The monitor now proposes a penalized-unknown global route and
+keeps a separate verified local path for the follower. The update describes
+the new topics, map-sampling optimization, recovery from stable SLAM frame
+corrections, and current verification (752 tests, zero failures, three skips).
+
+## Latest 3D continuation: September 15, 06:34:47 test
+
+See [the latest bag report](PLANNER3D_LATEST_BAG_20260915.md): confirmed 25 cm
+robot radius, fixed false off-center start recovery, and cached per-generation
+grid preparation. At that revision: 745 tests, zero failures, three skips.
+The native replay audit passes, but the recorded camera coverage still does
+not establish a complete route to the requested waypoint.
+
+## Latest follow-up: visible blockers and current-height goals
+
+Read [the guided scan handoff](PLANNER3D_SCAN_HANDOFF_20260915.md). A calibrated
+optimistic-visibility test confirms that the existing yaw bag cannot connect
+its 50 cm start clearing on the native grid, even if every recorded camera
+view is granted free space. New forward-clearance markers identify the unknown
+cells to observe. `goal_height_mode:=current` optionally latches a clicked
+waypoint at fresh body height; default `clicked` still preserves XYZ. The
+historical scan procedure is superseded by the level-camera update above.
+
+## Latest comparison: voxel-perception-tuning and the 05:39 yaw test
+
+Read [the branch comparison](VOXEL_BRANCH_COMPARISON_20260915.md) before another
+carry test. The old documented setup used a 1 m unknown-only clear assertion,
+decimation 2, range minimum 0.80 m, opt-in frustum fill, and a fixed planning
+height. Those tuning commits were absent from the ROS migration. Controlled
+reconstruction of the new bag still yields only 10–13 cm paths with the
+requested 50 cm clearing; a diagnostic 1 m assertion plus dense measured rays
+reaches about 1.9 m, still a partial route. The old cache bound and missing
+ROS depth-tuning controls have been restored. Existing defaults, the 50 cm
+limit, and current-generation clearance checks are retained. See the report
+for measured results, limitations and current verification.
+
 ## Latest waypoint follow-up — September 15 at 05:15
 
 The stationary test failed because its configured floor boundary clipped the

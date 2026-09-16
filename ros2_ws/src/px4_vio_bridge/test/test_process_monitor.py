@@ -14,12 +14,14 @@ def test_native_3d_profile_is_bounded_to_the_graph_processes() -> None:
     assert list(sorted(NATIVE_3D_TARGETS)) == [
         "bag_record",
         "cpp_astar_planner_3d",
+        "cpp_flight_adapter_3d",
         "cpp_ros_planner_pose",
         "cpp_route_follower_3d",
         "foxglove",
         "mapper_container",
         "oak_container",
         "rtabmap_octomap_node",
+        "vio_bridge_3d",
     ]
     assert NATIVE_3D_TARGETS["oak_container"] != NATIVE_3D_TARGETS["mapper_container"]
 
@@ -44,6 +46,8 @@ def test_native_3d_patterns_match_nodes_and_not_launchers() -> None:
         "cpp_ros_planner_pose": f"{prefix}/lib/px4_vio_bridge/cpp_ros_planner_pose --ros-args",
         "cpp_astar_planner_3d": f"{prefix}/lib/px4_vio_bridge/cpp_astar_planner_3d --ros-args",
         "cpp_route_follower_3d": f"{prefix}/lib/px4_vio_bridge/cpp_route_follower_3d --ros-args",
+        "cpp_flight_adapter_3d": f"{prefix}/lib/px4_vio_bridge/cpp_flight_adapter_3d --ros-args",
+        "vio_bridge_3d": f"python3 {prefix}/lib/px4_vio_bridge/vio_to_px4_odometry --ros-args",
         "foxglove": "/opt/ros/jazzy/lib/foxglove_bridge/foxglove_bridge --ros-args",
     }
     launch = "/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch px4_vio_bridge " \

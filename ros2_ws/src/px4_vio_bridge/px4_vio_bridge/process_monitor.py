@@ -89,6 +89,8 @@ NATIVE_3D_TARGETS = {
     "cpp_ros_planner_pose": "lib/px4_vio_bridge/cpp_ros_planner_pose",
     "cpp_astar_planner_3d": "lib/px4_vio_bridge/cpp_astar_planner_3d",
     "cpp_route_follower_3d": "lib/px4_vio_bridge/cpp_route_follower_3d",
+    "cpp_flight_adapter_3d": "lib/px4_vio_bridge/cpp_flight_adapter_3d",
+    "vio_bridge_3d": "lib/px4_vio_bridge/vio_to_px4_odometry",
     "bag_record": "ros2 bag record",
     # Match the installed bridge executable, rather than the package name:
     # ros2 launch command lines include ``foxglove_bridge_launch.xml`` too.

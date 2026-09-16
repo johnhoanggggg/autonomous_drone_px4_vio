@@ -21,6 +21,17 @@ TEST(NavigationSnapshot, InvalidGeometryCannotBecomeIdentity)
   EXPECT_THROW(snapshot_pose({0, 0, 0}), std::invalid_argument);
 }
 
+TEST(NavigationSnapshot, CorrectionMustMatchMapIncludingQuaternionSignEquivalence)
+{
+  const auto a = snapshot_pose({0.2, -0.1, 0.3, 0, 0, 0, 1});
+  auto b = snapshot_pose({0.2, -0.1, 0.3, 0, 0, 0, -1});
+  EXPECT_TRUE(same_snapshot_transform(a, b));
+  b.position.x += 0.001;
+  EXPECT_FALSE(same_snapshot_transform(a, b));
+  b = snapshot_pose({0.2, -0.1, 0.3, 0, std::sin(0.1), 0, std::cos(0.1)});
+  EXPECT_FALSE(same_snapshot_transform(a, b));
+}
+
 TEST(NavigationSnapshot, BodyOffsetRotatesAndComposesWithMapCorrection)
 {
   const auto half = std::sqrt(0.5);

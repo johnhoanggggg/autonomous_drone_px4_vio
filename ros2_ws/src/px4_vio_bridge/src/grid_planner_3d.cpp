@@ -270,6 +270,48 @@ std::optional<Voxel> CostVoxelGrid::world_to_voxel(const Point3 & point) const
   return in_bounds(voxel) ? std::optional<Voxel>(voxel) : std::nullopt;
 }
 
+SphereBlockers3D sphere_blockers_3d(
+  const VoxelGrid & raw, const Point3 & center, double radius)
+{
+  if (!std::isfinite(center.x) || !std::isfinite(center.y) || !std::isfinite(center.z) ||
+    !std::isfinite(radius) || radius < 0.0 || raw.size() == 0)
+  {
+    throw std::invalid_argument("invalid clearance diagnostic sphere");
+  }
+  SphereBlockers3D result;
+  const auto upper = raw.upper_bound();
+  result.inside_bounds = center.x - radius >= raw.origin().x &&
+    center.y - radius >= raw.origin().y && center.z - radius >= raw.origin().z &&
+    center.x + radius <= upper.x && center.y + radius <= upper.y && center.z + radius <= upper.z;
+  const auto r = raw.resolution();
+  const auto index = [r](double value, double origin, std::size_t size) {
+      return static_cast<int>(std::clamp(std::floor((value - origin) / r),
+        0.0, static_cast<double>(size - 1)));
+    };
+  for (int z = index(center.z - radius - 1e-12, raw.origin().z, raw.depth());
+    z <= index(center.z + radius + 1e-12, raw.origin().z, raw.depth()); ++z)
+  {
+    for (int y = index(center.y - radius - 1e-12, raw.origin().y, raw.height());
+      y <= index(center.y + radius + 1e-12, raw.origin().y, raw.height()); ++y)
+    {
+      for (int x = index(center.x - radius - 1e-12, raw.origin().x, raw.width());
+        x <= index(center.x + radius + 1e-12, raw.origin().x, raw.width()); ++x)
+      {
+        const Voxel voxel{x, y, z};
+        if (raw.at(voxel) == VoxelState::Free) {continue;}
+        const Point3 lower{raw.origin().x + x * r, raw.origin().y + y * r,
+          raw.origin().z + z * r};
+        if (point_box_distance_squared(center, lower,
+            {lower.x + r, lower.y + r, lower.z + r}) <= radius * radius + 1e-12)
+        {
+          (raw.at(voxel) == VoxelState::Unknown ? result.unknown : result.occupied).push_back(voxel);
+        }
+      }
+    }
+  }
+  return result;
+}
+
 CostVoxelGrid inflate_voxels(
   const VoxelGrid & grid, double lethal_radius, double inflation_radius,
   double cost_scaling)
@@ -615,7 +657,10 @@ bool swept_sphere_clear(
 std::vector<Point3> simplify_path_3d(
   const VoxelGrid & raw, const std::vector<Point3> & path, double radius)
 {
-  if (path.size() < 3) {return path;}
+  if (path.empty()) {return {};}
+  if (path.size() == 1) {
+    return swept_sphere_clear(raw, path.front(), path.front(), radius) ? path : std::vector<Point3>{};
+  }
   std::vector<Point3> simplified{path.front()};
   std::size_t anchor = 0;
   while (anchor + 1 < path.size()) {
@@ -654,19 +699,105 @@ PlanResult3D plan_path_3d(
     result.reason = "INVALID_CONFIG";
     return result;
   }
+  return PreparedPlanner3D(raw, config).plan(start, requested_goal);
+}
+
+PreparedPlanner3D::PreparedPlanner3D(
+  VoxelGrid raw, const Planner3DConfig & config, const CostVoxelGrid * verified_costs)
+: raw_(std::move(raw)), config_(config),
+  inflated_(inflate_voxels(raw_, config.lethal_radius, config.inflation_radius, config.cost_scaling))
+{
+  if (verified_costs) {
+    if (verified_costs->width() != raw_.width() || verified_costs->height() != raw_.height() ||
+      verified_costs->depth() != raw_.depth() || verified_costs->resolution() != raw_.resolution())
+    {throw std::invalid_argument("reference cost geometry mismatch");}
+    for (int z = 0; z < static_cast<int>(raw_.depth()); ++z) {
+      for (int y = 0; y < static_cast<int>(raw_.height()); ++y) {
+        for (int x = 0; x < static_cast<int>(raw_.width()); ++x) {
+          const Voxel v{x, y, z};
+          if (inflated_.traversable(v) && !verified_costs->traversable(v)) {
+            inflated_.set(v, std::max<std::int16_t>(200, inflated_.at(v)));
+          }
+        }
+      }
+    }
+  }
+}
+
+std::vector<Point3> verified_prefix_3d(
+  const VoxelGrid & observed, const std::vector<Point3> & proposed, double radius)
+{
+  if (proposed.empty() || !swept_sphere_clear(observed, proposed.front(), proposed.front(), radius)) {
+    return {};
+  }
+  std::vector<Point3> prefix{proposed.front()};
+  for (std::size_t i = 1; i < proposed.size(); ++i) {
+    const auto & a = proposed[i - 1];
+    const auto & b = proposed[i];
+    if (swept_sphere_clear(observed, a, b, radius)) {prefix.push_back(b); continue;}
+    double low = 0.0, high = 1.0;
+    const auto point = [&](double t) {
+        return Point3{a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), a.z + t * (b.z - a.z)};
+      };
+    for (int iteration = 0; iteration < 24; ++iteration) {
+      const auto mid = (low + high) * 0.5;
+      if (swept_sphere_clear(observed, a, point(mid), radius)) {low = mid;} else {high = mid;}
+    }
+    if (distance(a, point(low)) > 1.0e-6) {prefix.push_back(point(low));}
+    break;
+  }
+  return prefix.size() >= 2 ? prefix : std::vector<Point3>{};
+}
+
+PlanResult3D PreparedPlanner3D::plan(const Point3 & start, const Point3 & requested_goal) const
+{
+  PlanResult3D result;
+  const auto & raw = raw_;
+  const auto & config = config_;
+  const auto & inflated = inflated_;
   const auto start_voxel = raw.world_to_voxel(start);
   if (!start_voxel) {result.reason = "START_OUTSIDE_MAP"; return result;}
-  auto inflated = inflate_voxels(
-    raw, config.lethal_radius, config.inflation_radius, config.cost_scaling);
-  const auto recovered = recover_start_3d(
-    raw, inflated, *start_voxel, config.start_recovery_radius);
+  // A cell center can be blocked even while the actual off-center body is
+  // clear. Attach that body to a nearby traversable center only after proving
+  // the complete connecting chord. This is ordinary planning, not recovery
+  // from an invalid physical envelope.
+  std::optional<Voxel> recovered;
+  const bool start_clear = swept_sphere_clear(raw, start, start, config.lethal_radius);
+  if (start_clear) {
+    std::vector<std::pair<double, Voxel>> candidates;
+    const int limit = static_cast<int>(std::ceil(config.start_recovery_radius / raw.resolution()));
+    for (int z = -limit; z <= limit; ++z) {
+      for (int y = -limit; y <= limit; ++y) {
+        for (int x = -limit; x <= limit; ++x) {
+          const Voxel v{start_voxel->x + x, start_voxel->y + y, start_voxel->z + z};
+          if (!inflated.traversable(v)) {continue;}
+          const auto d = distance(start, raw.voxel_center(v));
+          if (v == *start_voxel || d <= config.start_recovery_radius) {
+            candidates.emplace_back(d, v);
+          }
+        }
+      }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto & a, const auto & b) {
+        return a.first < b.first;
+      });
+    for (const auto & candidate : candidates) {
+      if (swept_sphere_clear(raw, start, raw.voxel_center(candidate.second), config.lethal_radius)) {
+        recovered = candidate.second;
+        break;
+      }
+    }
+    if (!recovered) {result.reason = "NO_SAFE_START_CONNECTION"; return result;}
+  } else {
+    recovered = recover_start_3d(raw, inflated, *start_voxel, config.start_recovery_radius);
+  }
   if (!recovered) {result.reason = "START_BLOCKED"; return result;}
   result.recovered_start = recovered;
   // Recovery from an already-invalid envelope is a distinct controller state,
   // not an ordinary route segment. This planner identifies the monotonically
   // safer recovery target but deliberately does not publish it as a flyable
   // A* path.
-  if (*recovered != *start_voxel) {
+  if (!start_clear && *recovered != *start_voxel) {
     result.reason = "RECOVERY_REQUIRED";
     return result;
   }
@@ -681,6 +812,35 @@ PlanResult3D plan_path_3d(
     if (result.search.found()) {
       result.goal = GoalSelection3D{
         *requested_voxel, true, true, 0.0, result.search.expanded};
+    }
+  }
+  if (!result.goal && config.project_blocked_goal &&
+    (!requested_voxel || !inflated.traversable(*requested_voxel)))
+  {
+    // An occupied goal envelope needs an approach point, not a time-limited
+    // flood fill that advances only partway across a large unknown volume.
+    std::optional<Voxel> nearest;
+    double nearest_squared = std::numeric_limits<double>::infinity();
+    for (int z = 0; z < static_cast<int>(raw.depth()); ++z) {
+      for (int y = 0; y < static_cast<int>(raw.height()); ++y) {
+        for (int x = 0; x < static_cast<int>(raw.width()); ++x) {
+          const Voxel v{x, y, z};
+          if (!inflated.traversable(v)) {continue;}
+          const auto p = raw.voxel_center(v);
+          const double dx = p.x - requested_goal.x, dy = p.y - requested_goal.y,
+            dz = p.z - requested_goal.z;
+          const double squared = dx * dx + dy * dy + dz * dz;
+          if (squared < nearest_squared) {nearest = v; nearest_squared = squared;}
+        }
+      }
+    }
+    if (nearest) {
+      result.search = astar_3d(inflated, *recovered, *nearest, config.heuristic_weight,
+        config.cost_weight, config.timeout_ms);
+      if (result.search.found()) {
+        result.goal = GoalSelection3D{*nearest, false, true,
+          std::sqrt(nearest_squared), result.search.expanded};
+      }
     }
   }
   if (!result.goal) {
@@ -717,6 +877,10 @@ PlanResult3D plan_path_3d(
       result.path.push_back(requested_goal);
     }
   }
+  // The actual body and exact waypoint need the same visibility pass as the
+  // grid centers. Otherwise short paths kink through an unnecessary center.
+  result.path = simplify_path_3d(raw, result.path, config.lethal_radius);
+  if (result.path.empty()) {result.reason = "CONTINUOUS_CLEARANCE_FAILED"; return result;}
   result.reason = result.goal->exact ? "PATH_VALID" :
     (result.goal->terminal ? "SAFE_APPROACH" : "EXPLORING");
   return result;

@@ -24,6 +24,7 @@
 #include "std_msgs/msg/int32.hpp"
 
 #include "px4_vio_bridge/path_geometry.hpp"
+#include "px4_vio_bridge/flight_authority.hpp"
 
 namespace px4_vio_bridge
 {
@@ -163,6 +164,7 @@ protected:
   rclcpp::TimerBase::SharedPtr timer_;
 
 private:
+  FlightAuthority flight_authority_;
   void on_control_mode(const px4_msgs::msg::VehicleControlMode & msg);
   void on_vio_pose(const geometry_msgs::msg::PoseStamped & msg);
   void on_vio_feature_count(const std_msgs::msg::Int32 & msg);

@@ -1,0 +1,87 @@
+"""Command the explicit unknown-allowed 3D reference using the existing PX4 sequencer.
+
+Attach to ros_planner_3d_monitor. This launch owns PX4 output; auto_arm defaults
+false. The visual odometry bridge always consumes continuous raw odometry.
+"""
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, RegisterEventHandler, EmitEvent, LogInfo
+from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+from px4_vio_bridge.log_paths import timestamped_bag
+
+FLIGHT_RECORD_TOPICS = (
+    '/rosout', '/fmu/in/offboard_control_mode', '/fmu/in/trajectory_setpoint',
+    '/fmu/in/vehicle_command', '/fmu/in/vehicle_visual_odometry',
+    '/fmu/out/vehicle_local_position_v1', '/fmu/out/vehicle_control_mode',
+    '/fmu/out/vehicle_command_ack', '/fmu/out/vehicle_status_v1',
+    '/fmu/out/vehicle_land_detected', '/fmu/out/failsafe_flags',
+    '/fmu/out/battery_status_v1', '/fmu/out/sensor_combined',
+    '/rtabmap/vio_odometry', '/rtabmap/vio_pose', '/rtabmap/vio_odom_info',
+    '/rtabmap/mapData', '/rtabmap/octomap', '/rtabmap/octomap_metadata',
+    '/planner3d/pose_snapshot', '/planner3d/reference_snapshot',
+    '/planner3d/reference_path', '/planner3d/path_snapshot', '/planner3d/status',
+    '/planner3d/flight/status', '/planner3d/flight/config', '/planner3d/flight/teleop',
+    '/waypoint/clicked', '/tf_static', '/perf/processes', '/perf/cpu_percent',
+    '/perf/cpu_temp_c', '/perf/throttled', '/perf/mem_percent',
+)
+
+
+def generate_launch_description():
+    defaults = {
+        'auto_arm': 'false', 'start_vio_bridge': 'true', 'record_bag': 'true',
+        'bag_output': str(timestamped_bag('offboard_planner_3d_unknown')),
+        'hover_height': '0.5', 'min_height': '0.15', 'max_height': '1.25',
+        'geofence_radius': '3.0', 'required_clearance': '0.35',
+        'command_speed': '0.10', 'command_vertical_speed': '0.05',
+        'command_acceleration': '0.30', 'command_vertical_acceleration': '0.20',
+        'rate_hz': '50.0', 'climb_timeout': '25.0', 'max_flight_time': '180.0',
+        'planner_fault_land_time': '3.0', 'goal_hold_time': '3.0',
+        'map_timeout': '3.0', 'pose_timeout': '0.5', 'path_timeout': '2.0',
+        'vio_yaw_offset_deg': '0.0', 'min_vio_features': '20',
+        'require_goal_after_hover': 'true', 'yaw_follows_heading': 'true',
+        'yaw_rate_deg': '20.0', 'keyboard_kill': 'true', 'keyboard_land': 'true',
+        'foxglove_teleop': 'true',
+    }
+    booleans = {'auto_arm', 'require_goal_after_hover', 'yaw_follows_heading',
+                'keyboard_kill', 'keyboard_land', 'foxglove_teleop'}
+    excluded = {'start_vio_bridge', 'record_bag', 'bag_output'}
+    params = {k: ParameterValue(LaunchConfiguration(k), value_type=(
+        bool if k in booleans else int if k == 'min_vio_features' else float))
+        for k in defaults if k not in excluded}
+    params.update({'allow_unknown': True,
+                   'path_snapshot_topic': '/planner3d/reference_snapshot',
+                   'foxglove_teleop_topic': '/planner3d/flight/teleop'})
+    adapter = Node(package='px4_vio_bridge', executable='cpp_flight_adapter_3d',
+                   name='cpp_flight_adapter_3d', output='screen', emulate_tty=True,
+                   parameters=[params])
+    bridge = Node(package='px4_vio_bridge', executable='vio_to_px4_odometry',
+                  name='vio_to_px4_odometry', output='screen',
+                  condition=IfCondition(LaunchConfiguration('start_vio_bridge')),
+                  parameters=[{'input_odometry_topic': '/rtabmap/vio_odometry',
+                               'input_pose_topic': '/rtabmap/vio_pose',
+                               'frame_transform': 'enu_flu_to_ned_frd',
+                               'vio_yaw_offset_deg': ParameterValue(
+                                   LaunchConfiguration('vio_yaw_offset_deg'), value_type=float)}])
+    recorder = ExecuteProcess(
+        cmd=['ros2', 'bag', 'record', '--storage', 'mcap', '--storage-preset-profile',
+             'fastwrite', '--disable-keyboard-controls', '--output',
+             LaunchConfiguration('bag_output'), '--topics', *FLIGHT_RECORD_TOPICS],
+        output='screen', sigterm_timeout='90', sigkill_timeout='90',
+        condition=IfCondition(LaunchConfiguration('record_bag')))
+    stop_adapter = RegisterEventHandler(OnProcessExit(target_action=adapter,
+        on_exit=[EmitEvent(event=Shutdown(reason='3D flight adapter stopped'))]))
+    stop_bridge = RegisterEventHandler(OnProcessExit(target_action=bridge,
+        on_exit=[EmitEvent(event=Shutdown(reason='VIO bridge stopped'))]),
+        condition=IfCondition(LaunchConfiguration('start_vio_bridge')))
+    stop_recorder = RegisterEventHandler(OnProcessExit(target_action=recorder,
+        on_exit=[EmitEvent(event=Shutdown(reason='3D flight recorder stopped'))]),
+        condition=IfCondition(LaunchConfiguration('record_bag')))
+    return LaunchDescription([
+        *[DeclareLaunchArgument(k, default_value=v) for k, v in defaults.items()],
+        LogInfo(msg='3D FLIGHT: unknown allowed, occupied blocked. Auto-arm defaults false; K=kill, L=land.'),
+        stop_adapter, stop_bridge, stop_recorder, recorder, bridge, adapter,
+    ])

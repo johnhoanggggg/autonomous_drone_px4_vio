@@ -68,7 +68,9 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("pose_topic", default_value="/rtabmap/pose"),
         DeclareLaunchArgument("goal_topic", default_value="/waypoint/clicked"),
+        DeclareLaunchArgument("goal_height_mode", default_value="clicked", choices=["clicked", "current"]),
         DeclareLaunchArgument("frame_id", default_value="world"),
+        DeclareLaunchArgument("exploration_route", default_value="true"),
         DeclareLaunchArgument("voxel_size", default_value="0.05"),
         DeclareLaunchArgument("robot_radius", default_value="0.25"),
         DeclareLaunchArgument("safety_margin", default_value="0.10"),
@@ -114,6 +116,8 @@ def generate_launch_description():
         "require_map_metadata": True,
         "pose_topic": LaunchConfiguration("pose_topic"),
         "goal_topic": LaunchConfiguration("goal_topic"),
+        "goal_height_mode": typed("goal_height_mode", str),
+        "exploration_route": typed("exploration_route", bool),
         "frame_id": LaunchConfiguration("frame_id"),
         "voxel_size": typed("voxel_size", float),
         "robot_radius": typed("robot_radius", float),
@@ -219,6 +223,7 @@ def generate_launch_description():
             "/rtabmap/pose", "/rtabmap/vio_pose",
             "/rtabmap/odom_correction", "/waypoint/clicked",
             "/planner3d/path", "/planner3d/candidate_path",
+            "/planner3d/reference_path", "/planner3d/reference_snapshot",
             "/planner3d/status", "/planner3d/markers",
             "/planner3d/test_start_clear",
             "/planner3d/map_generation", "/planner3d/path_map_generation",
@@ -262,7 +267,7 @@ def generate_launch_description():
     return LaunchDescription(arguments + [
         LogInfo(msg=(
             "3D planner monitor is observation only; it has no /fmu/in publishers. "
-            "Goals must be PointStamped in frame 'world' and clicked Z is preserved."
+            "Goals must be PointStamped in frame 'world'; goal_height_mode selects clicked or current body height."
         )),
         RegisterEventHandler(OnProcessExit(target_action=planner, on_exit=required_node_exited)),
         RegisterEventHandler(OnProcessExit(target_action=producer, on_exit=required_node_exited)),

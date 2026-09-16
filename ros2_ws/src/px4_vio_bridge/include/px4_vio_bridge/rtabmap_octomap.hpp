@@ -76,6 +76,7 @@ public:
   void set_use_checkpoints(bool enabled);
   [[nodiscard]] std::size_t checkpoint_restores() const {return checkpoint_restores_;}
   [[nodiscard]] std::size_t full_rebuilds() const {return full_rebuilds_;}
+  [[nodiscard]] std::size_t cached_nodes() const {return cache_.size();}
 
   [[nodiscard]] static std::uint64_t pose_generation(
     const std::map<int, rtabmap::Transform> & optimized_poses);

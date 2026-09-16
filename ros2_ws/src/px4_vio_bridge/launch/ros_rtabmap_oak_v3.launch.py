@@ -87,6 +87,11 @@ def generate_launch_description():
         DeclareLaunchArgument("voxel_size", default_value="0.05"),
         DeclareLaunchArgument("range_min", default_value="0.30"),
         DeclareLaunchArgument("range_max", default_value="4.0"),
+        DeclareLaunchArgument("grid_depth_decimation", default_value="8"),
+        DeclareLaunchArgument("grid_noise_radius", default_value="0.15"),
+        DeclareLaunchArgument("grid_noise_min_neighbors", default_value="4"),
+        DeclareLaunchArgument("grid_cluster_radius", default_value="0.20"),
+        DeclareLaunchArgument("grid_min_cluster_size", default_value="20"),
         # Full-tree marker traversal causes estimator starvation as maps grow.
         # The binary OctoMap remains published; opt in to markers for short
         # visualization sessions only.
@@ -291,14 +296,14 @@ def generate_launch_description():
             "Grid/GroundIsObstacle": "false",
             "Grid/RayTracing": "true",
             "Grid/CellSize": core_string("voxel_size"),
-            "Grid/DepthDecimation": "8",
+            "Grid/DepthDecimation": core_string("grid_depth_decimation"),
             "Grid/RangeMin": core_string("range_min"),
             "Grid/RangeMax": core_string("range_max"),
             "Grid/PreVoxelFiltering": "true",
-            "Grid/NoiseFilteringRadius": "0.15",
-            "Grid/NoiseFilteringMinNeighbors": "4",
-            "Grid/ClusterRadius": "0.20",
-            "Grid/MinClusterSize": "20",
+            "Grid/NoiseFilteringRadius": core_string("grid_noise_radius"),
+            "Grid/NoiseFilteringMinNeighbors": core_string("grid_noise_min_neighbors"),
+            "Grid/ClusterRadius": core_string("grid_cluster_radius"),
+            "Grid/MinClusterSize": core_string("grid_min_cluster_size"),
         }],
         remappings=sensor_remappings + [
             ("odom", "/rtabmap/vio_odometry"),

@@ -191,6 +191,12 @@ private:
     if (!poses.empty()) {
       optimized_poses_ = std::move(poses);
     }
+    // Match the mapper's active graph: stationary transient signatures are
+    // replaced every frame. Retrieved nodes arrive with their grid data again.
+    for (auto item = observations_.begin(); item != observations_.end(); ) {
+      item = optimized_poses_.find(item->first) == optimized_poses_.end() ?
+        observations_.erase(item) : std::next(item);
+    }
     std::vector<LocalGridObservation> observations;
     observations.reserve(optimized_poses_.size());
     for (const auto & pose : optimized_poses_) {
@@ -290,6 +296,8 @@ private:
     metadata["checkpoint_restores"] = assembler_.checkpoint_restores();
     metadata["full_rebuilds"] = assembler_.full_rebuilds();
     metadata["checkpoints_enabled"] = use_checkpoints_;
+    metadata["observation_cache_nodes"] = observations_.size();
+    metadata["assembler_cache_nodes"] = assembler_.cached_nodes();
     std_msgs::msg::String metadata_message;
     metadata_message.data = metadata.dump();
     // The planner pairs by stamp and accepts either arrival order.

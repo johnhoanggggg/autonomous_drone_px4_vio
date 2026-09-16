@@ -18,7 +18,7 @@ def audit(bag):
     reader.open(rosbag2_py.StorageOptions(uri=str(bag), storage_id="mcap"),
                 rosbag2_py.ConverterOptions("", ""))
     selected = {"/rtabmap/octomap", "/rtabmap/octomap_metadata", "/planner3d/path_snapshot",
-                "/planner3d/follower/status"}
+                "/planner3d/follower/status", "/planner3d/reference_snapshot"}
     types = {item.name: get_message(item.type) for item in reader.get_all_topics_and_types()
              if item.name in selected}
     reader.set_filter(rosbag2_py.StorageFilter(topics=list(selected)))
@@ -38,6 +38,7 @@ def audit(bag):
         if not result["valid"]:
             errors.append({"kind": record["kind"], "generation": record["generation"], **result})
         counts["segments"] += result.get("segments", 0)
+        counts["unverified_reference_segments"] += result.get("unverified_reference_segments", 0)
 
     def flush():
         for stamp in sorted(set(pending_maps) & set(metadata)):
@@ -77,7 +78,13 @@ def audit(bag):
                     metadata[stamp] = value
                     if value.get("test_start_clear", {}).get("enabled", False):
                         test_clear_generations.add(value["generation"])
+                elif topic == "/planner3d/reference_snapshot" and len(value["points"]) >= 2:
+                    checks.append({"kind": "references", "generation": value["map_generation"],
+                                   "stamp_ns": value["map_stamp_ns"], "points": value["points"],
+                                   "radius": value["lethal_radius"], "executable": value["executable"]})
                 elif topic == "/planner3d/path_snapshot" and len(value["points"]) >= 2:
+                    if not value.get("executable", True):
+                        errors.append({"error": "reference route published as executable path"})
                     checks.append({"kind": "paths", "generation": value["map_generation"],
                                    "stamp_ns": value["map_stamp_ns"], "points": value["points"],
                                    "radius": value["lethal_radius"]})
@@ -104,6 +111,8 @@ def audit(bag):
         process.wait(timeout=10)
         process.stdout.close()
     return {"valid": not errors and counts["paths"] > 0 and counts["chords"] > 0,
+            "accepted_path_check": "occupied_and_unknown",
+            "reference_check": "occupied_only; not executable",
             "uses_artificial_start_clear": bool(test_clear_generations),
             "artificial_start_generations": sorted(test_clear_generations),
             "physical_clearance_valid": not test_clear_generations and not errors

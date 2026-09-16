@@ -99,6 +99,45 @@ def test_ros_navigation_monitor_uses_one_map_producer_and_atomic_body_pose():
     assert not any('offboard' in str(a) for a in ld.entities)
 
 
+def test_ros_perception_tuning_reaches_backend_and_mapper():
+    from launch.utilities import perform_substitutions
+    from launch_ros.actions import LoadComposableNodes
+    from launch_ros.utilities import evaluate_parameters
+    context = LaunchContext()
+    context.launch_configurations.update({
+        'range_min': '0.80', 'grid_depth_decimation': '2',
+        'grid_noise_min_neighbors': '6', 'mapping_rate_hz': '0.5',
+    })
+    monitor = load('ros_planner_3d_monitor.launch.py')
+    for action in monitor.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    backend = next(a for a in monitor.entities if type(a) is ExecuteProcess)
+    command = [perform_substitutions(context, part) for part in backend.cmd]
+    for argument in ('range_min:=0.80', 'grid_depth_decimation:=2',
+                     'grid_noise_min_neighbors:=6', 'mapping_rate_hz:=0.5'):
+        assert argument in command
+    native = load('ros_rtabmap_oak_v3_native_features.launch.py')
+    include = next(a for a in native.entities if isinstance(a, IncludeLaunchDescription))
+    forwarded = dict(include.launch_arguments)
+    assert perform_substitutions(context, [forwarded['grid_depth_decimation']]) == '2'
+    base = load('ros_rtabmap_oak_v3.launch.py')
+    for action in base.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    # Jazzy exposes no public getter; inspect descriptions without executing
+    # the load action, which would contact a live component manager.
+    components = [node for action in base.entities if isinstance(action, LoadComposableNodes)
+                  for node in action._LoadComposableNodes__composable_node_descriptions]
+    mapper = next(node for node in components
+                  if perform_substitutions(context, node.node_plugin) == 'rtabmap_slam::CoreWrapper')
+    parameters = evaluate_parameters(context, mapper.parameters)[0]
+    assert parameters['Grid/DepthDecimation'] == '2'
+    assert parameters['Grid/RangeMin'] == '0.80'
+    assert parameters['Grid/NoiseFilteringMinNeighbors'] == '6'
+    assert parameters['Rtabmap/DetectionRate'] == '0.5'
+
+
 def test_test_clear_requires_owned_backend_and_is_disabled_by_default():
     from launch.actions import OpaqueFunction
     ld = load('ros_planner_3d_monitor.launch.py')
@@ -128,9 +167,38 @@ def test_3d_recording_includes_cpu_and_artificial_start_evidence():
         if isinstance(action, DeclareLaunchArgument):
             action.execute(context)
     assert context.launch_configurations['process_monitor'] == 'true'
+    assert context.launch_configurations['exploration_route'] == 'true'
     recorder = next(a for a in ld.entities if type(a) is ExecuteProcess)
     command = [perform_substitutions(context, part) for part in recorder.cmd]
     for topic in ('/perf/processes', '/perf/cpu_percent', '/perf/throttled',
                   '/perf/process/rtabmap_octomap_node/cpu_percent',
-                  '/perf/process/cpp_astar_planner_3d/cpu_percent', '/planner3d/test_start_clear'):
+                  '/perf/process/cpp_astar_planner_3d/cpu_percent', '/planner3d/test_start_clear',
+                  '/planner3d/reference_path', '/planner3d/reference_snapshot'):
+        assert topic in command
+
+
+def test_unknown_flight_launch_uses_raw_vio_and_explicit_reference_policy():
+    from launch_ros.utilities import evaluate_parameters
+    from launch.utilities import perform_substitutions
+    ld = load('offboard_planner_3d_unknown.launch.py')
+    context = LaunchContext()
+    for action in ld.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    assert context.launch_configurations['auto_arm'] == 'false'
+    assert context.launch_configurations['require_goal_after_hover'] == 'true'
+    nodes = [a for a in ld.entities if isinstance(a, Node)]
+    configs = [evaluate_parameters(context, a._Node__parameters)[0] for a in nodes]
+    flight = next(p for p in configs if 'allow_unknown' in p)
+    bridge = next(p for p in configs if 'input_odometry_topic' in p)
+    assert flight['allow_unknown'] is True
+    assert flight['path_snapshot_topic'] == '/planner3d/reference_snapshot'
+    assert bridge['input_odometry_topic'] == '/rtabmap/vio_odometry'
+    assert bridge['frame_transform'] == 'enu_flu_to_ned_frd'
+    assert bridge['vio_yaw_offset_deg'] == flight['vio_yaw_offset_deg']
+    recorder = next(a for a in ld.entities if type(a) is ExecuteProcess)
+    command = [perform_substitutions(context, part) for part in recorder.cmd]
+    for topic in ['/planner3d/flight/status', '/planner3d/flight/config', '/rtabmap/octomap',
+                  '/rtabmap/octomap_metadata', '/planner3d/pose_snapshot',
+                  '/fmu/in/trajectory_setpoint', '/perf/processes', '/rtabmap/vio_odom_info']:
         assert topic in command
