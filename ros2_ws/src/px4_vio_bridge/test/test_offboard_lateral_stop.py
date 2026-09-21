@@ -1,10 +1,12 @@
 import math
+import json
 from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
 
 from px4_vio_bridge.offboard_lateral_stop import OffboardLateralStop, StopProfile, lateral_xy
+from px4_vio_bridge.brake_damping import BrakeDamping
 
 
 @pytest.mark.parametrize("distance", [0.01, 0.35, 0.50])
@@ -49,6 +51,7 @@ def stub():
                         endpoints=[.35, 0., -.35, 0.], start_offset=0.,
                         profile=StopProfile(.35, .2, .3), local_received=0.,
                         clock=0., abort_xy=None, messages=[], transitions=[])
+    s.brake_damper = BrakeDamping()
     s.pos = SimpleNamespace(x=2., y=-1., z=-.3, heading=.7,
                             vx=0., vy=0., v_xy_valid=True)
     s.hold_point = (2., -1.)
@@ -72,8 +75,10 @@ def stub():
     return s
 
 
-def test_four_leg_sequence_holds_heading_and_waits_before_each_move():
+@pytest.mark.parametrize("damping", [False, True])
+def test_four_leg_sequence_holds_heading_and_waits_before_each_move(damping):
     s = stub()
+    s.brake_damper.enabled = damping
     for _ in range(1000):
         s.clock += .05
         s.local_received = s.clock
@@ -148,3 +153,129 @@ def test_settling_dwell_resets_when_vehicle_moves_again():
         s.local_received = s.clock
         s.handle_flight_state()
     assert s.state == "CLIMB_HOLD"
+
+
+@pytest.mark.parametrize("kwargs", [dict(gain=-1), dict(gain=math.nan),
+    dict(limit=0), dict(enabled=True, limit=.31), dict(time_constant=0),
+    dict(time_constant=math.inf), dict(acceleration_limit=math.nan)])
+def test_damping_rejects_invalid_configuration(kwargs):
+    with pytest.raises(ValueError):
+        BrakeDamping(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [dict(enabled=False), dict(enabled=True, gain=0)])
+def test_disabled_damping_preserves_baseline_exactly(kwargs):
+    d = BrakeDamping(**kwargs)
+    for phase in (False, True):
+        for a in [(0., 0.), (.12, -.27), (-.3, 0.)]:
+            result = d.update((.1, -.1), a, (.8, -.6), 1., active=True, braking=phase)
+            assert result.acceleration == a
+            assert result.applied_correction == (0., 0.)
+
+
+def test_disabled_damping_accepts_existing_lower_acceleration_profiles():
+    d = BrakeDamping(enabled=False, acceleration_limit=.05)
+    r = d.update((0., 0.), (.03, .04), (.1, 0.), 1., active=True, braking=True)
+    assert r.acceleration == (.03, .04)
+
+
+@pytest.mark.parametrize("yaw", [0., .7, math.pi/2, -2.4])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_hold_damping_opposes_motion_in_rotated_ned_frame(yaw, sign):
+    d = BrakeDamping(enabled=True)
+    direction = (-math.sin(yaw), math.cos(yaw))
+    velocity = tuple(sign*.1*x for x in direction)
+    for i in range(40):
+        result = d.update((0., 0.), (0., 0.), velocity, i*.05,
+                          active=True, braking=True)
+    assert result.acceleration == pytest.approx(tuple(-.5*x for x in velocity), abs=1e-8)
+    assert sum(a*v for a,v in zip(result.acceleration, velocity)) < 0
+
+
+def test_damping_vector_caps_and_phase_release():
+    d = BrakeDamping(enabled=True)
+    for i in range(30):
+        r = d.update((0., 0.), (-.18, -.24), (.8, .6), i*.05,
+                     active=True, braking=True)
+        assert math.hypot(*r.filtered_correction) <= .1 + 1e-12
+        assert math.hypot(*r.acceleration) <= .3 + 1e-12
+        assert math.hypot(*r.applied_correction) <= .1 + 1e-12
+    previous = math.hypot(*r.filtered_correction)
+    for i in range(30, 60):
+        r = d.update((.2, 0.), (0., 0.), (.8, .6), i*.05,
+                     active=True, braking=False)
+        magnitude = math.hypot(*r.filtered_correction)
+        assert magnitude == pytest.approx(previous*math.exp(-.05/.1))
+        previous = magnitude
+    assert previous < 1e-7
+
+
+@pytest.mark.parametrize("fault", ["missing", "nan", "inactive", "gap", "backward_time"])
+def test_damping_clears_and_restarts_smoothly_after_invalid_input(fault):
+    d = BrakeDamping(enabled=True)
+    for i in range(10):
+        r = d.update((0., 0.), (0., 0.), (.1, 0.), i*.05, active=True, braking=True)
+    assert abs(r.acceleration[0]) > .04
+    now = .8 if fault == "gap" else (.4 if fault == "backward_time" else .5)
+    measured = None if fault == "missing" else ((math.nan, 0.) if fault == "nan" else (.1, 0.))
+    r = d.update((0., 0.), (0., 0.), measured, now,
+                 active=fault != "inactive", braking=True)
+    assert r.acceleration == (0., 0.)
+    assert d.previous_time is None
+    first = d.update((0., 0.), (0., 0.), (.1, 0.), now+.05, active=True, braking=True)
+    second = d.update((0., 0.), (0., 0.), (.1, 0.), now+.10, active=True, braking=True)
+    assert first.acceleration == (0., 0.)
+    assert -.05 < second.acceleration[0] < 0.
+
+
+def test_published_damping_keeps_targets_and_exposes_applied_correction():
+    base, trial = stub(), stub()
+    trial.brake_damper.enabled = True
+    rows = []
+    trial.config = {}
+    trial.debug_pub = SimpleNamespace(publish=lambda m: rows.append(json.loads(m.data)))
+    for i in range(12):
+        for s in (base, trial):
+            s.state = "LATERAL_HOLD"
+            s.phase = "HOLD"
+            s.clock = i*.05
+            s.local_received = s.clock
+            s.offset = .35
+            s.pos.vx, s.pos.vy = .1, -.1
+            s.publish_setpoint(.3)
+        a, b = base.messages[-1], trial.messages[-1]
+        assert list(a.position) == list(b.position)
+        assert list(a.velocity) == list(b.velocity)
+        assert a.yaw == b.yaw
+        assert math.isnan(a.acceleration[2]) and math.isnan(b.acceleration[2])
+    assert trial.messages[-1].acceleration[0] < 0
+    assert trial.messages[-1].acceleration[1] > 0
+    debug = rows[-1]['damping']
+    assert debug['reason'] == 'braking_or_hold'
+    assert debug['published_acceleration_ned'] == list(trial.messages[-1].acceleration[:2])
+    assert debug['applied_correction_ned'] == pytest.approx(debug['published_acceleration_ned'])
+
+
+@pytest.mark.parametrize("fault", ["stale", "invalid", "nan", "land", "abort", "climb"])
+def test_published_damping_never_leaks_into_invalid_or_inactive_states(fault):
+    s = stub()
+    s.brake_damper.enabled = True
+    s.state, s.phase = "LATERAL_HOLD", "HOLD"
+    s.pos.vx = .1
+    for i in range(10):
+        s.clock = s.local_received = i*.05
+        s.publish_setpoint(.3)
+    assert s.messages[-1].acceleration[0] < -.04
+    s.clock += .05
+    s.local_received = s.clock
+    if fault == "stale":
+        s.local_received -= .11
+    elif fault == "invalid":
+        s.pos.v_xy_valid = False
+    elif fault == "nan":
+        s.pos.vy = math.nan
+    else:
+        s.state = {"land": "LAND", "abort": "ABORT", "climb": "CLIMB_HOLD"}[fault]
+    s.publish_setpoint(.3)
+    assert list(s.messages[-1].acceleration[:2]) == [0., 0.]
+    assert s.brake_damper.previous_time is None

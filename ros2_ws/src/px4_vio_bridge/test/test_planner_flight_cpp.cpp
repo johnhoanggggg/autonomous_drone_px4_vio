@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include "px4_vio_bridge/brake_damping.hpp"
 #include "px4_vio_bridge/command_limiter.hpp"
 #include "px4_vio_bridge/path_geometry.hpp"
 
@@ -12,6 +13,61 @@ using px4_vio_bridge::HorizontalCommandLimiter;
 using px4_vio_bridge::PathCommandLimiter;
 using px4_vio_bridge::Point2;
 using px4_vio_bridge::Polyline;
+
+TEST(BrakeDamping, DisabledIsAnExactPassThrough)
+{
+  px4_vio_bridge::BrakeDamping damping(false, 0.75, 0.10, 0.10, 0.30);
+  const auto result = damping.update(
+    {0.0, 0.0}, {-0.30, 0.0}, Point2{0.20, 0.0}, 1.0, true, true);
+  EXPECT_EQ(result.acceleration, Point2(-0.30, 0.0));
+  EXPECT_EQ(result.applied_correction, Point2(0.0, 0.0));
+  EXPECT_EQ(result.reason, "disabled");
+}
+
+TEST(BrakeDamping, FiltersCapsAndPreservesTheTotalAccelerationLimit)
+{
+  px4_vio_bridge::BrakeDamping damping(true, 0.75, 0.10, 0.10, 0.30);
+  damping.update({0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.00, true, true);
+  const auto filtered = damping.update(
+    {0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.10, true, true);
+  EXPECT_NEAR(filtered.raw_correction.first, -0.75, 1e-12);
+  EXPECT_NEAR(filtered.filtered_correction.first, -0.10 * (1.0 - std::exp(-1.0)), 1e-12);
+  const auto capped = damping.update(
+    {0.0, 0.0}, {-0.29, 0.0}, Point2{1.0, 0.0}, 1.20, true, true);
+  EXPECT_NEAR(std::hypot(capped.acceleration.first, capped.acceleration.second), 0.30, 1e-12);
+}
+
+TEST(BrakeDamping, UnsafeExitAndCallbackGapClearStoredCorrection)
+{
+  px4_vio_bridge::BrakeDamping damping(true, 0.75, 0.10, 0.10, 0.30);
+  damping.update({0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.00, true, true);
+  EXPECT_LT(damping.update(
+      {0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.10, true, true)
+    .acceleration.first, 0.0);
+  EXPECT_EQ(damping.update(
+      {0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.15, false, true)
+    .reason, "inactive_state");
+  EXPECT_DOUBLE_EQ(damping.update(
+      {0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.20, true, true)
+    .acceleration.first, 0.0);
+  damping.update({0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.25, true, true);
+  EXPECT_EQ(damping.update(
+      {0.0, 0.0}, {0.0, 0.0}, Point2{1.0, 0.0}, 1.50, true, true)
+    .reason, "callback_gap");
+}
+
+TEST(BrakeDamping, InvalidOrMissingVelocityNeverAppliesFeedback)
+{
+  px4_vio_bridge::BrakeDamping damping(true, 0.75, 0.10, 0.10, 0.30);
+  const auto missing = damping.update(
+    {0.0, 0.0}, {-0.20, 0.0}, std::nullopt, 1.0, true, true);
+  EXPECT_EQ(missing.acceleration, Point2(-0.20, 0.0));
+  EXPECT_EQ(missing.reason, "velocity_unavailable");
+  const auto invalid = damping.update(
+    {0.0, 0.0}, {-0.20, 0.0}, Point2{std::nan(""), 0.0}, 1.1, true, true);
+  EXPECT_EQ(invalid.acceleration, Point2(-0.20, 0.0));
+  EXPECT_EQ(invalid.reason, "velocity_unavailable");
+}
 
 TEST(Polyline, DropsConsecutiveDuplicatesAndMeasuresArcLength)
 {

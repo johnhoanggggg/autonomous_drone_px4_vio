@@ -1,5 +1,10 @@
 # Fixed-heading lateral braking test
 
+**Current experiment (2026-09-21):** [optional velocity damping trial](LATERAL_DAMPING_TRIAL_20260921.md).
+Built, tested and flown ON/OFF/ON; see [results](LATERAL_DAMPING_RESULTS_20260921.md).
+Enable with `brake_damping:=true`;
+the baseline profile below remains the default with damping disabled.
+
 Current repeat: [ROLL_RATE_TUNING_20260908.md](ROLL_RATE_TUNING_20260908.md)
 documents the saved roll-rate P trial (0.150 -> 0.165) and rollback. The profile
 below is unchanged; the original baseline flew with P=0.150.

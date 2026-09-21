@@ -22,6 +22,7 @@ from px4_msgs.msg import TrajectorySetpoint
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
+from px4_vio_bridge.brake_damping import BrakeDamping
 from px4_vio_bridge.grid_planner import GridMap, segment_has_clearance
 from px4_vio_bridge.offboard_hover import OffboardHover, wrap_pi
 from px4_vio_bridge.path_follower import (
@@ -72,6 +73,11 @@ class OffboardGlobalPlanner(OffboardHover):
         # making the position loop rediscover it. Default since the 2026-08-28
         # 03:5x runs; set false to fall back to the position-only command.
         self.declare_parameter("horizontal_feedforward", True)
+        self.declare_parameter("brake_damping", False)
+        self.declare_parameter("damping_gain", 0.75)
+        self.declare_parameter("damping_limit", 0.10)
+        self.declare_parameter("damping_time_constant", 0.10)
+        self.declare_parameter("damping_velocity_timeout", 0.10)
         # Corner blending: carry speed through a bend at the speed that keeps
         # the airframe within junction_deviation of the vertex, instead of the
         # full stop-and-wait the limiter takes by default. Off by default -- it
@@ -160,6 +166,18 @@ class OffboardGlobalPlanner(OffboardHover):
                 self.get_parameter("command_acceleration").value
             ),
         )
+        self.damping_velocity_timeout = float(
+            self.get_parameter("damping_velocity_timeout").value
+        )
+        if not math.isfinite(self.damping_velocity_timeout) or self.damping_velocity_timeout <= 0:
+            raise ValueError("damping velocity timeout must be finite and positive")
+        self.brake_damper = BrakeDamping(
+            enabled=bool(self.get_parameter("brake_damping").value),
+            gain=float(self.get_parameter("damping_gain").value),
+            limit=float(self.get_parameter("damping_limit").value),
+            time_constant=float(self.get_parameter("damping_time_constant").value),
+            acceleration_limit=self.limiter.max_acceleration,
+        )
         self.route_limiter = PathCommandLimiter(
             max_speed=self.limiter.max_speed,
             max_acceleration=self.limiter.max_acceleration,
@@ -191,6 +209,8 @@ class OffboardGlobalPlanner(OffboardHover):
         )
 
         self.last_ff_velocity = None
+        self.measured_velocity = None
+        self.measured_velocity_received = None
         self.follower_valid = False
         self.follower_valid_received = None
         self.goal_reached = False
@@ -280,9 +300,13 @@ class OffboardGlobalPlanner(OffboardHover):
         self.route_status_pub = self.create_publisher(
             String, "/planner/flight/status", 10
         )
+        self.damping_debug_pub = self.create_publisher(
+            String, "/planner/flight/damping_debug", 10
+        )
         self.get_logger().warn(
             "GLOBAL PLANNER FLIGHT ADAPTER: position-only, "
-            f"auto_arm={self.auto_arm}, speed={self.limiter.max_speed:.2f}m/s, "
+            f"brake_damping={self.brake_damper.enabled}, auto_arm={self.auto_arm}, "
+            f"speed={self.limiter.max_speed:.2f}m/s, "
             f"geofence={self.geofence_radius:.2f}m, correction gate="
             f"{self.max_correction_m:.2f}m/"
             f"{math.degrees(self.max_correction_yaw):.1f}deg"
@@ -446,6 +470,7 @@ class OffboardGlobalPlanner(OffboardHover):
         )
         if self.local_reset_counters is not None and counters != self.local_reset_counters:
             now = self.monotonic_time()
+            self.brake_damper.reset()
             if self.x0 is not None and math.isfinite(msg.x) and math.isfinite(msg.y):
                 self.limiter.reset((float(msg.x), float(msg.y)))
                 self.route_limiter.clear()
@@ -465,6 +490,15 @@ class OffboardGlobalPlanner(OffboardHover):
             self.get_logger().error(self.planner_fault_reason_text)
         self.local_reset_counters = counters
         super().on_local_position(msg)
+        self.measured_velocity_received = self.monotonic_time()
+        if (
+            msg.v_xy_valid
+            and math.isfinite(msg.vx)
+            and math.isfinite(msg.vy)
+        ):
+            self.measured_velocity = float(msg.vx), float(msg.vy)
+        else:
+            self.measured_velocity = None
 
     def ensure_limiter(self):
         if self.limiter.position is None and self.x0 is not None:
@@ -629,7 +663,7 @@ class OffboardGlobalPlanner(OffboardHover):
         """
         if math.isnan(vx) or math.isnan(vy) or self.last_ff_velocity is None:
             self.last_ff_velocity = None if math.isnan(vx) else (vx, vy)
-            return math.nan, math.nan
+            return self.apply_brake_damping((vx, vy), (math.nan, math.nan)).acceleration
         limit = self.limiter.max_acceleration
         ax = (vx - self.last_ff_velocity[0]) / self.dt
         ay = (vy - self.last_ff_velocity[1]) / self.dt
@@ -638,7 +672,63 @@ class OffboardGlobalPlanner(OffboardHover):
         if magnitude > limit and magnitude > 0.0:
             scale = limit / magnitude
             ax, ay = ax * scale, ay * scale
-        return ax, ay
+        return self.apply_brake_damping((vx, vy), (ax, ay)).acceleration
+
+    def apply_brake_damping(self, reference_velocity, reference_acceleration):
+        """Add bounded feedback only to healthy, validated route braking/holds."""
+        now = self.monotonic_time()
+        age = (
+            None
+            if self.measured_velocity_received is None
+            else now - self.measured_velocity_received
+        )
+        measured = self.measured_velocity
+        if age is None or not 0 <= age <= self.damping_velocity_timeout:
+            measured = None
+        active = (
+            self.state == "ROUTE"
+            and not self.holding_for_fault
+            and not self.route_command_holding
+            and not getattr(self, "degraded_ride_out", False)
+        )
+        finite_reference = all(
+            math.isfinite(value)
+            for value in (*reference_velocity, *reference_acceleration)
+        )
+        speed = math.hypot(*reference_velocity) if finite_reference else math.nan
+        power = (
+            sum(v * a for v, a in zip(reference_velocity, reference_acceleration))
+            if finite_reference
+            else math.nan
+        )
+        braking = finite_reference and (speed <= 0.01 or power < -1.0e-9)
+        result = self.brake_damper.update(
+            reference_velocity,
+            reference_acceleration,
+            measured,
+            now,
+            active=active,
+            braking=braking,
+        )
+        def vector_json(vector):
+            return [value if math.isfinite(value) else None for value in vector]
+
+        row = {
+            "reason": result.reason,
+            "enabled": self.brake_damper.enabled,
+            "active": active,
+            "braking_or_hold": braking,
+            "velocity_age_s": age,
+            "measured_velocity_ned": None if measured is None else vector_json(measured),
+            "reference_velocity_ned": vector_json(reference_velocity),
+            "reference_acceleration_ned": vector_json(reference_acceleration),
+            "raw_correction_ned": vector_json(result.raw_correction),
+            "filtered_correction_ned": vector_json(result.filtered_correction),
+            "applied_correction_ned": vector_json(result.applied_correction),
+            "published_acceleration_ned": vector_json(result.acceleration),
+        }
+        self.damping_debug_pub.publish(String(data=json.dumps(row, allow_nan=False)))
+        return result
 
     def publish_route_status(self, text, kind):
         now = self.monotonic_time()

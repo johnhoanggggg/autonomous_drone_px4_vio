@@ -1,9 +1,11 @@
+import json
 import math
 from types import SimpleNamespace
 
 import pytest
 from geometry_msgs.msg import PoseStamped
 
+from px4_vio_bridge.brake_damping import BrakeDamping
 from px4_vio_bridge.grid_planner import GridMap
 from px4_vio_bridge.offboard_global_planner import OffboardGlobalPlanner
 from px4_vio_bridge.planner_flight import (
@@ -718,11 +720,20 @@ def test_replanning_is_suppressed_while_the_yaw_slew_pauses_translation():
 def feedforward_stub(**overrides):
     """route_stub wired for publish_setpoint, defaulting to an advancing route."""
     published = []
+    clock = [0.0]
+    damping_debug = []
     stub = route_stub(
         state="ROUTE",
         holding_for_fault=False,
+        degraded_ride_out=False,
         horizontal_feedforward=True,
         ramp_yaw=lambda target: (target, math.nan),
+        brake_damper=BrakeDamping(False, .75, .10, .10, .30),
+        damping_velocity_timeout=.10,
+        measured_velocity=(0.0, 0.0),
+        measured_velocity_received=0.0,
+        monotonic_time=lambda: clock[0],
+        damping_debug_pub=SimpleNamespace(publish=damping_debug.append),
     )
     stub.__dict__.update(overrides)
     stub.now_us = lambda: 0
@@ -730,7 +741,10 @@ def feedforward_stub(**overrides):
     stub.sp_pub = SimpleNamespace(publish=published.append)
     stub.setpoint_velocity_xy = OffboardGlobalPlanner.setpoint_velocity_xy.__get__(stub)
     stub.setpoint_acceleration_xy = OffboardGlobalPlanner.setpoint_acceleration_xy.__get__(stub)
+    stub.apply_brake_damping = OffboardGlobalPlanner.apply_brake_damping.__get__(stub)
     stub.last_ff_velocity = None
+    stub.test_clock = clock
+    stub.damping_debug = damping_debug
     stub.limiter.velocity = (0.06, -0.08)
     return stub, published
 
@@ -802,6 +816,52 @@ def test_acceleration_feedforward_is_bounded_by_the_limiter() -> None:
 
     a = published[-1].acceleration
     assert math.hypot(a[0], a[1]) == pytest.approx(0.30)
+
+
+def test_opt_in_damping_adds_feedback_only_while_route_is_braking() -> None:
+    stub, published = feedforward_stub(
+        brake_damper=BrakeDamping(True, .75, .10, .10, .30),
+        measured_velocity=(.20, 0.0),
+    )
+    stub.dt = .05
+    stub.limiter.velocity = (.10, 0.0)
+    OffboardGlobalPlanner.publish_setpoint(stub, .30)  # prime derivative
+
+    stub.test_clock[0] = .05
+    stub.limiter.velocity = (.095, 0.0)
+    OffboardGlobalPlanner.publish_setpoint(stub, .30)  # prime damping filter
+    reference_acceleration = published[-1].acceleration[0]
+    assert reference_acceleration == pytest.approx(-.10)
+
+    stub.test_clock[0] = .10
+    stub.limiter.velocity = (.090, 0.0)
+    OffboardGlobalPlanner.publish_setpoint(stub, .30)
+    assert published[-1].acceleration[0] < reference_acceleration
+    debug = json.loads(stub.damping_debug[-1].data)
+    assert debug['reason'] == 'braking_or_hold'
+    assert debug['active'] is True
+
+
+@pytest.mark.parametrize('unsafe', ['command', 'fault', 'degraded', 'land'])
+def test_opt_in_damping_is_cleared_in_non_normal_route_modes(unsafe) -> None:
+    overrides = dict(
+        brake_damper=BrakeDamping(True, .75, .10, .10, .30),
+        measured_velocity=(.20, 0.0),
+    )
+    if unsafe == 'command':
+        overrides['route_command_holding'] = True
+    elif unsafe == 'fault':
+        overrides['holding_for_fault'] = True
+    elif unsafe == 'degraded':
+        overrides['degraded_ride_out'] = True
+    else:
+        overrides['state'] = 'LAND'
+    stub, published = feedforward_stub(**overrides)
+    OffboardGlobalPlanner.publish_setpoint(stub, .30)
+    assert math.isnan(published[-1].acceleration[0]) or published[-1].acceleration[0] == 0.0
+    debug = json.loads(stub.damping_debug[-1].data)
+    assert debug['reason'] in ('inactive_state', 'reference_unavailable')
+    assert debug['applied_correction_ned'] == [0.0, 0.0]
 
 
 def test_acceleration_is_nan_whenever_the_velocity_is() -> None:

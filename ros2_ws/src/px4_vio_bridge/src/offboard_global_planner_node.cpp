@@ -29,6 +29,7 @@
 #include "std_msgs/msg/string.hpp"
 
 #include "offboard_hover_node.hpp"
+#include "px4_vio_bridge/brake_damping.hpp"
 #include "px4_vio_bridge/localization_pair.hpp"
 #include "px4_vio_bridge/command_limiter.hpp"
 #include "px4_vio_bridge/grid_clearance.hpp"
@@ -124,6 +125,16 @@ public:
     const auto command_acceleration =
       declare_parameter<double>("command_acceleration", 0.30);
     horizontal_feedforward_ = declare_parameter<bool>("horizontal_feedforward", true);
+    const bool brake_damping = declare_parameter<bool>("brake_damping", false);
+    const double damping_gain = declare_parameter<double>("damping_gain", 0.75);
+    const double damping_limit = declare_parameter<double>("damping_limit", 0.10);
+    const double damping_time_constant =
+      declare_parameter<double>("damping_time_constant", 0.10);
+    damping_velocity_timeout_ =
+      declare_parameter<double>("damping_velocity_timeout", 0.10);
+    if (!std::isfinite(damping_velocity_timeout_) || damping_velocity_timeout_ <= 0.0) {
+      throw std::invalid_argument("damping velocity timeout must be finite and positive");
+    }
     corner_blending_ = declare_parameter<bool>("corner_blending", false);
     junction_deviation_ = declare_parameter<double>("junction_deviation", 0.05);
     const auto corner_blending = corner_blending_;
@@ -166,6 +177,9 @@ public:
 
     limiter_ = std::make_unique<HorizontalCommandLimiter>(
       command_speed, command_acceleration);
+    brake_damper_ = std::make_unique<BrakeDamping>(
+      brake_damping, damping_gain, damping_limit, damping_time_constant,
+      command_acceleration);
     route_limiter_ = std::make_unique<PathCommandLimiter>(
       limiter_->max_speed(), limiter_->max_acceleration(), projection_tolerance,
       corner_tolerance, entry_tolerance, connector_tolerance, suffix_tolerance,
@@ -219,6 +233,8 @@ public:
       "/planner/flight/joining", 10);
     heading_debug_pub_ = create_publisher<std_msgs::msg::String>(
       "/planner/flight/heading_debug", 10);
+    damping_debug_pub_ = create_publisher<std_msgs::msg::String>(
+      "/planner/flight/damping_debug", 10);
     // Latched, like /planner/config and /planner/follower/config, so a bag
     // records what the adapter was configured to do even when the recorder
     // started after the node did. Until this existed, corner_blending and the
@@ -230,9 +246,10 @@ public:
     RCLCPP_WARN(
       get_logger(),
       "GLOBAL PLANNER FLIGHT ADAPTER (C++): position control, horizontal "
-      "velocity/acceleration feedforward=%d, auto_arm=%d, speed=%.2fm/s, "
+      "velocity/acceleration feedforward=%d, brake_damping=%d, auto_arm=%d, speed=%.2fm/s, "
       "geofence=%.2fm, correction gate=%.2fm/%.1fdeg",
-      static_cast<int>(horizontal_feedforward_), static_cast<int>(auto_arm_),
+      static_cast<int>(horizontal_feedforward_), static_cast<int>(brake_damper_->enabled()),
+      static_cast<int>(auto_arm_),
       limiter_->max_speed(), geofence_radius_,
       max_correction_m_, degrees(max_correction_yaw_));
     RCLCPP_WARN(
@@ -284,6 +301,7 @@ protected:
       static_cast<int>(msg.heading_reset_counter)};
     if (local_reset_counters_ && counters != *local_reset_counters_) {
       const double now = monotonic_time();
+      brake_damper_->reset();
       if (x0_ && std::isfinite(msg.x) && std::isfinite(msg.y)) {
         limiter_->reset({static_cast<double>(msg.x), static_cast<double>(msg.y)});
         route_limiter_->clear();
@@ -309,6 +327,12 @@ protected:
     }
     local_reset_counters_ = counters;
     OffboardHover::on_local_position(msg);
+    measured_velocity_received_ = monotonic_time();
+    if (msg.v_xy_valid && std::isfinite(msg.vx) && std::isfinite(msg.vy)) {
+      measured_velocity_ = Point2{static_cast<double>(msg.vx), static_cast<double>(msg.vy)};
+    } else {
+      measured_velocity_.reset();
+    }
   }
 
   void arm() override
@@ -818,7 +842,7 @@ private:
     if (std::isnan(vx) || std::isnan(vy) || !last_ff_velocity_) {
       last_ff_velocity_ =
         std::isnan(vx) ? std::nullopt : std::optional<Point2>{{vx, vy}};
-      return {kNan, kNan};
+      return apply_brake_damping({vx, vy}, {kNan, kNan}).acceleration;
     }
     const double limit = limiter_->max_acceleration();
     double ax = (vx - last_ff_velocity_->first) / dt_;
@@ -830,7 +854,59 @@ private:
       ax *= scale;
       ay *= scale;
     }
-    return {ax, ay};
+    return apply_brake_damping({vx, vy}, {ax, ay}).acceleration;
+  }
+
+  BrakeDampingResult apply_brake_damping(
+    const Point2 & reference_velocity, const Point2 & reference_acceleration)
+  {
+    const double now = monotonic_time();
+    const std::optional<double> velocity_age = measured_velocity_received_ ?
+      std::optional<double>{now - *measured_velocity_received_} : std::nullopt;
+    const bool velocity_fresh = velocity_age && *velocity_age >= 0.0 &&
+      *velocity_age <= damping_velocity_timeout_;
+    const std::optional<Point2> measured = velocity_fresh ?
+      measured_velocity_ : std::nullopt;
+    // Only a healthy, fully validated normal route may receive feedback.
+    // Fault/command holds, degraded ride-out, escape, climb and LAND all clear
+    // it. Normal route braking, corner/yaw stops and the validated goal hold
+    // remain eligible.
+    const bool active = state_ == State::Route && !holding_for_fault_ &&
+      !route_command_holding_ && !degraded_ride_out_;
+    const bool reference_finite = finite(reference_velocity) && finite(reference_acceleration);
+    const double speed = reference_finite ?
+      std::hypot(reference_velocity.first, reference_velocity.second) : kNan;
+    const double power = reference_finite ?
+      reference_velocity.first * reference_acceleration.first +
+      reference_velocity.second * reference_acceleration.second : kNan;
+    const bool braking = reference_finite && (speed <= 0.01 || power < -1.0e-9);
+    const auto result = brake_damper_->update(
+      reference_velocity, reference_acceleration, measured, now, active, braking);
+
+    const auto vector_json = [](const Point2 & point) {
+        return nlohmann::json::array({
+          std::isfinite(point.first) ? nlohmann::json(point.first) : nlohmann::json(nullptr),
+          std::isfinite(point.second) ? nlohmann::json(point.second) : nlohmann::json(nullptr)});
+      };
+    nlohmann::json debug;
+    debug["reason"] = result.reason;
+    debug["enabled"] = brake_damper_->enabled();
+    debug["active"] = active;
+    debug["braking_or_hold"] = braking;
+    debug["velocity_age_s"] = velocity_age ?
+      nlohmann::json(*velocity_age) : nlohmann::json(nullptr);
+    debug["measured_velocity_ned"] = measured ?
+      vector_json(*measured) : nlohmann::json(nullptr);
+    debug["reference_velocity_ned"] = vector_json(reference_velocity);
+    debug["reference_acceleration_ned"] = vector_json(reference_acceleration);
+    debug["raw_correction_ned"] = vector_json(result.raw_correction);
+    debug["filtered_correction_ned"] = vector_json(result.filtered_correction);
+    debug["applied_correction_ned"] = vector_json(result.applied_correction);
+    debug["published_acceleration_ned"] = vector_json(result.acceleration);
+    std_msgs::msg::String message;
+    message.data = debug.dump();
+    damping_debug_pub_->publish(message);
+    return result;
   }
 
   // --- status / holds ------------------------------------------------------
@@ -871,6 +947,12 @@ private:
     config["yaw_slowdown"] = yaw_slowdown_;
     config["yaw_resume_error_deg"] = degrees(yaw_resume_error_);
     config["horizontal_feedforward"] = horizontal_feedforward_;
+    config["brake_damping"] = brake_damper_->enabled();
+    config["damping_gain"] = brake_damper_->gain();
+    config["damping_limit"] = brake_damper_->correction_limit();
+    config["damping_time_constant"] = brake_damper_->time_constant();
+    config["damping_velocity_timeout"] = damping_velocity_timeout_;
+    config["damping_scope"] = "validated_route_braking_and_holds";
     config["replan_during_yaw_align"] = replan_during_yaw_align_;
     config["max_correction_m"] = max_correction_m_;
     config["max_correction_yaw_deg"] = degrees(max_correction_yaw_);
@@ -1496,6 +1578,7 @@ private:
   std::optional<double> fault_escape_clearance_;
   double max_follower_displacement_{}, max_correction_m_{}, max_correction_yaw_{};
   bool horizontal_feedforward_{};
+  double damping_velocity_timeout_{};
   double route_command_grace_{};
   bool replan_during_yaw_align_{};
   bool corner_blending_{};
@@ -1512,14 +1595,18 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr joining_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr flight_config_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr heading_debug_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr damping_debug_pub_;
 
   std::unique_ptr<HorizontalCommandLimiter> limiter_;
   std::unique_ptr<PathCommandLimiter> route_limiter_;
+  std::unique_ptr<BrakeDamping> brake_damper_;
   /// The map solution `route_limiter_`'s state is currently expressed in.
   std::optional<Correction4> route_limiter_frame_;
 
   // --- runtime state -------------------------------------------------------
   std::optional<Point2> last_ff_velocity_;
+  std::optional<Point2> measured_velocity_;
+  std::optional<double> measured_velocity_received_;
   bool follower_valid_{false};
   std::optional<double> follower_valid_received_;
   bool goal_reached_{false};
