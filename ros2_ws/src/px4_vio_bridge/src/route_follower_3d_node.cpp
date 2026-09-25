@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -31,6 +32,7 @@
 #include <std_msgs/msg/string.hpp>
 
 #include "px4_vio_bridge/grid_planner_3d.hpp"
+#include "px4_vio_bridge/flight_geometry_3d.hpp"
 #include "px4_vio_bridge/octomap_grid.hpp"
 #include "px4_vio_bridge/navigation_snapshot.hpp"
 #include "px4_vio_bridge/route_follower_3d.hpp"
@@ -64,6 +66,13 @@ struct Correction3D
   double roll{};
   double pitch{};
   double yaw{};
+};
+
+struct MapFrame
+{
+  std::int64_t generation{};
+  std::int64_t stamp_ns{};
+  Pose3 map_from_odom;
 };
 
 class ProcessSingleton
@@ -290,9 +299,15 @@ private:
     map_generation_ = pending_metadata_->generation;
     map_stamp_ = pending_metadata_->stamp_ns;
     map_correction_ = pending_metadata_->correction;
+    if (map_correction_) {
+      map_frames_.push_back({map_generation_, map_stamp_, *map_correction_});
+      while (map_frames_.size() > 64) {map_frames_.pop_front();}
+    }
     pending_metadata_.reset();
     map_received_ = steady_seconds();
-    follower_->clear();
+    // Revalidate the retained source route against this newest map before it
+    // can produce another command. Do not require the planner to reinflate the
+    // same generation just to keep the observation follower alive.
     active_path_generation_.reset();
     try_accept_path();
   }
@@ -331,8 +346,16 @@ private:
       path_stamp_ = stamp;
       path_received_ = steady_seconds();
       // An empty path is an explicit veto. Never retain the previous route.
-      if (pending_path_.size() < 2 || *pending_path_generation_ != map_generation_ ||
-        path_map_stamp_ != map_stamp_) {follower_->clear(); active_path_generation_.reset();}
+      const bool current_source = *pending_path_generation_ == map_generation_ &&
+        path_map_stamp_ == map_stamp_;
+      const bool historical_source = std::any_of(
+        map_frames_.begin(), map_frames_.end(), [this](const MapFrame & frame) {
+          return frame.generation == *pending_path_generation_ &&
+                 frame.stamp_ns == path_map_stamp_;
+        });
+      if (pending_path_.size() < 2 || (!current_source && !historical_source)) {
+        follower_->clear(); active_path_generation_.reset();
+      }
       try_accept_path();
     } catch (const std::exception &) {
       follower_->clear(); active_path_generation_.reset(); pending_path_.clear();
@@ -368,13 +391,13 @@ private:
 
   void try_accept_path()
   {
-    if (!pose_ || pending_path_.size() < 2 || !pending_path_generation_ ||
-      *pending_path_generation_ != map_generation_ || path_map_stamp_ != map_stamp_ || !octree_ ||
+    if (!pose_ || pending_path_.size() < 2 || !pending_path_generation_ || !octree_ ||
       (!snapshot_topic_.empty() && (pose_generation_ != map_generation_ || pose_map_stamp_ != map_stamp_)))
     {
       return;
     }
-    if (accepted_path_stamp_ == path_stamp_ && active_path_generation_) {return;}
+    if (accepted_path_stamp_ == path_stamp_ && active_path_generation_ &&
+      *active_path_generation_ == map_generation_) {return;}
     if (!snapshot_topic_.empty()) {
       if (!correction_ || !map_correction_ || !snapshot_correction_ ||
         !same_snapshot_transform(*map_correction_, *snapshot_correction_)) {return;}
@@ -383,21 +406,46 @@ private:
         configured_map_generation_ = map_generation_;
       }
     }
-    if (active_path_generation_ && active_points_.size() == pending_path_.size() &&
-      std::equal(active_points_.begin(), active_points_.end(), pending_path_.begin(),
+    std::vector<Point3> current_path;
+    current_path.reserve(pending_path_.size());
+    if (*pending_path_generation_ == map_generation_ && path_map_stamp_ == map_stamp_) {
+      current_path = pending_path_;
+    } else {
+      if (!map_correction_) {return;}
+      const auto source = std::find_if(
+        map_frames_.begin(), map_frames_.end(), [this](const MapFrame & frame) {
+          return frame.generation == *pending_path_generation_ &&
+                 frame.stamp_ns == path_map_stamp_;
+        });
+      if (source == map_frames_.end()) {return;}
+      for (const auto & point : pending_path_) {
+        current_path.push_back(reframe_map_point_3d(
+          point, source->map_from_odom, *map_correction_));
+      }
+    }
+    for (std::size_t index = 1; index < current_path.size(); ++index) {
+      if (!chord_clear(current_path[index - 1], current_path[index])) {
+        follower_->clear();
+        active_path_generation_.reset();
+        return;
+      }
+    }
+    if (active_path_generation_ && active_points_.size() == current_path.size() &&
+      std::equal(active_points_.begin(), active_points_.end(), current_path.begin(),
         [](const Point3 & a, const Point3 & b) {return a.x == b.x && a.y == b.y && a.z == b.z;}))
     {
       active_goal_exact_ = pending_goal_exact_;
       active_goal_terminal_ = pending_goal_terminal_;
       accepted_path_stamp_ = path_stamp_;
+      active_path_generation_ = map_generation_;
       return;
     }
-    if (follower_->set_path(pending_path_, *pose_)) {
-      active_points_ = pending_path_;
+    if (follower_->set_path(current_path, *pose_)) {
+      active_points_ = std::move(current_path);
       active_goal_exact_ = pending_goal_exact_;
       active_goal_terminal_ = pending_goal_terminal_;
       accepted_path_stamp_ = path_stamp_;
-      active_path_generation_ = pending_path_generation_;
+      active_path_generation_ = map_generation_;
     }
   }
 
@@ -632,6 +680,7 @@ private:
   double max_z_{};
   double required_clearance_{};
   std::optional<Pose3> map_correction_, snapshot_correction_;
+  std::deque<MapFrame> map_frames_;
   std::int64_t configured_map_generation_{};
   double max_correction_translation_{};
   double max_correction_yaw_{};

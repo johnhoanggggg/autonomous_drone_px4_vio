@@ -687,17 +687,38 @@ private:
         auto output = planning_future_.get();
         const auto pose_in_source = reframe_map_point_3d(
           *pose_, map_from_odom_, output.map_from_odom);
-        const bool pose_matches = std::hypot(
+        const auto pose_drift = std::hypot(
           std::hypot(pose_in_source.x - output.planned_pose.x,
           pose_in_source.y - output.planned_pose.y),
-          pose_in_source.z - output.planned_pose.z) <= planning_pose_drift_tolerance_;
-        const bool connector_clear = output.result.path.empty() || swept_sphere_clear(
-          *output.raw, pose_in_source, output.result.path.front(), config_.lethal_radius);
+          pose_in_source.z - output.planned_pose.z);
+        const bool pose_matches =
+          pose_drift <= planning_pose_drift_tolerance_ + 1.0e-12;
+        const Point3 * route_entry = !output.result.path.empty() ?
+          &output.result.path.front() : (!output.reference_path.empty() ?
+          &output.reference_path.front() : nullptr);
+        const bool connector_clear = !route_entry || swept_sphere_clear(
+          *output.raw, pose_in_source, *route_entry, config_.lethal_radius);
         const bool source_is_current = output.map_generation == map_generation_ &&
           output.map_stamp_ns == map_stamp_.nanoseconds();
         const bool current = output.goal_generation == goal_generation_ && pose_matches &&
           connector_clear && (source_is_current || output.result.found());
         if (current) {
+          // A completed plan remains usable after bounded motion only if the
+          // verified connector is part of the route handed to consumers.
+          if (pose_drift > 1.0e-9) {
+            if (!output.result.path.empty()) {
+              output.result.path.insert(output.result.path.begin(), pose_in_source);
+            }
+            if (!output.reference_path.empty()) {
+              output.reference_path.insert(output.reference_path.begin(), pose_in_source);
+              output.reference_info["length_m"] =
+                output.reference_info.value("length_m", 0.0) + pose_drift;
+              output.reference_info["verified_prefix_m"] =
+                output.reference_info.value("verified_prefix_m", 0.0) + pose_drift;
+              output.reference_info["verified_local_path_m"] =
+                output.reference_info.value("verified_local_path_m", 0.0) + pose_drift;
+            }
+          }
           reference_path_ = std::move(output.reference_path);
           reference_info_ = std::move(output.reference_info);
           reference_map_generation_ = output.map_generation;
