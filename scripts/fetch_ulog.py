@@ -89,6 +89,10 @@ def download(master, remote, local, expect_size=None):
     last = [time.time()]
 
     def progress(pct):
+        # MAVSDK may signal completion without a percentage after the final
+        # block has already been written.
+        if pct is None:
+            return
         if time.time() - last[0] > 3:
             print(f"  {pct:.0f}%", flush=True)
             last[0] = time.time()

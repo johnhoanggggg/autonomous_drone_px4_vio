@@ -369,8 +369,9 @@ TEST(GridPlanner3D, ReferenceRouteCrossesUnknownButItsVerifiedPrefixDoesNot)
     for (int y = 0; y < 20; ++y) {proposed_map.set({15, y, z}, p::VoxelState::Free);}
   }
   p::Planner3DConfig config;
-  const p::PreparedPlanner3D verified(observed, config);
-  const p::PreparedPlanner3D reference(proposed_map, config, &verified.costs());
+  const p::PreparedPlanner3D reference(proposed_map, config, &observed);
+  EXPECT_EQ(reference.costs().at({15, 10, 10}), p::VOXEL_EXPLORATION_COST);
+  EXPECT_TRUE(reference.costs().traversable({15, 10, 10}));
   const auto route = reference.plan({0.65, 1.05, 1.05}, {3.05, 1.05, 1.05});
   ASSERT_TRUE(route.found());
   ASSERT_TRUE(route.goal->exact);
@@ -384,7 +385,7 @@ TEST(GridPlanner3D, ReferenceRouteCrossesUnknownButItsVerifiedPrefixDoesNot)
   for (int z = 0; z < 20; ++z) {
     for (int y = 0; y < 20; ++y) {proposed_map.set({15, y, z}, p::VoxelState::Occupied);}
   }
-  const p::PreparedPlanner3D walled(proposed_map, config, &verified.costs());
+  const p::PreparedPlanner3D walled(proposed_map, config, &observed);
   const auto blocked = walled.plan({0.65, 1.05, 1.05}, {3.05, 1.05, 1.05});
   ASSERT_TRUE(blocked.found());
   EXPECT_FALSE(blocked.goal->exact);

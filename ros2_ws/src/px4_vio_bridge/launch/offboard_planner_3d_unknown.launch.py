@@ -1,10 +1,16 @@
-"""Command the explicit unknown-allowed 3D reference using the existing PX4 sequencer.
+"""Command the full unknown-aware 3D reference route.
 
 Attach to ros_planner_3d_monitor. This launch owns PX4 output; auto_arm defaults
 false. The visual odometry bridge always consumes continuous raw odometry.
 """
+import math
+from pathlib import Path
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, RegisterEventHandler, EmitEvent, LogInfo
+from launch.actions import (
+    DeclareLaunchArgument, ExecuteProcess, RegisterEventHandler, EmitEvent,
+    LogInfo, OpaqueFunction, TimerAction,
+)
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
@@ -20,8 +26,11 @@ FLIGHT_RECORD_TOPICS = (
     '/fmu/out/vehicle_command_ack', '/fmu/out/vehicle_status_v1',
     '/fmu/out/vehicle_land_detected', '/fmu/out/failsafe_flags',
     '/fmu/out/battery_status_v1', '/fmu/out/sensor_combined',
-    '/rtabmap/vio_odometry', '/rtabmap/vio_pose', '/rtabmap/vio_odom_info',
-    '/rtabmap/mapData', '/rtabmap/octomap', '/rtabmap/octomap_metadata',
+    '/rtabmap/vio_odometry', '/rtabmap/vio_pose', '/rtabmap/vio_odom_info_lite',
+    # OctoMap plus paired metadata is the independent command-audit evidence.
+    # MapData is a high-volume planner-replay input and is intentionally left
+    # to an explicit diagnostic recording, not the time-critical flight bag.
+    '/rtabmap/octomap', '/rtabmap/octomap_metadata',
     '/planner3d/pose_snapshot', '/planner3d/reference_snapshot',
     '/planner3d/reference_path', '/planner3d/path_snapshot', '/planner3d/status',
     '/planner3d/flight/status', '/planner3d/flight/config', '/planner3d/flight/teleop',
@@ -30,27 +39,81 @@ FLIGHT_RECORD_TOPICS = (
 )
 
 
+def existing_bag_recorders(proc_root=Path('/proc')):
+    """Return live `ros2 bag record` processes without requiring psutil."""
+    recorders = []
+    try:
+        entries = proc_root.iterdir()
+    except OSError:
+        return recorders
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = [part.decode(errors='replace') for part in
+                    (entry / 'cmdline').read_bytes().split(b'\0') if part]
+        except (OSError, PermissionError):
+            continue
+        if any(argv[index:index + 2] == ['bag', 'record']
+               for index in range(len(argv) - 1)):
+            recorders.append((int(entry.name), ' '.join(argv)))
+    return sorted(recorders)
+
+
+def validate_flight_start(context):
+    speed = float(LaunchConfiguration('command_speed').perform(context))
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise RuntimeError('route_speed/command_speed must be finite and positive')
+    recorders = existing_bag_recorders()
+    if recorders:
+        details = '; '.join(f'PID {pid}: {command}' for pid, command in recorders)
+        raise RuntimeError(
+            'Refusing 3D flight start while another ros2 bag recorder is alive. '
+            'Stop the old recorder and keep the monitor at record_bag:=false. ' + details)
+    return []
+
+
 def generate_launch_description():
     defaults = {
         'auto_arm': 'false', 'start_vio_bridge': 'true', 'record_bag': 'true',
+        # The ROS 3D backend starts cold on the Pi. Give the VIO bridge time to
+        # establish PX4 external-vision fusion before the adapter starts its
+        # own 10-second local-position watchdog. This mirrors the proven 2D
+        # flow, where the bridge is already warm before the flight launch.
+        'adapter_start_delay': '5.0',
         'bag_output': str(timestamped_bag('offboard_planner_3d_unknown')),
-        'hover_height': '0.5', 'min_height': '0.15', 'max_height': '1.25',
+        # Use the same takeoff profile that has flown successfully in the 2D
+        # adapter. Route motion keeps its separate conservative 3D limits.
+        'hover_height': '0.30', 'min_height': '0.15', 'max_height': '1.25',
+        'climb_rate': '0.25', 'climb_leash': '0.12', 'climb_release': '0.05',
+        'climb_feedforward': 'true',
         'geofence_radius': '3.0', 'required_clearance': '0.35',
-        'command_speed': '0.10', 'command_vertical_speed': '0.05',
+        # route_speed is the operator-facing control. command_speed remains a
+        # compatible override for existing scripts and is what the node sees.
+        'route_speed': '0.15', 'command_speed': LaunchConfiguration('route_speed'),
+        'command_vertical_speed': '0.05',
         'command_acceleration': '0.30', 'command_vertical_acceleration': '0.20',
-        'rate_hz': '50.0', 'climb_timeout': '25.0', 'max_flight_time': '180.0',
+        # 20 Hz remains far above PX4's offboard requirement and avoids doing
+        # the full 3D chord revalidation 50 times per second on the Pi.
+        'rate_hz': '20.0', 'climb_timeout': '15.0', 'max_flight_time': '180.0',
         'planner_fault_land_time': '3.0', 'goal_hold_time': '3.0',
-        'map_timeout': '3.0', 'pose_timeout': '0.5', 'path_timeout': '2.0',
+        'map_timeout': '3.0', 'pose_timeout': '0.5', 'max_vio_source_age': '0.30',
+        'path_timeout': '2.0', 'vio_info_topic': '/rtabmap/vio_odom_info_lite',
         'vio_yaw_offset_deg': '0.0', 'min_vio_features': '20',
-        'require_goal_after_hover': 'true', 'yaw_follows_heading': 'true',
+        # Match the 2D adapter: an existing goal may be used, but only after the
+        # planner publishes a new coherent route snapshot from the hover state.
+        # Set true to require a second user click after takeoff.
+        'require_goal_after_hover': 'false', 'yaw_follows_heading': 'true',
         'yaw_rate_deg': '20.0', 'keyboard_kill': 'true', 'keyboard_land': 'true',
         'foxglove_teleop': 'true',
     }
-    booleans = {'auto_arm', 'require_goal_after_hover', 'yaw_follows_heading',
+    booleans = {'auto_arm', 'climb_feedforward', 'require_goal_after_hover', 'yaw_follows_heading',
                 'keyboard_kill', 'keyboard_land', 'foxglove_teleop'}
-    excluded = {'start_vio_bridge', 'record_bag', 'bag_output'}
+    strings = {'vio_info_topic'}
+    excluded = {'start_vio_bridge', 'record_bag', 'bag_output', 'adapter_start_delay',
+                'route_speed'}
     params = {k: ParameterValue(LaunchConfiguration(k), value_type=(
-        bool if k in booleans else int if k == 'min_vio_features' else float))
+        bool if k in booleans else str if k in strings else int if k == 'min_vio_features' else float))
         for k in defaults if k not in excluded}
     params.update({'allow_unknown': True,
                    'path_snapshot_topic': '/planner3d/reference_snapshot',
@@ -64,6 +127,8 @@ def generate_launch_description():
                   parameters=[{'input_odometry_topic': '/rtabmap/vio_odometry',
                                'input_pose_topic': '/rtabmap/vio_pose',
                                'frame_transform': 'enu_flu_to_ned_frd',
+                               'max_raw_odometry_age': ParameterValue(
+                                   LaunchConfiguration('max_vio_source_age'), value_type=float),
                                'vio_yaw_offset_deg': ParameterValue(
                                    LaunchConfiguration('vio_yaw_offset_deg'), value_type=float)}])
     recorder = ExecuteProcess(
@@ -80,8 +145,16 @@ def generate_launch_description():
     stop_recorder = RegisterEventHandler(OnProcessExit(target_action=recorder,
         on_exit=[EmitEvent(event=Shutdown(reason='3D flight recorder stopped'))]),
         condition=IfCondition(LaunchConfiguration('record_bag')))
+    delayed_adapter = TimerAction(
+        period=LaunchConfiguration('adapter_start_delay'), actions=[adapter])
     return LaunchDescription([
         *[DeclareLaunchArgument(k, default_value=v) for k, v in defaults.items()],
-        LogInfo(msg='3D FLIGHT: unknown allowed, occupied blocked. Auto-arm defaults false; K=kill, L=land.'),
-        stop_adapter, stop_bridge, stop_recorder, recorder, bridge, adapter,
+        LogInfo(msg=[
+            '3D FLIGHT: unknown traversable, occupied blocked. VIO bridge warm-up ',
+            LaunchConfiguration('adapter_start_delay'),
+            ' s; route speed ', LaunchConfiguration('command_speed'),
+            ' m/s; auto-arm defaults false; K=kill, L=land.',
+        ]),
+        OpaqueFunction(function=validate_flight_start),
+        stop_adapter, stop_bridge, stop_recorder, recorder, bridge, delayed_adapter,
     ])

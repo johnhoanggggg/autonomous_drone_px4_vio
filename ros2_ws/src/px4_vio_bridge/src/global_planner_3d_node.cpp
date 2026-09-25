@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -119,9 +120,16 @@ public:
     pose_topic_ = declare_parameter<std::string>("pose_topic", "/rtabmap/pose");
     goal_topic_ = declare_parameter<std::string>("goal_topic", "/waypoint/clicked");
     goal_height_mode_ = declare_parameter<std::string>("goal_height_mode", "clicked");
+    current_goal_min_height_above_start_ =
+      declare_parameter<double>("current_goal_min_height_above_start", 0.0);
     exploration_route_ = declare_parameter<bool>("exploration_route", false);
     if (goal_height_mode_ != "clicked" && goal_height_mode_ != "current") {
       throw std::invalid_argument("goal_height_mode must be clicked or current");
+    }
+    if (!std::isfinite(current_goal_min_height_above_start_) ||
+      current_goal_min_height_above_start_ < 0.0)
+    {
+      throw std::invalid_argument("current_goal_min_height_above_start must be finite and nonnegative");
     }
     frame_id_ = declare_parameter<std::string>("frame_id", "world");
     voxel_size_ = declare_parameter<double>("voxel_size", 0.05);
@@ -180,10 +188,27 @@ public:
       "/planner3d/markers", 10);
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / std::max(0.2, rate_hz)), [this]() {tick();});
+    // Do not leave a completed sub-second job waiting for the next 2 Hz
+    // planning tick: that can coincide with the next 1 Hz map and needlessly
+    // discard useful work. This timer only wakes the normal single-threaded
+    // result-consumption path once per job.
+    worker_poll_timer_ = create_wall_timer(std::chrono::milliseconds(20), [this]() {
+        if (!worker_completion_notified_ && planning_future_.valid() &&
+          planning_future_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        {
+          worker_completion_notified_ = true;
+          tick();
+        }
+      });
     RCLCPP_WARN(
       get_logger(),
       "3D planner is OBSERVATION ONLY: no PX4 publishers; unknown=blocked radius=%.2fm",
       config_.lethal_radius);
+  }
+
+  ~GlobalPlanner3DNode() override
+  {
+    if (planning_future_.valid()) {planning_future_.wait();}
   }
 
 private:
@@ -194,14 +219,156 @@ private:
     SphereBlockers3D blockers;
   };
 
-  ForwardProbe forward_probe(const VoxelGrid & raw) const
+  struct PlanningRequest
   {
-    const double dx = goal_->x - pose_->x, dy = goal_->y - pose_->y, dz = goal_->z - pose_->z;
+    std::shared_ptr<const VoxelGrid> raw;
+    Point3 pose;
+    Point3 goal;
+    Point3 takeoff_center;
+    Planner3DConfig config;
+    std::int64_t map_generation{};
+    std::int64_t map_stamp_ns{};
+    std::int64_t goal_generation{};
+    bool exploration_route{};
+    double planning_radius_xy{};
+    double min_z{};
+    double max_z{};
+    double grid_ms{};
+  };
+
+  struct PlanningOutput
+  {
+    std::shared_ptr<const VoxelGrid> raw;
+    Point3 planned_pose;
+    Point3 requested_goal;
+    PlanResult3D result;
+    ForwardProbe probe;
+    std::vector<Point3> reference_path;
+    nlohmann::ordered_json reference_info;
+    nlohmann::ordered_json timing;
+    std::int64_t map_generation{};
+    std::int64_t map_stamp_ns{};
+    std::int64_t goal_generation{};
+    bool exploration_route{};
+  };
+
+  struct PlanningWorkerCache
+  {
+    std::int64_t map_generation{-1};
+    std::int64_t map_stamp_ns{-1};
+    bool exploration_route{};
+    std::optional<PreparedPlanner3D> planner;
+  };
+
+  static bool request_inside_geofence(const PlanningRequest & request, const Point3 & point)
+  {
+    return std::hypot(
+      point.x - request.takeoff_center.x, point.y - request.takeoff_center.y) <=
+      request.planning_radius_xy + 1.0e-12 && point.z >= request.min_z &&
+      point.z <= request.max_z;
+  }
+
+  static ForwardProbe make_forward_probe(
+    const VoxelGrid & raw, const Point3 & pose, const Point3 & goal, double radius)
+  {
+    const double dx = goal.x - pose.x, dy = goal.y - pose.y, dz = goal.z - pose.z;
     const double distance = std::hypot(std::hypot(dx, dy), dz);
     const double step = std::min(0.25, distance);
     const double scale = distance > 1e-12 ? step / distance : 0.0;
-    const Point3 center{pose_->x + dx * scale, pose_->y + dy * scale, pose_->z + dz * scale};
-    return {center, step, sphere_blockers_3d(raw, center, config_.lethal_radius)};
+    const Point3 center{pose.x + dx * scale, pose.y + dy * scale, pose.z + dz * scale};
+    return {center, step, sphere_blockers_3d(raw, center, radius)};
+  }
+
+  static PlanningOutput calculate_plan(
+    PlanningRequest request, const std::shared_ptr<PlanningWorkerCache> & cache)
+  {
+    const auto worker_begin = steady_seconds();
+    const bool cache_hit = cache->planner &&
+      cache->map_generation == request.map_generation &&
+      cache->map_stamp_ns == request.map_stamp_ns &&
+      cache->exploration_route == request.exploration_route;
+    const auto prepare_begin = steady_seconds();
+    if (!cache_hit) {
+      if (request.exploration_route) {
+        auto optimistic = *request.raw;
+        for (int z = 0; z < static_cast<int>(optimistic.depth()); ++z) {
+          for (int y = 0; y < static_cast<int>(optimistic.height()); ++y) {
+            for (int x = 0; x < static_cast<int>(optimistic.width()); ++x) {
+              const Voxel voxel{x, y, z};
+              if (!request_inside_geofence(request, optimistic.voxel_center(voxel))) {
+                optimistic.set(voxel, VoxelState::Occupied);
+              } else if (request.raw->at(voxel) == VoxelState::Unknown) {
+                optimistic.set(voxel, VoxelState::Free);
+              }
+            }
+          }
+        }
+        auto proposal_config = request.config;
+        proposal_config.heuristic_weight = 2.5;
+        proposal_config.project_blocked_goal = true;
+        cache->planner.emplace(std::move(optimistic), proposal_config, request.raw.get());
+      } else {
+        cache->planner.emplace(*request.raw, request.config);
+      }
+      cache->map_generation = request.map_generation;
+      cache->map_stamp_ns = request.map_stamp_ns;
+      cache->exploration_route = request.exploration_route;
+    }
+    const auto plan_begin = steady_seconds();
+    auto result = cache->planner->plan(request.pose, request.goal);
+    std::vector<Point3> reference_path;
+    nlohmann::ordered_json reference_info;
+    if (request.exploration_route) {
+      reference_path = result.path;
+      auto verified = verified_prefix_3d(
+        *request.raw, reference_path, request.config.lethal_radius);
+      const bool complete = !verified.empty() && verified.size() == reference_path.size() &&
+        verified.back().x == reference_path.back().x &&
+        verified.back().y == reference_path.back().y &&
+        verified.back().z == reference_path.back().z;
+      const double prefix_length = path_length_3d(verified);
+      reference_info = { {"state", result.reason},
+        {"map_generation", request.map_generation},
+        {"goal_generation", request.goal_generation},
+        {"length_m", path_length_3d(reference_path)},
+        {"fully_verified", complete},
+        {"verified_prefix_m", prefix_length},
+        {"verified_local_path_m", prefix_length},
+        {"local_route_mode", "prefix"},
+        {"known_fallback_used", false},
+        {"goal_exact", result.goal && result.goal->exact},
+        {"executable", false}};
+      result.path = std::move(verified);
+      if (!complete && result.goal) {
+        result.goal->exact = false;
+        result.goal->terminal = false;
+      }
+      if (!complete && !reference_path.empty()) {
+        result.reason = result.path.empty() ? "REFERENCE_ONLY" : "EXPLORING";
+      }
+    }
+    const auto plan_end = steady_seconds();
+    auto probe = make_forward_probe(
+      *request.raw, request.pose, request.goal, request.config.lethal_radius);
+    PlanningOutput output;
+    output.raw = std::move(request.raw);
+    output.planned_pose = request.pose;
+    output.requested_goal = request.goal;
+    output.result = std::move(result);
+    output.probe = std::move(probe);
+    output.reference_path = std::move(reference_path);
+    output.reference_info = std::move(reference_info);
+    output.timing = {{"map_generation", request.map_generation},
+      {"map_cache_hit", cache_hit}, {"grid_ms", request.grid_ms},
+      {"prepare_ms", (plan_begin - prepare_begin) * 1000.0},
+      {"plan_ms", (plan_end - plan_begin) * 1000.0},
+      {"probe_ms", (steady_seconds() - plan_end) * 1000.0},
+      {"worker_total_ms", (steady_seconds() - worker_begin) * 1000.0}};
+    output.map_generation = request.map_generation;
+    output.map_stamp_ns = request.map_stamp_ns;
+    output.goal_generation = request.goal_generation;
+    output.exploration_route = request.exploration_route;
+    return output;
   }
 
   void add_probe_status(nlohmann::ordered_json & status, const ForwardProbe * probe) const
@@ -299,8 +466,9 @@ private:
     map_stamp_ = pending_map_stamp_;
     map_received_ = steady_seconds();
     map_generation_ = pending_metadata_->generation;
-    prepared_planner_.reset();
-    reference_planner_.reset();
+    raw_grid_.reset();
+    raw_grid_generation_ = -1;
+    raw_grid_ms_ = 0.0;
     reference_path_.clear();
     reference_info_ = nlohmann::ordered_json::object();
     source_pose_generation_ = pending_metadata_->source_pose_generation;
@@ -360,19 +528,44 @@ private:
       return;
     }
     clicked_goal_ = point;
-    Point3 resolved = point;
     if (goal_height_mode_ == "current") {
-      if (!pose_ || !fresh_stamp(pose_stamp_, now().nanoseconds(), pose_timeout_) ||
-        (!snapshot_topic_.empty() && (pose_generation_ != map_generation_ ||
-        pose_map_stamp_ != map_stamp_.nanoseconds())))
-      {
+      if (!current_goal_pose_ready()) {
+        // A Foxglove click is a user command, not disposable sensor data. Map
+        // publication briefly leads its matching pose snapshot on the live
+        // graph, so retain the newest click and resolve its height as soon as a
+        // coherent pose/map pair arrives. The 20260921T142531Z flight lost its
+        // only post-hover click in exactly this window.
+        pending_current_goal_ = point;
         goal_.reset();
         fail_closed("GOAL_HEIGHT_POSE_UNAVAILABLE");
         return;
       }
-      resolved.z = pose_->z;  // Latch once per click, never follow subsequent body motion.
+    }
+    accept_goal(point);
+  }
+
+  bool current_goal_pose_ready() const
+  {
+    return pose_ && fresh_stamp(pose_stamp_, now().nanoseconds(), pose_timeout_) &&
+      (snapshot_topic_.empty() || (pose_generation_ == map_generation_ &&
+      pose_map_stamp_ == map_stamp_.nanoseconds()));
+  }
+
+  void accept_goal(Point3 resolved)
+  {
+    if (goal_height_mode_ == "current") {
+      resolved.z = pose_->z;
+      if (takeoff_center_) {
+        // In the flight monitor, a floor click made before takeoff must describe
+        // the hover-level XY destination, not a descent back toward the floor.
+        // This floor is zero by default and explicitly set to 0.30 m by the
+        // ROS/PX4 3D monitor launch.
+        resolved.z = std::max(
+          resolved.z, takeoff_center_->z + current_goal_min_height_above_start_);
+      }
     }
     goal_ = resolved;
+    pending_current_goal_.reset();
     ++goal_generation_;
     plan_dirty_ = true;
   }
@@ -380,12 +573,28 @@ private:
   void tick()
   {
     const auto now = steady_seconds();
+    // Transient freshness faults report status without withdrawing a route.
+    // The worker below keeps this executor responsive while inflation and A*
+    // run; consumers independently hold on stale map/pose/path snapshots.
     if (!octree_ || now - map_received_ > map_timeout_ ||
-      !fresh_stamp(map_stamp_.nanoseconds(), this->now().nanoseconds(), map_timeout_)) {fail_closed("MAP_STALE"); return;}
+      !fresh_stamp(map_stamp_.nanoseconds(), this->now().nanoseconds(), map_timeout_))
+    {
+      publish_status("MAP_STALE");
+      return;
+    }
     if (!pose_ || now - pose_received_ > pose_timeout_ ||
-      !fresh_stamp(pose_stamp_, this->now().nanoseconds(), pose_timeout_)) {fail_closed("POSE_STALE"); return;}
+      !fresh_stamp(pose_stamp_, this->now().nanoseconds(), pose_timeout_))
+    {
+      publish_status("POSE_STALE");
+      return;
+    }
     if (!snapshot_topic_.empty() && (pose_generation_ != map_generation_ ||
-      pose_map_stamp_ != map_stamp_.nanoseconds())) {fail_closed("POSE_MAP_MISMATCH"); return;}
+      pose_map_stamp_ != map_stamp_.nanoseconds()))
+    {
+      publish_status("POSE_MAP_MISMATCH");
+      return;
+    }
+    if (pending_current_goal_) {accept_goal(*pending_current_goal_);}
     if (!goal_) {fail_closed("WAITING_FOR_GOAL"); return;}
     if (!takeoff_center_) {fail_closed("WAITING_FOR_TAKEOFF_ORIGIN"); return;}
     if (!inside_geofence(*goal_)) {fail_closed("GOAL_OUTSIDE_GEOFENCE"); return;}
@@ -402,106 +611,90 @@ private:
       return;
     }
 
-    const auto generation = map_generation_;
-    const auto prepare_begin = steady_seconds();
-    const bool cache_hit = prepared_planner_.has_value();
-    if (!prepared_planner_) {
+    if (planning_future_.valid()) {
+      if (planning_future_.wait_for(std::chrono::milliseconds(0)) !=
+        std::future_status::ready)
+      {
+        publish_status("PLANNING");
+        return;
+      }
+      try {
+        auto output = planning_future_.get();
+        const bool pose_matches =
+          std::hypot(pose_->x - output.planned_pose.x, pose_->y - output.planned_pose.y) <
+          voxel_size_ * 0.5 &&
+          std::abs(pose_->z - output.planned_pose.z) < voxel_size_ * 0.5;
+        const bool current = output.map_generation == map_generation_ &&
+          output.map_stamp_ns == map_stamp_.nanoseconds() &&
+          output.goal_generation == goal_generation_ && pose_matches;
+        if (current) {
+          reference_path_ = std::move(output.reference_path);
+          reference_info_ = std::move(output.reference_info);
+          plan_timing_ = std::move(output.timing);
+          publish_reference();
+          publish_candidate(output.exploration_route ? reference_path_ : output.result.path);
+          publish_markers(*output.raw, output.result, output.probe);
+          last_planned_pose_ = output.planned_pose;
+          if (!output.result.found()) {
+            fail_closed(output.result.reason, &output.probe);
+            // The same immutable inputs cannot produce a different answer.
+            // Map, goal, or meaningful pose motion will mark planning dirty.
+            plan_dirty_ = false;
+            return;
+          }
+          accepted_goal_exact_ = output.result.goal && output.result.goal->exact;
+          accepted_goal_terminal_ = output.result.goal && output.result.goal->terminal;
+          accepted_path_ = output.result.path;
+          path_map_generation_ = output.map_generation;
+          publish_path(accepted_path_, path_pub_);
+          std_msgs::msg::Int32 path_generation;
+          path_generation.data = static_cast<std::int32_t>(path_map_generation_);
+          path_map_generation_pub_->publish(path_generation);
+          plan_dirty_ = false;
+          publish_result_status(
+            output.result, output.raw->resolution(), output.probe);
+          return;
+        }
+        // The completed job is obsolete. There is deliberately no queue: the
+        // latest coherent map/pose/goal snapshot below replaces every update
+        // which arrived while this job was running.
+        plan_dirty_ = true;
+      } catch (const std::exception & error) {
+        RCLCPP_ERROR(get_logger(), "3D planning worker failed: %s", error.what());
+        fail_closed("PLANNING_WORKER_FAILED");
+        return;
+      }
+    }
+
+    if (!raw_grid_ || raw_grid_generation_ != map_generation_) {
+      const auto grid_begin = steady_seconds();
       auto grid = make_planning_grid();
       if (!grid) {fail_closed("MAP_CROP_INVALID"); return;}
-      prepared_planner_.emplace(std::move(*grid), config_);
+      raw_grid_ = std::make_shared<const VoxelGrid>(std::move(*grid));
+      raw_grid_generation_ = map_generation_;
+      raw_grid_ms_ = (steady_seconds() - grid_begin) * 1000.0;
     }
-    const auto plan_begin = steady_seconds();
-    const auto & raw = prepared_planner_->raw();
-    PlanResult3D result;
-    if (exploration_route_) {
-      if (!reference_planner_) {
-        auto reference_grid = raw;
-        for (int z = 0; z < static_cast<int>(raw.depth()); ++z) {
-          for (int y = 0; y < static_cast<int>(raw.height()); ++y) {
-            for (int x = 0; x < static_cast<int>(raw.width()); ++x) {
-              const Voxel v{x, y, z};
-              // Unknown inside the search bounds can be proposed, while the
-              // hard geofence remains blocked. Sensor occupancy is untouched.
-              if (!inside_geofence(raw.voxel_center(v))) {
-                reference_grid.set(v, VoxelState::Occupied);
-              } else if (raw.at(v) == VoxelState::Unknown) {
-                reference_grid.set(v, VoxelState::Free);
-              }
-            }
-          }
-        }
-        auto reference_config = config_;
-        reference_config.heuristic_weight = 2.5;
-        reference_config.project_blocked_goal = true;
-        reference_planner_.emplace(std::move(reference_grid), reference_config,
-          &prepared_planner_->costs());
-      }
-      result = reference_planner_->plan(*pose_, *goal_);
-      reference_path_ = result.path;
-      auto verified = verified_prefix_3d(raw, reference_path_, config_.lethal_radius);
-      bool complete = !verified.empty() && verified.size() == reference_path_.size() &&
-        verified.back().x == reference_path_.back().x && verified.back().y == reference_path_.back().y &&
-        verified.back().z == reference_path_.back().z;
-      double prefix_length = path_length_3d(verified);
-      bool local_frontier = false;
-      // A proposal may climb immediately into unknown space even though a
-      // short forward detour is verified. Preserve useful local exploration
-      // instead of shortening it to the proposal's first blocked segment.
-      if (!complete && !reference_path_.empty() && prefix_length < 0.15) {
-        auto local = prepared_planner_->plan(*pose_, *goal_);
-        const auto remaining = [this](const Point3 & p) {
-            return std::hypot(std::hypot(p.x - goal_->x, p.y - goal_->y), p.z - goal_->z);
-          };
-        if (local.found() && (verified.empty() ||
-          remaining(local.path.back()) < remaining(verified.back()) - 1e-6))
-        {
-          verified = local.path;
-          local_frontier = true;
-          if (local.goal && local.goal->exact) {
-            reference_path_ = verified; result = std::move(local);
-            complete = true; prefix_length = path_length_3d(verified); local_frontier = false;
-          }
-        }
-      }
-      reference_info_ = {{"state", result.reason}, {"map_generation", generation},
-        {"goal_generation", goal_generation_}, {"length_m", path_length_3d(reference_path_)},
-        {"fully_verified", complete}, {"verified_prefix_m", prefix_length},
-        {"verified_local_path_m", path_length_3d(verified)},
-        {"local_route_mode", local_frontier ? "reachable_frontier" : "prefix"},
-        {"goal_exact", result.goal && result.goal->exact}, {"executable", false}};
-      publish_reference();
-      result.path = std::move(verified);
-      if (!complete && result.goal) {result.goal->exact = false; result.goal->terminal = false;}
-      if (!complete && !reference_path_.empty()) {
-        result.reason = result.path.empty() ? "REFERENCE_ONLY" : "EXPLORING";
-      }
-    } else {
-      result = prepared_planner_->plan(*pose_, *goal_);
-    }
-    const auto plan_end = steady_seconds();
-    const auto probe = forward_probe(raw);
-    plan_timing_ = {{"map_generation", generation}, {"map_cache_hit", cache_hit},
-      {"prepare_ms", (plan_begin - prepare_begin) * 1000.0},
-      {"plan_ms", (plan_end - plan_begin) * 1000.0},
-      {"probe_ms", (steady_seconds() - plan_end) * 1000.0}};
-    if (generation != map_generation_) {fail_closed("MAP_GENERATION_RACE"); return;}
-    publish_candidate(exploration_route_ ? reference_path_ : result.path);
-    publish_markers(raw, result, probe);
-    if (!result.found()) {
-      fail_closed(result.reason, &probe);
-      return;
-    }
-    accepted_goal_exact_ = result.goal && result.goal->exact;
-    accepted_goal_terminal_ = result.goal && result.goal->terminal;
-    publish_path(result.path, path_pub_);
-    accepted_path_ = result.path;
-    last_planned_pose_ = pose_;
-    path_map_generation_ = generation;
-    std_msgs::msg::Int32 path_generation;
-    path_generation.data = static_cast<std::int32_t>(path_map_generation_);
-    path_map_generation_pub_->publish(path_generation);
-    plan_dirty_ = false;
-    publish_result_status(result, raw.resolution(), probe);
+    PlanningRequest request;
+    request.raw = raw_grid_;
+    request.pose = *pose_;
+    request.goal = *goal_;
+    request.takeoff_center = *takeoff_center_;
+    request.config = config_;
+    request.map_generation = map_generation_;
+    request.map_stamp_ns = map_stamp_.nanoseconds();
+    request.goal_generation = goal_generation_;
+    request.exploration_route = exploration_route_;
+    request.planning_radius_xy = planning_radius_xy_;
+    request.min_z = min_z_;
+    request.max_z = max_z_;
+    request.grid_ms = raw_grid_ms_;
+    auto cache = planning_worker_cache_;
+    planning_future_ = std::async(
+      std::launch::async, [request = std::move(request), cache]() mutable {
+        return calculate_plan(std::move(request), cache);
+      });
+    worker_completion_notified_ = false;
+    publish_status("PLANNING");
   }
 
   bool inside_geofence(const Point3 & point) const
@@ -529,6 +722,8 @@ private:
     if (pose_) {status["start"] = {pose_->x, pose_->y, pose_->z};}
     if (goal_) {status["requested_goal"] = {goal_->x, goal_->y, goal_->z};}
     status["goal_height_mode"] = goal_height_mode_;
+    status["current_goal_min_height_above_start"] = current_goal_min_height_above_start_;
+    status["goal_height_pending"] = pending_current_goal_.has_value();
     status["exploration_route"] = exploration_route_;
     if (!reference_info_.empty() && reference_info_["map_generation"] == map_generation_ &&
       reference_info_["goal_generation"] == goal_generation_) {status["reference_route"] = reference_info_;}
@@ -841,6 +1036,7 @@ private:
   std::string pose_topic_;
   std::string goal_topic_;
   std::string goal_height_mode_;
+  double current_goal_min_height_above_start_{};
   std::string frame_id_;
   std::string snapshot_topic_;
   bool accepted_goal_exact_{false}, accepted_goal_terminal_{false};
@@ -860,9 +1056,14 @@ private:
   std::size_t max_marker_voxels_{};
   bool require_map_metadata_{};
   Planner3DConfig config_;
-  std::optional<PreparedPlanner3D> prepared_planner_;
   bool exploration_route_{};
-  std::optional<PreparedPlanner3D> reference_planner_;
+  std::shared_ptr<const VoxelGrid> raw_grid_;
+  std::int64_t raw_grid_generation_{-1};
+  double raw_grid_ms_{};
+  std::shared_ptr<PlanningWorkerCache> planning_worker_cache_{
+    std::make_shared<PlanningWorkerCache>()};
+  std::future<PlanningOutput> planning_future_;
+  bool worker_completion_notified_{false};
   std::vector<Point3> reference_path_;
   nlohmann::ordered_json reference_info_;
   nlohmann::ordered_json plan_timing_;
@@ -873,6 +1074,7 @@ private:
   std::optional<Point3> pose_;
   std::optional<Point3> goal_;
   std::optional<Point3> clicked_goal_;
+  std::optional<Point3> pending_current_goal_;
   std::optional<Point3> takeoff_center_;
   std::optional<Point3> last_planned_pose_;
   std::vector<Point3> accepted_path_;
@@ -897,6 +1099,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr path_map_generation_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr worker_poll_timer_;
 };
 
 }  // namespace px4_vio_bridge

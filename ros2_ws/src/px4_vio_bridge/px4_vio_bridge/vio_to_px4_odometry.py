@@ -165,13 +165,18 @@ def pose_rejection_reason(
     return None
 
 
-def raw_odometry_rejection_reason(message, now_ns, previous_stamp_ns=None):
+def raw_odometry_rejection_reason(
+    message, now_ns, previous_stamp_ns=None, max_age_ns=500_000_000
+):
     """ROS backend only: accept continuous oak-body odometry, never map poses."""
     if message.header.frame_id != 'rtabmap_odom' or message.child_frame_id != 'oak':
         return 'unexpected raw odometry frames'
     stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
-    if stamp <= 0 or stamp > now_ns or now_ns - stamp > 500_000_000:
-        return 'raw odometry timestamp is invalid, future or over 500 ms old'
+    if stamp <= 0 or stamp > now_ns or now_ns - stamp > max_age_ns:
+        return (
+            'raw odometry timestamp is invalid, future or over '
+            f'{max_age_ns / 1_000_000:.0f} ms old'
+        )
     if previous_stamp_ns is not None and stamp <= previous_stamp_ns:
         return 'non-increasing raw odometry timestamp'
     p, q = message.pose.pose.position, message.pose.pose.orientation
@@ -200,11 +205,16 @@ class VioToPx4Odometry(Node):
         self.declare_parameter("reject_rtabmap_reset_pose", True)
         self.declare_parameter("reset_position_epsilon", 1.0e-6)
         self.declare_parameter("reset_orientation_epsilon", 1.0e-3)
+        self.declare_parameter("max_raw_odometry_age", 0.5)
 
         input_topic = self.get_parameter("input_pose_topic").value
         odometry_topic = self.get_parameter("input_odometry_topic").value
         self.raw_odometry_input = bool(odometry_topic)
         self.last_raw_stamp_ns = None
+        max_raw_age = float(self.get_parameter("max_raw_odometry_age").value)
+        if not math.isfinite(max_raw_age) or max_raw_age <= 0.0:
+            raise ValueError("max_raw_odometry_age must be finite and positive")
+        self.max_raw_odometry_age_ns = int(max_raw_age * 1_000_000_000)
         output_topic = self.get_parameter("output_odometry_topic").value
 
         qos = QoSProfile(
@@ -243,7 +253,8 @@ class VioToPx4Odometry(Node):
 
     def odometry_callback(self, odometry: Odometry) -> None:
         reason = raw_odometry_rejection_reason(
-            odometry, self.get_clock().now().nanoseconds, self.last_raw_stamp_ns)
+            odometry, self.get_clock().now().nanoseconds, self.last_raw_stamp_ns,
+            self.max_raw_odometry_age_ns)
         if reason is not None:
             self.previous_position = None
             self.previous_time_us = None

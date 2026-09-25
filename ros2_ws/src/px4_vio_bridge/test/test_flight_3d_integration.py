@@ -14,7 +14,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profile_sensor_data
 from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import PoseStamped
 from octomap_msgs.msg import Octomap
@@ -24,24 +24,26 @@ from std_msgs.msg import String
 from px4_vio_bridge.process_singleton import ProcessSingleton
 
 
-def occupied_tree(points, resolution=.05):
+def occupied_tree(points, resolution=.05, free_points=()):
     """OctoMap binary format: two bits per child, depth-first inner nodes."""
     root = {}
-    for point in points:
+    for point, leaf_state in [*((point, 1) for point in free_points),
+                              *((point, 2) for point in points)]:
         key = [int(math.floor(x/resolution))+32768 for x in point]
         node = root
         for bit in range(15, -1, -1):
             index = sum(((key[axis] >> bit) & 1) << axis for axis in range(3))
             if bit == 0:
-                node[index] = None
+                node[index] = leaf_state
             else:
                 node = node.setdefault(index, {})
 
     def encode(node):
-        bits = sum((2 if child is None else 3) << (2*i) for i, child in node.items())
+        bits = sum((child if isinstance(child, int) else 3) << (2*i)
+                   for i, child in node.items())
         out = [bits & 255, bits >> 8]
         for i in sorted(node):
-            if node[i] is not None:
+            if not isinstance(node[i], int):
                 out.extend(encode(node[i]))
         return out
     return [b if b < 128 else b-256 for b in encode(root)]
@@ -62,9 +64,9 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         (VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', durable),
         (VehicleControlMode, '/fmu/out/vehicle_control_mode', durable),
         (VehicleOdometry, '/fmu/in/vehicle_visual_odometry', qos_profile_sensor_data),
-        (PoseStamped, '/rtabmap/vio_pose', 10), (OdomInfo, '/rtabmap/vio_odom_info', qos_profile_sensor_data),
+        (PoseStamped, '/rtabmap/vio_pose', 10), (OdomInfo, '/rtabmap/vio_odom_info_lite', qos_profile_sensor_data),
         (Octomap, '/rtabmap/octomap', durable), (String, '/rtabmap/octomap_metadata', durable),
-        (String, '/planner3d/pose_snapshot', 10), (String, '/planner3d/reference_snapshot', 10),
+        (String, '/planner3d/pose_snapshot', 10), (String, '/planner3d/path_snapshot', 10),
     ]:
         pub[topic] = node.create_publisher(kind, prefix+topic if topic.startswith('/fmu/') else topic, qos)
     writer = rosbag2_py.SequentialWriter()
@@ -85,18 +87,22 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         received[key].append(msg)
         if key=='status':record('/planner3d/flight/status',msg)
         elif key=='setpoints':record('/fmu/in/trajectory_setpoint',msg)
+    setpoint_qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
     subs = [node.create_subscription(kind, topic, lambda m, key=key: receive(key,m), qos)
             for kind, topic, key, qos in [
                 (String, '/planner3d/flight/status', 'status', 10),
                 (VehicleCommand, prefix+'/fmu/in/vehicle_command', 'commands', qos_profile_sensor_data),
-                (TrajectorySetpoint, prefix+'/fmu/in/trajectory_setpoint', 'setpoints', qos_profile_sensor_data)]]
+                (TrajectorySetpoint, prefix+'/fmu/in/trajectory_setpoint', 'setpoints', setpoint_qos)]]
     subs.append(node.create_subscription(String,'/planner3d/flight/config',lambda m:record('/planner3d/flight/config',m),durable))
     binary = Path(get_package_prefix('px4_vio_bridge'))/'lib/px4_vio_bridge/cpp_flight_adapter_3d'
     args = [str(binary), '--ros-args']
-    params = {'auto_arm': auto_arm, 'allow_unknown': True, 'hover_height': .3,
+    params = {'auto_arm': auto_arm, 'allow_unknown': False,
+              'path_snapshot_topic': '/planner3d/path_snapshot', 'hover_height': .3,
               'min_height': .1, 'max_height': 1.5, 'command_speed': .3,
               'command_vertical_speed': .3, 'command_acceleration': .6,
               'command_vertical_acceleration': .6, 'min_vio_features': 20,
+              'climb_rate': .25, 'climb_leash': .12, 'climb_release': .05,
+              'climb_feedforward': True,
               'stream_time': .2, 'climb_timeout': 8., 'planner_fault_land_time': 1.5,
               'max_flight_time': 90., 'goal_hold_time': 20., 'keyboard_kill': False,
               'keyboard_land': False, 'yaw_follows_heading': auto_arm, 'yaw_rate_deg': 180.}
@@ -109,14 +115,20 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
     process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT,
         env={**os.environ, 'ROS_DOMAIN_ID': str(domain)}, start_new_session=True)
     position = [4., -2., 1.]; ground = position[:]
-    armed = False; offboard = False; generation = 0; map_stamp = 0; goal_generation = 0
-    goal = None; next_map = 0.; next_path = 0.; last_pump = 0.; command_index = 0
-    fault = None; obstacle = None
+    armed = False; offboard = False; generation = 0; map_stamp = 0; goal_generation = 1
+    goal = [.7,.1,.65]; next_map = 0.; next_path = 0.; last_pump = 0.; command_index = 0
+    pre_hover_path_pending = True; path_generation_lag = 0; map_history = {}
+    fault = None; obstacle = None; external_offset = [0., 0., 0.]
+    # Use native voxel centres. Coordinates on cell boundaries can round into
+    # an adjacent OctoMap key and leave a checkerboard of accidental unknowns.
+    free_points = [((x+.5)*.05, (y+.5)*.05, (z+.5)*.05)
+                   for x in range(-6, 23) for y in range(-8, 13) for z in range(-6, 23)]
+    clear_tree_data = occupied_tree([[2., 2., 2.]], free_points=free_points)
 
     def status(): return json.loads(received['status'][-1].data) if received['status'] else {}
 
     def pump():
-        nonlocal armed, offboard, generation, map_stamp, next_map, next_path, last_pump, command_index
+        nonlocal armed, offboard, generation, map_stamp, next_map, next_path, last_pump, command_index, pre_hover_path_pending
         now = time.monotonic()
         if now-last_pump < .02: return
         last_pump = now
@@ -127,7 +139,7 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         command_index = len(received['commands'])
         if received['setpoints']:
             target = received['setpoints'][-1].position
-            position[:] = [float(x) for x in target]
+            position[:] = [float(x)+external_offset[i] for i,x in enumerate(target)]
             if auto_arm and status().get('state')=='YAW_ALIGN':position[0]+=.003
         local = VehicleLocalPosition(); local.timestamp = ns//1000
         local.xy_valid = local.z_valid = True
@@ -150,14 +162,16 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         ev.reset_counter=1 if fault=='ev_reset' else 0
         pub['/fmu/in/vehicle_visual_odometry'].publish(ev)
         info=OdomInfo();info.header.stamp=pose.header.stamp;info.inliers=100;info.lost=False
-        if fault != 'lost_info': pub['/rtabmap/vio_odom_info'].publish(info)
+        if fault != 'lost_info': pub['/rtabmap/vio_odom_info_lite'].publish(info)
         if now>=next_map:
             generation += 1;map_stamp=ns;next_map=now+1.
             tree=Octomap();tree.header.frame_id='world';tree.header.stamp=pose.header.stamp
             tree.id='OcTree';tree.binary=True;tree.resolution=.05
-            tree.data=occupied_tree([obstacle or [2.,2.,2.]])
+            tree.data=(occupied_tree([obstacle], free_points=free_points)
+                       if obstacle else clear_tree_data)
             metadata={'generation':generation,'stamp_ns':map_stamp,'frame_id':'world','resolution':.05,
                       'map_from_odom':[0,0,0,0,0,0,1]}
+            map_history[generation] = (map_stamp, metadata['map_from_odom'])
             pub['/rtabmap/octomap'].publish(tree);record('/rtabmap/octomap',tree)
             metadata_msg=String(data=json.dumps(metadata))
             pub['/rtabmap/octomap_metadata'].publish(metadata_msg);record('/rtabmap/octomap_metadata',metadata_msg)
@@ -168,12 +182,27 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
                   'pose':mapped+[0,0,pose.pose.orientation.z,pose.pose.orientation.w],'correction':correction}
         if fault != 'pose': pub['/planner3d/pose_snapshot'].publish(String(data=json.dumps(snapshot)))
         if goal is not None and now>=next_path:
-            next_path=now+.5
+            # Publish the requested goal once before takeoff, then withhold its
+            # next route snapshot until the test explicitly releases it after
+            # hover. This proves the 2D-style policy accepts the same goal only
+            # after a fresh post-hover replan, without requiring another click.
+            if pre_hover_path_pending:
+                # The path topic is intentionally volatile, so repeat until the
+                # adapter confirms receipt; its subscription may still be joining
+                # DDS when the first mock publication occurs.
+                next_path=now+.1
+                if status().get('goal_generation') == goal_generation and not status().get('hover_ready'):
+                    pre_hover_path_pending=False
+                    next_path=float('inf')
+            else:
+                next_path=now+.5
+            path_generation=max(1,generation-path_generation_lag)
+            path_map_stamp,_=map_history.get(path_generation,(map_stamp,None))
             reference={'stamp_ns':ns,'frame_id':'wrong' if fault=='path_frame' else 'world',
-                       'map_generation':generation,'map_stamp_ns':map_stamp,'goal_generation':goal_generation,
-                       'lethal_radius':.35,'unknown_policy':'penalized','executable':False,
-                       'points':[body,goal], 'verification':{'goal_exact':True,'state':'PATH_VALID'}}
-            pub['/planner3d/reference_snapshot'].publish(String(data=json.dumps(reference)))
+                       'map_generation':path_generation,'map_stamp_ns':path_map_stamp,'goal_generation':goal_generation,
+                       'lethal_radius':.35,'executable':True, 'goal_exact':True,
+                       'goal_terminal':True, 'points':[body,goal]}
+            pub['/planner3d/path_snapshot'].publish(String(data=json.dumps(reference)))
 
     def wait(predicate, seconds=10.):
         end=time.monotonic()+seconds
@@ -185,7 +214,43 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
 
     try:
         wait(lambda:status().get('state')=='WAITING_FOR_GOAL')
+        hover_status = status()
+        assert hover_status['flight_state'] == 'WAITING_FOR_ROUTE'
+        assert hover_status['hover_ready'] is True
+        assert hover_status['minimum_goal_generation'] == goal_generation
+        assert hover_status['post_hover_path'] is False
         assert abs(position[2]-(ground[2]-.3)) < .08
+        # Takeoff must use the same vertical velocity feedforward as the proven
+        # 2D adapter, while the route retains its independent 3D limits.
+        climb_vz=[float(m.velocity[2]) for m in received['setpoints']
+                  if math.isfinite(float(m.velocity[2])) and float(m.velocity[2]) < 0.]
+        assert climb_vz and min(climb_vz) <= -.24
+        wait(lambda:math.isfinite(float(received['setpoints'][-1].velocity[2])) and
+             abs(float(received['setpoints'][-1].velocity[2])) < 1e-3,seconds=2.)
+        assert abs(float(received['setpoints'][-1].velocity[2])) < 1e-3
+        # Hover readiness is a one-way takeoff latch. An altitude overshoot
+        # while waiting for the post-hover route must not re-enter CLIMB
+        # and later fire the old climb timeout.
+        external_offset[2] = -.12
+        until=time.monotonic()+.15
+        wait(lambda:time.monotonic()>=until,seconds=.4)
+        assert status().get('state')=='WAITING_FOR_GOAL'
+        external_offset[2] = 0.
+        # A transient input fault must freeze the last safe command, not adopt
+        # the disturbed vehicle position. Alternating fault/recovery did the
+        # latter in flight and ratcheted the takeoff hold by 0.51 m.
+        before_fault = [float(x) for x in received['setpoints'][-1].position]
+        external_offset[0] = .12
+        fault = 'pose'
+        wait(lambda:status().get('state')=='HOLD' and status().get('fault')=='POSE_STALE',seconds=1.3)
+        held = [float(x) for x in received['setpoints'][-1].position]
+        assert math.hypot(held[0]-before_fault[0],held[1]-before_fault[1]) < .01
+        until=time.monotonic()+.15
+        wait(lambda:time.monotonic()>=until,seconds=.4)
+        assert math.dist([float(x) for x in received['setpoints'][-1].position],held) < 1e-6
+        external_offset[0] = 0.
+        fault = None;next_map=0.
+        wait(lambda:status().get('state')=='WAITING_FOR_GOAL')
         with pytest.raises(RuntimeError, match='duplicate flight_authority'):
             ProcessSingleton('flight_authority',domain_id=domain)
         duplicate=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
@@ -193,18 +258,26 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         wait(lambda:duplicate.poll() is not None,seconds=10.)
         _, duplicate_error=duplicate.communicate()
         assert duplicate.returncode != 0 and 'another flight adapter' in duplicate_error
-        goal_generation=1
-        goal=[.7,.1,.65]
+        # Release a new route snapshot for the already-requested preflight goal.
+        # No second goal generation/click is needed under the default policy.
+        # Reproduce the flown load: every route trails the newest OctoMap by one
+        # generation. It may run only after odom-frame reprojection and complete
+        # swept-sphere validation against the current tree.
+        path_generation_lag=1;next_map=0.;next_path=0.
         wait(lambda:status().get('state')=='FOLLOWING')
+        assert status()['post_hover_path'] is True
+        assert status()['path_map_generation'] < status()['map_generation']
+        assert status()['path_validated_map_generation'] == status()['map_generation']
         wait(lambda:position[1]-ground[1]>.08 and ground[2]-position[2]>.32)
         assert not any(m.command==400 and m.param1==1 for m in received['commands']) if not auto_arm else armed
         before=position[:]
         for injected,expected in [('pose','POSE_STALE'),('correction','POSE_MAP_MISMATCH'),('path_frame','PATH_STALE')]:
             fault=injected;next_path=0.
             wait(lambda:status().get('state')=='HOLD' and status().get('fault')==expected,seconds=1.3)
-            held=position[:];until=time.monotonic()+.15
+            held=[float(x) for x in received['setpoints'][-1].position]
+            until=time.monotonic()+.15
             wait(lambda:time.monotonic()>=until,seconds=.4)
-            assert math.dist(position,held)<.002
+            assert math.dist([float(x) for x in received['setpoints'][-1].position],held)<1e-6
             fault=None;next_path=0.
             wait(lambda:status().get('state')=='FOLLOWING')
         obstacle=[.1+position[1]-ground[1]+.15,.1+position[0]-ground[0],.2+ground[2]-position[2]]
@@ -212,8 +285,20 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         wait(lambda:status().get('state')=='HOLD' and ('OBSTACLE' in status().get('fault','') or 'BLOCKED' in status().get('fault','')))
         obstacle=None;next_map=0.;next_path=0.
         wait(lambda:status().get('state')=='FOLLOWING')
-        # Mock an armed vehicle for the inherited health->LAND watchdog.
-        armed=True;fault=terminal_fault
+        # A non-fatal fault may inhibit arming indefinitely, but none of that
+        # pre-arm time may consume the armed LAND grace period.
+        fault=terminal_fault
+        if not auto_arm:
+            wait(lambda:status().get('state')=='HOLD' and status().get('fault')=='VIO_HEALTH',seconds=1.3)
+            until=time.monotonic()+1.7
+            wait(lambda:time.monotonic()>=until,seconds=2.)
+            land_commands=sum(m.command==21 for m in received['commands'])
+            armed=True
+            until=time.monotonic()+.3
+            wait(lambda:time.monotonic()>=until,seconds=.6)
+            assert sum(m.command==21 for m in received['commands']) == land_commands
+        else:
+            armed=True
         wait(lambda:any(m.command==21 for m in received['commands']),seconds=4.)
         if auto_arm:
             states=[json.loads(m.data) for m in received['status']]
@@ -230,9 +315,14 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         result=subprocess.run(['python3',str(audit_script),str(tmp_path/'bag'),'--out',str(tmp_path/'audit.json')],
                               capture_output=True,text=True,timeout=30)
         assert result.returncode==0,result.stdout+result.stderr
-        assert json.loads((tmp_path/'audit.json').read_text())['counts']['unverified_segments']>0
+        assert json.loads((tmp_path/'audit.json').read_text())['counts']['unverified_segments']==0
         armed=False
-        until=time.monotonic()+.15;wait(lambda:time.monotonic()>=until,seconds=.4)
+        # The adapter may reach DONE immediately after the mock disarms. Do not
+        # require the process to remain alive merely to give callbacks time to
+        # drain during test cleanup.
+        until=time.monotonic()+.15
+        while time.monotonic()<until and process.poll() is None:
+            pump();executor.spin_once(timeout_sec=.01)
     finally:
         if process.poll() is None:os.killpg(process.pid,signal.SIGINT)
         try:process.wait(timeout=10)

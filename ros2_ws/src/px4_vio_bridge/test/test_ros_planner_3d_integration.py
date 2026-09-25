@@ -311,6 +311,12 @@ def test_ros_octomap_navigation_faults(tmp_path):
         # valid frame change; it must withdraw commands until pairing recovers.
         wait_for(following, pump=pump)
         map_enabled = False
+        # Drain a map already published by pump before freezing the pose relay;
+        # otherwise the ordinary one-generation handoff can mask the injected
+        # same-generation correction fault with POSE_STALE.
+        wait_for(lambda: following() and
+                 value("/planner3d/follower/status").get("pose_map_generation") ==
+                 value("/planner3d/follower/status").get("map_generation"), pump=pump)
         os.killpg(pose_process.pid, signal.SIGSTOP)
         try:
             bad = value("/planner3d/pose_snapshot")
@@ -357,31 +363,55 @@ def test_ros_octomap_navigation_faults(tmp_path):
 
 
         # Explicit 2D-click input mode selects a fresh body height once per
-        # click while retaining the fully 3D planner and clearance checks.
+        # click, floored at the flight hover plane, while retaining the fully
+        # 3D planner and clearance checks.
         os.killpg(planner_process.pid, signal.SIGINT)
         planner_process.wait(timeout=10)
         planner_process = start("cpp_astar_planner_3d", {
             **common, "voxel_size": 0.1, "planning_timeout_ms": 1000.0,
-            "goal_height_mode": "current", "exploration_route": True})
+            "goal_height_mode": "current", "exploration_route": True,
+            "current_goal_min_height_above_start": 0.30})
         goal_z = 0.0
         wait_for(lambda: value("/planner3d/status").get("goal_height_mode") == "current" and
                  value("/planner3d/status").get("state") == "PATH_VALID", pump=pump)
         status = value("/planner3d/status")
         assert status["reference_route"]["fully_verified"]
+        assert status["reference_route"]["known_fallback_used"] is False
+        assert status["reference_route"]["local_route_mode"] == "prefix"
+        assert status["last_plan_timing"]["worker_total_ms"] >= 0.0
+        assert status["last_plan_timing"]["grid_ms"] >= 0.0
         wait_for(lambda: len(value("/planner3d/reference_snapshot").get("points", [])) >= 2, pump=pump)
         assert value("/planner3d/reference_snapshot")["executable"] is False
         assert value("/planner3d/path_snapshot")["executable"] is True
         assert status["clicked_goal"][2] == 0.0
-        assert status["requested_goal"][2] == pytest.approx(0.856)
+        assert status["current_goal_min_height_above_start"] == pytest.approx(0.30)
+        assert status["requested_goal"][2] == pytest.approx(1.156)
         assert status["forward_probe"]["diagnostic_only"]
         assert status["forward_probe"]["radius"] == pytest.approx(0.35)
         goal_enabled = False
         mode = "raised"
         wait_for(lambda: value("/planner3d/status").get("start", [0, 0, 0])[2] > 0.90 and
                  value("/planner3d/status").get("state") == "PATH_VALID", pump=pump)
-        assert value("/planner3d/status")["requested_goal"][2] == pytest.approx(0.856)
+        assert value("/planner3d/status")["requested_goal"][2] == pytest.approx(1.156)
+        executable_before_stale = value("/planner3d/path_snapshot")
+        reference_before_stale = value("/planner3d/reference_snapshot")
+        assert executable_before_stale["points"]
+        assert reference_before_stale["points"]
+        executable_count = len(received["/planner3d/path_snapshot"])
+        reference_count = len(received["/planner3d/reference_snapshot"])
         mode = "stale"
         wait_for(lambda: value("/planner3d/status").get("state") == "POSE_STALE", pump=pump)
+        # A transient stale input reports status but must not
+        # publish an empty route.  The follower independently holds on stale
+        # pose/map/path data, so preserving the snapshot cannot command motion.
+        stale_observation_until = time.monotonic() + 0.25
+        wait_for(lambda: time.monotonic() >= stale_observation_until, pump=pump)
+        assert all(json.loads(msg.data)["points"]
+                   for _, msg in received["/planner3d/path_snapshot"][executable_count:])
+        assert all(json.loads(msg.data)["points"]
+                   for _, msg in received["/planner3d/reference_snapshot"][reference_count:])
+        assert value("/planner3d/path_snapshot")["points"] == executable_before_stale["points"]
+        assert value("/planner3d/reference_snapshot")["points"] == reference_before_stale["points"]
         rejected_before = len(received["/planner3d/status"])
         goal = PointStamped()
         goal.header.frame_id = "world"
@@ -390,10 +420,15 @@ def test_ros_octomap_navigation_faults(tmp_path):
         goal_pub.publish(goal)
         wait_for(lambda: any(json.loads(msg.data).get("state") == "GOAL_HEIGHT_POSE_UNAVAILABLE"
                  for _, msg in received["/planner3d/status"][rejected_before:]), pump=pump)
+        assert value("/planner3d/status")["goal_height_pending"]
         mode = "normal"
-        goal_enabled = True
+        # The rejected click is buffered. Recovery must not depend on another
+        # publication or another user click.
         wait_for(following, pump=pump)
-        report["current_height_goal"] = "latched; stale pose rejected"
+        assert not value("/planner3d/status")["goal_height_pending"]
+        assert value("/planner3d/status")["requested_goal"][2] == pytest.approx(1.156)
+        goal_enabled = True
+        report["current_height_goal"] = "hover floor applied; transient click buffered"
 
         audit_script = Path(__file__).resolve().parents[4] / "scripts/audit_planner_3d_bag.py"
         audit_result = subprocess.run(

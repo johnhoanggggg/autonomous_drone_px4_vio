@@ -13,6 +13,26 @@ inline bool finite_flight_point(const Point3 & p)
 inline Point3 point3(const Vec3 & p) {return {p.x, p.y, p.z};}
 inline Vec3 vec3(const Point3 & p) {return {p.x, p.y, p.z};}
 inline Quat inverse_rotation(const Quat & q) {return {-q.x, -q.y, -q.z, q.w};}
+inline Point3 odom_point_to_map_3d(const Point3 & p, const Pose3 & map_from_odom)
+{
+  const auto rotated = rotate(map_from_odom.orientation, vec3(p));
+  return {
+    map_from_odom.position.x + rotated.x,
+    map_from_odom.position.y + rotated.y,
+    map_from_odom.position.z + rotated.z};
+}
+inline Point3 map_point_to_odom_3d(const Point3 & p, const Pose3 & map_from_odom)
+{
+  return point3(rotate(inverse_rotation(map_from_odom.orientation), {
+    p.x - map_from_odom.position.x,
+    p.y - map_from_odom.position.y,
+    p.z - map_from_odom.position.z}));
+}
+inline Point3 reframe_map_point_3d(
+  const Point3 & p, const Pose3 & from_map_from_odom, const Pose3 & to_map_from_odom)
+{
+  return odom_point_to_map_3d(map_point_to_odom_3d(p, from_map_from_odom), to_map_from_odom);
+}
 inline Point3 map_delta_to_ned(const Point3 & d, const Quat & map_from_odom, double yaw_offset)
 {
   auto raw = rotate(inverse_rotation(map_from_odom), vec3(d));

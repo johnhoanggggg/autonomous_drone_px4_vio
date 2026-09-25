@@ -69,6 +69,7 @@ def generate_launch_description():
         DeclareLaunchArgument("pose_topic", default_value="/rtabmap/pose"),
         DeclareLaunchArgument("goal_topic", default_value="/waypoint/clicked"),
         DeclareLaunchArgument("goal_height_mode", default_value="clicked", choices=["clicked", "current"]),
+        DeclareLaunchArgument("current_goal_min_height_above_start", default_value="0.0"),
         DeclareLaunchArgument("frame_id", default_value="world"),
         DeclareLaunchArgument("exploration_route", default_value="true"),
         DeclareLaunchArgument("voxel_size", default_value="0.05"),
@@ -117,6 +118,8 @@ def generate_launch_description():
         "pose_topic": LaunchConfiguration("pose_topic"),
         "goal_topic": LaunchConfiguration("goal_topic"),
         "goal_height_mode": typed("goal_height_mode", str),
+        "current_goal_min_height_above_start": typed(
+            "current_goal_min_height_above_start", float),
         "exploration_route": typed("exploration_route", bool),
         "frame_id": LaunchConfiguration("frame_id"),
         "voxel_size": typed("voxel_size", float),

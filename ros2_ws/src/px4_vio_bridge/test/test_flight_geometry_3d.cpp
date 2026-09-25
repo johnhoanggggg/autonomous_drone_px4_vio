@@ -13,6 +13,18 @@ TEST(Flight3D, ConvertsAllAxesThroughFullCorrectionAndYawOffset)
   const auto n=p::map_delta_to_ned(v,{},0);
   EXPECT_DOUBLE_EQ(n.x,-.5);EXPECT_DOUBLE_EQ(n.y,.4);EXPECT_DOUBLE_EQ(n.z,-.6);
 }
+TEST(Flight3D, ReframesMapPointsThroughTheirContinuousOdomCoordinates)
+{
+  const p::Point3 odom{.4,-.5,.6};
+  const p::Pose3 old_frame{{1.,-2.,.3},p::normalize({.2,-.3,.1,.9})};
+  const p::Pose3 new_frame{{-.7,.8,-.2},p::normalize({-.1,.25,.3,.91})};
+  const auto old_map=p::odom_point_to_map_3d(odom,old_frame);
+  const auto recovered=p::map_point_to_odom_3d(old_map,old_frame);
+  EXPECT_NEAR(p::distance_3d(odom,recovered),0,1e-12);
+  const auto reframed=p::reframe_map_point_3d(old_map,old_frame,new_frame);
+  const auto expected=p::odom_point_to_map_3d(odom,new_frame);
+  EXPECT_NEAR(p::distance_3d(reframed,expected),0,1e-12);
+}
 TEST(Flight3D, UnknownRequiresExplicitPolicyAndOccupiedStillBlocks)
 {
   octomap::OcTree tree(.05);

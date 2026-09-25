@@ -14,6 +14,7 @@ namespace px4_vio_bridge
 
 inline constexpr std::int16_t VOXEL_UNKNOWN_COST = -1;
 inline constexpr std::int16_t VOXEL_LETHAL_COST = 255;
+inline constexpr std::int16_t VOXEL_EXPLORATION_COST = 200;
 
 class CostVoxelGrid
 {
@@ -103,6 +104,15 @@ struct SphereBlockers3D
   const VoxelGrid & grid, double lethal_radius, double inflation_radius,
   double cost_scaling = 3.0);
 
+// Inflate the optimistic proposal grid once, then penalize cells which are
+// unknown in the matching observed grid. Occupied cells and hard boundaries
+// must already remain occupied in optimistic. Unknown is therefore usable for
+// proposal generation, but A* prefers observed free space whenever practical.
+[[nodiscard]] CostVoxelGrid inflate_exploration_voxels(
+  const VoxelGrid & optimistic, const VoxelGrid & observed,
+  double lethal_radius, double inflation_radius, double cost_scaling = 3.0,
+  std::int16_t unknown_cost = VOXEL_EXPLORATION_COST);
+
 // 26-connected neighbours. Every face/edge cell implicated in a diagonal is
 // required to be free, preventing 2-axis and 3-axis corner cutting.
 [[nodiscard]] std::vector<std::pair<Voxel, double>> traversable_neighbors_3d(
@@ -140,7 +150,7 @@ class PreparedPlanner3D
 {
 public:
   PreparedPlanner3D(VoxelGrid raw, const Planner3DConfig & config,
-    const CostVoxelGrid * verified_costs = nullptr);
+    const VoxelGrid * observed_unknowns = nullptr);
   [[nodiscard]] const VoxelGrid & raw() const {return raw_;}
   [[nodiscard]] const CostVoxelGrid & costs() const {return inflated_;}
   [[nodiscard]] PlanResult3D plan(const Point3 & start, const Point3 & goal) const;

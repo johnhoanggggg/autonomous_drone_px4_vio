@@ -307,7 +307,10 @@ def generate_launch_description():
         }],
         remappings=sensor_remappings + [
             ("odom", "/rtabmap/vio_odometry"),
-            ("odom_info", "/rtabmap/vio_odom_info"),
+            # CoreWrapper consumes the scalar health, covariance and timing
+            # fields. The full F2M local bundle grows with every keyframe and
+            # needlessly serializes hundreds of KiB per odometry update.
+            ("odom_info", "/rtabmap/vio_odom_info_lite"),
         ],
     )
 

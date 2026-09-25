@@ -365,6 +365,38 @@ CostVoxelGrid inflate_voxels(
   return result;
 }
 
+CostVoxelGrid inflate_exploration_voxels(
+  const VoxelGrid & optimistic, const VoxelGrid & observed,
+  double lethal_radius, double inflation_radius, double cost_scaling,
+  std::int16_t unknown_cost)
+{
+  if (observed.width() != optimistic.width() || observed.height() != optimistic.height() ||
+    observed.depth() != optimistic.depth() ||
+    std::abs(observed.resolution() - optimistic.resolution()) > 1.0e-12 ||
+    observed.origin().x != optimistic.origin().x ||
+    observed.origin().y != optimistic.origin().y ||
+    observed.origin().z != optimistic.origin().z)
+  {
+    throw std::invalid_argument("exploration evidence geometry mismatch");
+  }
+  if (unknown_cost < 0 || unknown_cost >= VOXEL_LETHAL_COST) {
+    throw std::invalid_argument("exploration unknown cost must be traversable");
+  }
+  auto costs = inflate_voxels(
+    optimistic, lethal_radius, inflation_radius, cost_scaling);
+  for (int z = 0; z < static_cast<int>(optimistic.depth()); ++z) {
+    for (int y = 0; y < static_cast<int>(optimistic.height()); ++y) {
+      for (int x = 0; x < static_cast<int>(optimistic.width()); ++x) {
+        const Voxel voxel{x, y, z};
+        if (observed.at(voxel) == VoxelState::Unknown && costs.traversable(voxel)) {
+          costs.set(voxel, std::max(unknown_cost, costs.at(voxel)));
+        }
+      }
+    }
+  }
+  return costs;
+}
+
 std::vector<std::pair<Voxel, double>> traversable_neighbors_3d(
   const CostVoxelGrid & grid, const Voxel & voxel)
 {
@@ -703,26 +735,13 @@ PlanResult3D plan_path_3d(
 }
 
 PreparedPlanner3D::PreparedPlanner3D(
-  VoxelGrid raw, const Planner3DConfig & config, const CostVoxelGrid * verified_costs)
+  VoxelGrid raw, const Planner3DConfig & config, const VoxelGrid * observed_unknowns)
 : raw_(std::move(raw)), config_(config),
-  inflated_(inflate_voxels(raw_, config.lethal_radius, config.inflation_radius, config.cost_scaling))
-{
-  if (verified_costs) {
-    if (verified_costs->width() != raw_.width() || verified_costs->height() != raw_.height() ||
-      verified_costs->depth() != raw_.depth() || verified_costs->resolution() != raw_.resolution())
-    {throw std::invalid_argument("reference cost geometry mismatch");}
-    for (int z = 0; z < static_cast<int>(raw_.depth()); ++z) {
-      for (int y = 0; y < static_cast<int>(raw_.height()); ++y) {
-        for (int x = 0; x < static_cast<int>(raw_.width()); ++x) {
-          const Voxel v{x, y, z};
-          if (inflated_.traversable(v) && !verified_costs->traversable(v)) {
-            inflated_.set(v, std::max<std::int16_t>(200, inflated_.at(v)));
-          }
-        }
-      }
-    }
-  }
-}
+  inflated_(observed_unknowns ? inflate_exploration_voxels(
+      raw_, *observed_unknowns, config.lethal_radius, config.inflation_radius,
+      config.cost_scaling) : inflate_voxels(
+      raw_, config.lethal_radius, config.inflation_radius, config.cost_scaling))
+{}
 
 std::vector<Point3> verified_prefix_3d(
   const VoxelGrid & observed, const std::vector<Point3> & proposed, double radius)

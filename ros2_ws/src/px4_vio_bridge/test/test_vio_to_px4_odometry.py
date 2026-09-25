@@ -29,6 +29,7 @@ def test_raw_odometry_requires_continuous_frame_and_body():
 def test_raw_odometry_rejects_stale_future_reordered_and_null():
     msg = raw_message()
     assert raw_odometry_rejection_reason(msg, 10_500_000_001)
+    assert raw_odometry_rejection_reason(msg, 10_300_000_001, max_age_ns=300_000_000)
     assert raw_odometry_rejection_reason(msg, 9_999_999_999)
     assert raw_odometry_rejection_reason(msg, 10_100_000_000, 10_000_000_000)
     msg.pose.pose.orientation.w = 0.0
@@ -41,7 +42,8 @@ def test_raw_odometry_rejects_stale_future_reordered_and_null():
 def test_raw_callback_preserves_pose_and_stamp_without_map_transform():
     received = []
     clock = SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=10_100_000_000))
-    fake = SimpleNamespace(last_raw_stamp_ns=None, get_clock=lambda: clock,
+    fake = SimpleNamespace(last_raw_stamp_ns=None, max_raw_odometry_age_ns=300_000_000,
+                           get_clock=lambda: clock,
                            pose_callback=received.append)
     msg = raw_message()
     msg.pose.pose.position.x = 2.0
@@ -54,7 +56,8 @@ def test_raw_callback_preserves_pose_and_stamp_without_map_transform():
 
 def test_raw_callback_rejection_never_forwards_and_clears_velocity():
     received = []
-    fake = SimpleNamespace(last_raw_stamp_ns=None, previous_position=(1,2,3), previous_time_us=1,
+    fake = SimpleNamespace(last_raw_stamp_ns=None, max_raw_odometry_age_ns=300_000_000,
+        previous_position=(1,2,3), previous_time_us=1,
         rejected_count=0, get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=11_000_000_000)),
         get_logger=lambda: SimpleNamespace(warning=lambda text: None), pose_callback=received.append)
     VioToPx4Odometry.odometry_callback(fake, raw_message())
@@ -74,7 +77,8 @@ def test_raw_input_px4_payload_uses_sensor_time_and_ned_without_ros_graph():
         vio_yaw_offset_deg=0.0, frame_transform='enu_flu_to_ned_frd',
         position_variance=0.02, orientation_variance=0.01,
         velocity_variance=0.05, quality=100)
-    fake = SimpleNamespace(last_raw_stamp_ns=None, raw_odometry_input=True,
+    fake = SimpleNamespace(last_raw_stamp_ns=None, max_raw_odometry_age_ns=300_000_000,
+        raw_odometry_input=True,
         reset_pose_active=False, reset_counter=0, sent_count=0,
         get_parameter=lambda key: SimpleNamespace(value=parameters[key]),
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=10_100_000_000)),

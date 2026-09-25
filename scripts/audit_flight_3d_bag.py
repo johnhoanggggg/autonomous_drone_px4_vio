@@ -52,8 +52,14 @@ def audit(bag):
                 errors.append({'error':'missing exact command map'});continue
             if value['pose_map_generation']!=meta['generation']:
                 errors.append({'error':'command pose/map mismatch'});continue
-            if value['state']=='FOLLOWING' and value['path_map_generation']!=meta['generation']:
-                errors.append({'error':'command path/map mismatch'});continue
+            if value['state']=='FOLLOWING':
+                validated_generation=value.get('path_validated_map_generation',value['path_map_generation'])
+                validated_stamp=value.get('path_validated_map_stamp_ns',value['map_stamp_ns'])
+                if validated_generation!=meta['generation'] or validated_stamp!=stamp:
+                    errors.append({'error':'command path validation/map mismatch'});continue
+                if (value['path_map_generation']!=meta['generation'] and
+                    cfg.get('route_map_policy')!='odom_retained_revalidated_each_map'):
+                    errors.append({'error':'lagged path lacks explicit revalidation policy'});continue
             if abs(value['required_clearance']-cfg['required_clearance'])>1e-9:
                 errors.append({'error':'command clearance/config mismatch'});continue
             actual=setpoints.get(value['setpoint_timestamp_us'])

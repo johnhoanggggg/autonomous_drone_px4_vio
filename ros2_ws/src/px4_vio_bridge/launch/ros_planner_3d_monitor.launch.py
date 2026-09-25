@@ -44,6 +44,9 @@ def generate_launch_description():
         "test_start_clear_radius": "0.0",
         "process_monitor": "true",
         "goal_height_mode": "clicked", "exploration_route": "true",
+        # When current-height mode is selected for flight, a waypoint clicked
+        # before takeoff targets the 30 cm hover plane instead of the floor.
+        "current_goal_min_height_above_start": "0.30",
         "mapping_rate_hz": "1.0", "range_min": "0.30", "range_max": "4.0",
         "grid_depth_decimation": "8",
         "grid_noise_radius": "0.15", "grid_noise_min_neighbors": "4",
@@ -86,7 +89,8 @@ def generate_launch_description():
             **{key: LaunchConfiguration(key) for key in (
                 "foxglove", "record_bag", "use_sim_time", "min_z", "max_z",
                 "planning_radius_xy", "robot_radius", "safety_margin", "voxel_size",
-                "max_marker_voxels", "process_monitor", "goal_height_mode", "exploration_route")},
+                "max_marker_voxels", "process_monitor", "goal_height_mode", "exploration_route",
+                "current_goal_min_height_above_start")},
             "octomap_producer": "false", "simulate": "false",
             "pose_snapshot_topic": "/planner3d/pose_snapshot", "vio_frame_id": "rtabmap_odom",
         }.items(),
