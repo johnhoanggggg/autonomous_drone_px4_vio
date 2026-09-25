@@ -48,13 +48,14 @@ double point_box_distance_squared(
 // Squared Euclidean distance transform of a 1D line. Only finite entries are
 // sites; the lower envelope of their parabolas is evaluated in linear time.
 void squared_distance_transform_1d(
-  const std::vector<double> & input, std::vector<double> & output)
+  const std::vector<double> & input, std::vector<double> & output,
+  std::vector<std::size_t> & envelope, std::vector<double> & boundaries)
 {
   const auto infinity = std::numeric_limits<double>::infinity();
   output.assign(input.size(), infinity);
   if (input.empty()) {return;}
-  std::vector<std::size_t> envelope(input.size());
-  std::vector<double> boundaries(input.size() + 1);
+  envelope.resize(input.size());
+  boundaries.resize(input.size() + 1);
   std::size_t first = 0;
   while (first < input.size() && !std::isfinite(input[first])) {++first;}
   if (first == input.size()) {return;}
@@ -108,6 +109,13 @@ std::vector<double> squared_distance_transform(const VoxelGrid & grid)
   }
   std::vector<double> line;
   std::vector<double> transformed;
+  std::vector<std::size_t> envelope;
+  std::vector<double> boundaries;
+  const auto longest_line = std::max({grid.width(), grid.height(), grid.depth()});
+  line.reserve(longest_line);
+  transformed.reserve(longest_line);
+  envelope.reserve(longest_line);
+  boundaries.reserve(longest_line + 1);
   line.resize(grid.width());
   for (int z = 0; z < static_cast<int>(grid.depth()); ++z) {
     for (int y = 0; y < static_cast<int>(grid.height()); ++y) {
@@ -115,7 +123,7 @@ std::vector<double> squared_distance_transform(const VoxelGrid & grid)
         line[x] = distances[(static_cast<std::size_t>(z) * grid.height() +
           static_cast<std::size_t>(y)) * grid.width() + x];
       }
-      squared_distance_transform_1d(line, transformed);
+      squared_distance_transform_1d(line, transformed, envelope, boundaries);
       for (std::size_t x = 0; x < grid.width(); ++x) {
         distances[(static_cast<std::size_t>(z) * grid.height() +
           static_cast<std::size_t>(y)) * grid.width() + x] = transformed[x];
@@ -129,7 +137,7 @@ std::vector<double> squared_distance_transform(const VoxelGrid & grid)
         line[y] = distances[(static_cast<std::size_t>(z) * grid.height() + y) *
           grid.width() + static_cast<std::size_t>(x)];
       }
-      squared_distance_transform_1d(line, transformed);
+      squared_distance_transform_1d(line, transformed, envelope, boundaries);
       for (std::size_t y = 0; y < grid.height(); ++y) {
         distances[(static_cast<std::size_t>(z) * grid.height() + y) *
           grid.width() + static_cast<std::size_t>(x)] = transformed[y];
@@ -143,7 +151,7 @@ std::vector<double> squared_distance_transform(const VoxelGrid & grid)
         line[z] = distances[(z * grid.height() + static_cast<std::size_t>(y)) *
           grid.width() + static_cast<std::size_t>(x)];
       }
-      squared_distance_transform_1d(line, transformed);
+      squared_distance_transform_1d(line, transformed, envelope, boundaries);
       for (std::size_t z = 0; z < grid.depth(); ++z) {
         distances[(z * grid.height() + static_cast<std::size_t>(y)) *
           grid.width() + static_cast<std::size_t>(x)] = transformed[z];
@@ -312,9 +320,13 @@ SphereBlockers3D sphere_blockers_3d(
   return result;
 }
 
-CostVoxelGrid inflate_voxels(
+namespace
+{
+
+CostVoxelGrid inflate_voxels_impl(
   const VoxelGrid & grid, double lethal_radius, double inflation_radius,
-  double cost_scaling)
+  double cost_scaling, const VoxelGrid * observed_unknowns = nullptr,
+  std::int16_t unknown_cost = 0)
 {
   if (!std::isfinite(lethal_radius) || lethal_radius < 0.0 ||
     !std::isfinite(inflation_radius) || inflation_radius < lethal_radius ||
@@ -348,21 +360,35 @@ CostVoxelGrid inflate_voxels(
             0.0, std::sqrt(squared_distance) * grid.resolution() - half_diagonal);
         }
         const auto clearance = std::min(boundary_clearance, obstacle_clearance);
+        std::int16_t cost = 0;
         if (clearance <= lethal_radius + 1.0e-12) {
-          result.set(voxel, VOXEL_LETHAL_COST);
+          cost = VOXEL_LETHAL_COST;
         } else if (clearance <= inflation_radius + 1.0e-12) {
           const auto span = std::max(grid.resolution(), inflation_radius - lethal_radius);
           const auto decay = std::exp(-cost_scaling * (clearance - lethal_radius) / span);
-          result.set(voxel, static_cast<std::int16_t>(std::clamp(
+          cost = static_cast<std::int16_t>(std::clamp(
               static_cast<int>(std::nearbyint((VOXEL_LETHAL_COST - 1) * decay)),
-              1, static_cast<int>(VOXEL_LETHAL_COST - 1))));
-        } else {
-          result.set(voxel, 0);
+              1, static_cast<int>(VOXEL_LETHAL_COST - 1)));
         }
+        if (observed_unknowns && observed_unknowns->at(voxel) == VoxelState::Unknown &&
+          cost < VOXEL_LETHAL_COST)
+        {
+          cost = std::max(unknown_cost, cost);
+        }
+        result.set(voxel, cost);
       }
     }
   }
   return result;
+}
+
+}  // namespace
+
+CostVoxelGrid inflate_voxels(
+  const VoxelGrid & grid, double lethal_radius, double inflation_radius,
+  double cost_scaling)
+{
+  return inflate_voxels_impl(grid, lethal_radius, inflation_radius, cost_scaling);
 }
 
 CostVoxelGrid inflate_exploration_voxels(
@@ -382,19 +408,8 @@ CostVoxelGrid inflate_exploration_voxels(
   if (unknown_cost < 0 || unknown_cost >= VOXEL_LETHAL_COST) {
     throw std::invalid_argument("exploration unknown cost must be traversable");
   }
-  auto costs = inflate_voxels(
-    optimistic, lethal_radius, inflation_radius, cost_scaling);
-  for (int z = 0; z < static_cast<int>(optimistic.depth()); ++z) {
-    for (int y = 0; y < static_cast<int>(optimistic.height()); ++y) {
-      for (int x = 0; x < static_cast<int>(optimistic.width()); ++x) {
-        const Voxel voxel{x, y, z};
-        if (observed.at(voxel) == VoxelState::Unknown && costs.traversable(voxel)) {
-          costs.set(voxel, std::max(unknown_cost, costs.at(voxel)));
-        }
-      }
-    }
-  }
-  return costs;
+  return inflate_voxels_impl(
+    optimistic, lethal_radius, inflation_radius, cost_scaling, &observed, unknown_cost);
 }
 
 std::vector<std::pair<Voxel, double>> traversable_neighbors_3d(

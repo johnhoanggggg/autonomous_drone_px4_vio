@@ -333,7 +333,12 @@ private:
     const auto prepare_begin = steady_seconds();
     if (!cache_hit) {
       if (request.exploration_route) {
-        auto optimistic = *request.raw;
+        // Unknown-inside-geofence is the common case, so construct the
+        // optimistic view as free and write only hard obstacles. This avoids
+        // copying the observed grid and then rewriting most of it.
+        VoxelGrid optimistic(
+          request.raw->width(), request.raw->height(), request.raw->depth(),
+          request.raw->resolution(), request.raw->origin(), VoxelState::Free);
         for (int z = 0; z < static_cast<int>(optimistic.depth()); ++z) {
           for (int y = 0; y < static_cast<int>(optimistic.height()); ++y) {
             for (int x = 0; x < static_cast<int>(optimistic.width()); ++x) {
@@ -343,8 +348,8 @@ private:
                   static_cast<std::size_t>(x)])
               {
                 optimistic.set(voxel, VoxelState::Occupied);
-              } else if (request.raw->at(voxel) == VoxelState::Unknown) {
-                optimistic.set(voxel, VoxelState::Free);
+              } else if (request.raw->at(voxel) == VoxelState::Occupied) {
+                optimistic.set(voxel, VoxelState::Occupied);
               }
             }
           }
@@ -700,7 +705,9 @@ private:
           plan_timing_ = std::move(output.timing);
           publish_reference();
           publish_candidate(output.exploration_route ? reference_path_ : output.result.path);
-          publish_markers(*output.raw, output.result, output.probe);
+          publish_markers(
+            *output.raw, output.result, output.probe,
+            output.map_generation, output.map_stamp_ns);
           last_planned_pose_ = *pose_;
           if (!output.result.found()) {
             fail_closed(output.result.reason, &output.probe);
@@ -1015,12 +1022,18 @@ private:
     status_pub_->publish(message);
   }
 
-  void publish_markers(const VoxelGrid & raw, const PlanResult3D & result, const ForwardProbe & probe)
+  void publish_markers(
+    const VoxelGrid & raw, const PlanResult3D & result, const ForwardProbe & probe,
+    std::int64_t source_generation, std::int64_t source_stamp_ns)
   {
     visualization_msgs::msg::MarkerArray array;
-    visualization_msgs::msg::Marker clear;
-    clear.action = visualization_msgs::msg::Marker::DELETEALL;
-    array.markers.push_back(clear);
+    const bool refresh_occupancy = marker_map_generation_ != source_generation ||
+      marker_map_stamp_ns_ != source_stamp_ns;
+    if (refresh_occupancy) {
+      visualization_msgs::msg::Marker clear;
+      clear.action = visualization_msgs::msg::Marker::DELETEALL;
+      array.markers.push_back(clear);
+    }
     if (!reference_path_.empty()) {
       visualization_msgs::msg::Marker route;
       route.header.stamp = now(); route.header.frame_id = frame_id_;
@@ -1059,25 +1072,29 @@ private:
     occupied.color.g = 0.15F;
     occupied.color.b = 0.10F;
     occupied.color.a = 0.45F;
-    const auto occupied_total = static_cast<std::size_t>(std::count(
-        raw.data().begin(), raw.data().end(), VoxelState::Occupied));
-    const auto stride = std::max<std::size_t>(
-      1, max_marker_voxels_ == 0 ? occupied_total + 1 :
-      (occupied_total + max_marker_voxels_ - 1) / max_marker_voxels_);
-    std::size_t seen = 0;
-    for (int z = 0; z < static_cast<int>(raw.depth()); ++z) {
-      for (int y = 0; y < static_cast<int>(raw.height()); ++y) {
-        for (int x = 0; x < static_cast<int>(raw.width()); ++x) {
-          const Voxel voxel{x, y, z};
-          if (raw.at(voxel) != VoxelState::Occupied || seen++ % stride != 0) {continue;}
-          const auto center = raw.voxel_center(voxel);
-          geometry_msgs::msg::Point point;
-          point.x = center.x; point.y = center.y; point.z = center.z;
-          occupied.points.push_back(point);
+    if (refresh_occupancy) {
+      const auto occupied_total = static_cast<std::size_t>(std::count(
+          raw.data().begin(), raw.data().end(), VoxelState::Occupied));
+      const auto stride = std::max<std::size_t>(
+        1, max_marker_voxels_ == 0 ? occupied_total + 1 :
+        (occupied_total + max_marker_voxels_ - 1) / max_marker_voxels_);
+      std::size_t seen = 0;
+      for (int z = 0; z < static_cast<int>(raw.depth()); ++z) {
+        for (int y = 0; y < static_cast<int>(raw.height()); ++y) {
+          for (int x = 0; x < static_cast<int>(raw.width()); ++x) {
+            const Voxel voxel{x, y, z};
+            if (raw.at(voxel) != VoxelState::Occupied || seen++ % stride != 0) {continue;}
+            const auto center = raw.voxel_center(voxel);
+            geometry_msgs::msg::Point point;
+            point.x = center.x; point.y = center.y; point.z = center.z;
+            occupied.points.push_back(point);
+          }
         }
       }
+      array.markers.push_back(occupied);
+      marker_map_generation_ = source_generation;
+      marker_map_stamp_ns_ = source_stamp_ns;
     }
-    array.markers.push_back(occupied);
     visualization_msgs::msg::Marker path;
     path.header = occupied.header;
     path.ns = "clearance_path";
@@ -1164,6 +1181,8 @@ private:
   double raw_grid_ms_{};
   double last_map_preparation_{-std::numeric_limits<double>::infinity()};
   std::uint64_t map_preparation_count_{};
+  std::int64_t marker_map_generation_{-1};
+  std::int64_t marker_map_stamp_ns_{-1};
   std::shared_ptr<PlanningWorkerCache> planning_worker_cache_{
     std::make_shared<PlanningWorkerCache>()};
   std::future<PlanningOutput> planning_future_;
