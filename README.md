@@ -165,7 +165,7 @@ cannot move the drone.
 ros2 launch px4_vio_bridge global_planner_monitor.launch.py \
   cpp_nodes:=true \
   robot_radius:=0.25 \
-  safety_margin:=0.00 \
+  safety_margin:=0.03 \
   inflation_extra:=0.25 \
   lookahead:=0.25 \
   lookahead_step:=0.03 \
@@ -186,15 +186,15 @@ stalls in the gap between them with no new route coming.
 `global_planner_monitor.launch.py` now checks this at launch and refuses to
 start a combination that cannot be flown; see [Known issues](#known-issues).
 
-This is the narrow-hallway profile, retuned twice on 2026-08-31. The planner
-requires 0.25 m from the vehicle centre to an obstacle, so the minimum plannable
-gap is 0.50 m. `safety_margin 0.05` was tried in between and reverted: at a
+The current narrow-hallway profile uses a 0.25 m robot radius plus 0.03 m
+margin, requiring 0.28 m centre-to-obstacle clearance (a nominal 0.56 m gap).
+The example above now matches the margin recorded in the successful
+2026-09-21 migration flight. Historically, `safety_margin 0.05` was tried
+and reverted: at a
 0.30 m lethal radius the neck on `20260831T064828Z` (0.266–0.294 m of clearance)
 is not routable, 44% of that flight's track sat inside the requirement, and it
-stalled short of its goal. Contact therefore stays possible — worst case the
-airframe reaches `max_cross_track` = 0.08 m inside an obstacle, about half the
-0.15 m budget it was flying under when it hit the door frame on
-`20260831T033736Z`.
+stalled short of its goal. The current 0.03 m margin is still smaller than
+the 0.08 m cross-track allowance, so it cannot guarantee contact-free tracking.
 
 The cross-track numbers moved together and only make sense together: a 0.08 m
 fault threshold is *below* this airframe's own p90 horizontal setpoint error
@@ -226,6 +226,13 @@ ros2 launch px4_vio_bridge offboard_global_planner.launch.py \
   corner_blending:=true \
   planner_fault_land_time:=6.0
 ```
+
+On `tune/migration-tunnel-smoothing`, the flight runtime remains at the proven
+migration baseline: matched cruise caps of 0.20 m/s and acceleration 0.30 m/s².
+The proposed 0.18 m/s trial was withdrawn: the current task is diagnosing and
+correcting overshoot, rather than accepting lower cruise speed as its solution.
+See [the Sol handoff](HANDOFF_SOL_MIGRATION_TUNNEL.md) for the flight evidence
+and next steps.
 
 `cpp_nodes:=true` selects the C++ adapter as well as the C++ planner and
 follower; see [Which flight adapter](#which-flight-adapter). Set
@@ -1202,6 +1209,24 @@ The acceleration setpoint is the derivative of that velocity, bounded by
 `command_acceleration`. Both go NaN outside an advancing route — in a fault hold,
 a command hold, or LAND — so a stale command can never keep pushing the vehicle.
 
+An experimental velocity-error damping term can be added during normal route
+braking and validated route holds. It is **off by default**:
+
+| parameter | default | meaning |
+|---|---|---|
+| `brake_damping` | `false` | opt in to bounded braking/hold feedback |
+| `damping_gain` | `0.75` | multiply `(reference velocity - measured velocity)` |
+| `damping_limit` | 0.10 m/s² | maximum feedback-vector magnitude |
+| `damping_time_constant` | 0.10 s | first-order correction filter |
+| `damping_velocity_timeout` | 0.10 s | reject older PX4 velocity samples |
+
+The sum of reference acceleration and damping remains capped by
+`command_acceleration`. Damping clears on stale/invalid velocity, callback gaps,
+PX4 local-frame resets, climb, LAND, planner-fault or command holds, and degraded
+follower ride-out. Per-tick evidence is recorded on
+`/planner/flight/damping_debug`; the effective values are also latched in
+`/planner/flight/config` by the C++ adapter.
+
 ### Corner blending
 
 `PathCommandLimiter` stops the command dead at **every** path vertex and waits for
@@ -1616,8 +1641,8 @@ and `HANDOFF_GLOBAL_PLANNER.md`.
 Key launch defaults: `hover_height` 0.30, `command_speed` 0.20,
 `geofence_radius` 3.0, `max_flight_time` 60, `yaw_rate_deg` 20,
 `min_vio_features` 80, `planner_fault_land_time` 6.0, `goal_hold_time` 3.0,
-`rate_hz` 20.0, `cpp_mode` true, `cpp_shadow` false. `auto_arm` remains false and
-must always be opted into explicitly.
+`rate_hz` 20.0, `cpp_mode` true, `cpp_shadow` false and `brake_damping` false.
+`auto_arm` remains false and must always be opted into explicitly.
 
 `cpp_mode:=true` replaces the Python adapter process with the C++ one;
 `cpp_shadow:=true` co-runs the non-commanding clearance shadow alongside Python.

@@ -37,6 +37,54 @@ def load(name):
     return module.generate_launch_description()
 
 
+@pytest.mark.parametrize('enabled', [None, 'true'])
+def test_lateral_damping_is_opt_in_and_parameters_reach_node(enabled):
+    from launch_ros.utilities import evaluate_parameters
+    context = LaunchContext()
+    if enabled is not None:
+        context.launch_configurations.update(brake_damping=enabled, damping_gain='0.4')
+    ld = load('offboard_lateral_stop.launch.py')
+    for action in ld.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    timer = next(a for a in ld.entities if isinstance(a, TimerAction))
+    node = next(a for a in timer.actions if isinstance(a, Node))
+    # Inspect descriptions only; never execute the timer or flight node.
+    params = evaluate_parameters(context, node._Node__parameters)[0]
+    assert params['brake_damping'] is (enabled == 'true')
+    assert params['damping_gain'] == (0.4 if enabled else 0.5)
+    assert params['damping_limit'] == 0.10
+    assert params['damping_time_constant'] == 0.10
+    assert params['speed'] == 0.20
+    assert params['acceleration'] == 0.30
+    assert params['auto_arm'] is False
+
+
+@pytest.mark.parametrize('enabled', [None, 'true'])
+def test_global_damping_is_opt_in_and_parameters_reach_both_adapters(enabled):
+    from launch_ros.utilities import evaluate_parameters
+    context = LaunchContext()
+    if enabled is not None:
+        context.launch_configurations.update(brake_damping=enabled, damping_gain='0.6')
+    ld = load('offboard_global_planner.launch.py')
+    for action in ld.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    timer = next(action for action in ld.entities if isinstance(action, TimerAction))
+    nodes = [action for action in timer.actions if isinstance(action, Node)]
+    flight_nodes = [node for node in nodes if node.node_executable in (
+        'offboard_global_planner', 'cpp_flight_adapter')]
+    assert len(flight_nodes) == 2
+    for node in flight_nodes:
+        params = evaluate_parameters(context, node._Node__parameters)[0]
+        assert params['brake_damping'] is (enabled == 'true')
+        assert params['damping_gain'] == (0.6 if enabled else 0.75)
+        assert params['damping_limit'] == 0.10
+        assert params['damping_time_constant'] == 0.10
+        assert params['damping_velocity_timeout'] == 0.10
+        assert params['command_acceleration'] == 0.30
+
+
 def camera_actions():
     ld = load('rtabmap_slam_px4.launch.py')
     timer = next(a for a in ld.entities if isinstance(a, TimerAction))

@@ -7,6 +7,7 @@ from px4_msgs.msg import TrajectorySetpoint
 from std_msgs.msg import String
 
 from px4_vio_bridge.offboard_hover import OffboardHover, wrap_pi
+from px4_vio_bridge.brake_damping import BrakeDamping
 
 
 class StopProfile:
@@ -62,6 +63,16 @@ class OffboardLateralStop(OffboardHover):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{key} must be positive and finite")
             setattr(self, key, value)
+        self.declare_parameter("brake_damping", False)
+        damping = dict(damping_gain=.5, damping_limit=.10, damping_time_constant=.10)
+        for key, value in damping.items():
+            self.declare_parameter(key, value)
+            damping[key] = float(self.get_parameter(key).value)
+        self.brake_damper = BrakeDamping(
+            enabled=bool(self.get_parameter("brake_damping").value),
+            gain=damping["damping_gain"], limit=damping["damping_limit"],
+            time_constant=damping["damping_time_constant"],
+            acceleration_limit=self.acceleration)
         if self.distance + self.max_horizontal_error >= self.geofence_radius:
             raise ValueError("geofence must exceed distance plus tracking-error allowance")
         if self.settle_timeout <= max(self.settle_hold, self.settle_dwell):
@@ -79,6 +90,8 @@ class OffboardLateralStop(OffboardHover):
         self.abort_xy = None
         self.debug_pub = self.create_publisher(String, "/lateral_stop/debug", 10)
         self.config = dict(defaults, **{k: getattr(self, k) for k in defaults})
+        self.config.update(damping, brake_damping=self.brake_damper.enabled,
+                           damping_velocity_timeout=.10)
         self.config.update(profile="cosine_velocity_ramps", endpoints=self.endpoints,
                            peak_speed=self.profile.speed, ramp_s=self.profile.ramp,
                            brake_start_s=self.profile.brake_start,
@@ -108,6 +121,7 @@ class OffboardLateralStop(OffboardHover):
         if self.pos_valid():
             self.abort_xy = (float(self.pos.x), float(self.pos.y))
         self.velocity = self.acceleration_sp = 0.0
+        self.brake_damper.reset()
         if self.is_armed:
             self.trigger_landing(reason)
         else:
@@ -132,17 +146,36 @@ class OffboardLateralStop(OffboardHover):
         active = self.state in ("LATERAL_MOVE", "LATERAL_HOLD")
         v = self.velocity if active else 0.0
         a = self.acceleration_sp if active else 0.0
+        reference_velocity = (-math.sin(self.yaw0) * v, math.cos(self.yaw0) * v)
+        reference_acceleration = (-math.sin(self.yaw0) * a, math.cos(self.yaw0) * a)
+        now = self.monotonic_time()
+        age = None if self.local_received is None else now - self.local_received
+        measured = None
+        if (age is not None and 0 <= age <= .10 and self.pos is not None and
+                self.pos.v_xy_valid and all(math.isfinite(x) for x in (self.pos.vx, self.pos.vy))):
+            measured = (float(self.pos.vx), float(self.pos.vy))
+        damping = self.brake_damper.update(
+            reference_velocity, reference_acceleration, measured, now,
+            active=active, braking=self.phase in ("BRAKE", "HOLD"))
         m = TrajectorySetpoint()
         m.timestamp = self.now_us()
         m.position = [float(x), float(y), float(-z)]
-        m.velocity = [-math.sin(self.yaw0) * v, math.cos(self.yaw0) * v, vz]
-        m.acceleration = [-math.sin(self.yaw0) * a, math.cos(self.yaw0) * a, math.nan]
+        m.velocity = [*reference_velocity, vz]
+        m.acceleration = [*damping.acceleration, math.nan]
         m.yaw, m.yawspeed = float(self.yaw0), math.nan
         self.sp_pub.publish(m)
         if hasattr(self, "debug_pub"):
             row = dict(timestamp_us=m.timestamp, state=self.state, phase=self.phase,
                        leg=self.leg, offset=self.offset, velocity=v, acceleration=a,
                        origin=[self.x0, self.y0], yaw0=self.yaw0, config=self.config)
+            row["damping"] = dict(
+                reason=damping.reason, velocity_age_s=age,
+                measured_velocity_ned=measured,
+                reference_acceleration_ned=reference_acceleration,
+                raw_correction_ned=damping.raw_correction,
+                filtered_correction_ned=damping.filtered_correction,
+                applied_correction_ned=damping.applied_correction,
+                published_acceleration_ned=[float(value) for value in m.acceleration[:2]])
             if self.pos is not None:
                 row.update(actual_offset=-(self.pos.x-self.x0)*math.sin(self.yaw0) +
                            (self.pos.y-self.y0)*math.cos(self.yaw0),

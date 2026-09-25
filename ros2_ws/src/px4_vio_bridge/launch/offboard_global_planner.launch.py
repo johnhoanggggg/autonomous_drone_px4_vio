@@ -110,6 +110,7 @@ FLIGHT_RECORD_TOPICS = (
     "/planner/flight/path_offset",
     "/planner/flight/joining",
     "/planner/flight/heading_debug",
+    "/planner/flight/damping_debug",
     "/planner/flight/teleop",
     # Non-commanding C++ clearance shadow. Absent unless cpp_shadow:=true,
     # but keeping them listed makes a parity run self-contained.
@@ -234,6 +235,15 @@ def generate_launch_description():
         # Horizontal equivalent. Default since the 2026-08-28 03:5x runs;
         # false restores the position-only command.
         DeclareLaunchArgument("horizontal_feedforward", default_value="true"),
+        # Opt-in velocity-error feedback during validated route braking and
+        # normal route holds. The flown lateral-stop setting is 0.75 gain with
+        # a 0.10 m/s² correction cap and 0.10 s filter; default OFF preserves
+        # the proven tunnel command stream.
+        DeclareLaunchArgument("brake_damping", default_value="false"),
+        DeclareLaunchArgument("damping_gain", default_value="0.75"),
+        DeclareLaunchArgument("damping_limit", default_value="0.10"),
+        DeclareLaunchArgument("damping_time_constant", default_value="0.10"),
+        DeclareLaunchArgument("damping_velocity_timeout", default_value="0.10"),
         DeclareLaunchArgument("max_flight_time", default_value="60.0"),
         DeclareLaunchArgument("perf_monitor", default_value="true"),
         DeclareLaunchArgument("command_speed", default_value="0.20"),
@@ -331,6 +341,11 @@ def generate_launch_description():
         "climb_leash": typed("climb_leash", float),
         "climb_feedforward": typed("climb_feedforward", bool),
         "horizontal_feedforward": typed("horizontal_feedforward", bool),
+        "brake_damping": typed("brake_damping", bool),
+        "damping_gain": typed("damping_gain", float),
+        "damping_limit": typed("damping_limit", float),
+        "damping_time_constant": typed("damping_time_constant", float),
+        "damping_velocity_timeout": typed("damping_velocity_timeout", float),
         "max_flight_time": typed("max_flight_time", float),
         "command_speed": typed("command_speed", float),
         "command_acceleration": typed("command_acceleration", float),
