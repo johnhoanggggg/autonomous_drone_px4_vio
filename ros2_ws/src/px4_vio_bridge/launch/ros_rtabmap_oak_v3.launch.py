@@ -127,6 +127,12 @@ def generate_launch_description():
         DeclareLaunchArgument("keep_latest_frame", default_value="false"),
         DeclareLaunchArgument("keep_next_frame", default_value="false"),
         DeclareLaunchArgument("processing_queue_size", default_value="0"),
+        # Keep synchronizer backlog independently tunable. A ten-frame queue
+        # can add 0.33 s at 30 Hz before odometry even starts; flight profiles
+        # use two so overload discards old sensor tuples instead of forwarding
+        # stale visual odometry.
+        DeclareLaunchArgument("odometry_topic_queue_size", default_value="10"),
+        DeclareLaunchArgument("odometry_sync_queue_size", default_value="10"),
         DeclareLaunchArgument("sync_max_interval", default_value="0.05"),
         DeclareLaunchArgument("oak_feature_sync_max_interval", default_value="0.001"),
         DeclareLaunchArgument("oak_input_stride", default_value="1"),
@@ -255,8 +261,8 @@ def generate_launch_description():
         parameters=[odometry_parameters | {
             "approx_sync": True,
             "approx_sync_max_interval": typed("sync_max_interval", float),
-            "topic_queue_size": 10,
-            "sync_queue_size": 10,
+            "topic_queue_size": typed("odometry_topic_queue_size", int),
+            "sync_queue_size": typed("odometry_sync_queue_size", int),
             "qos_camera_info": typed("sensor_qos", int),
             "subscribe_rgbd": False,
         }],

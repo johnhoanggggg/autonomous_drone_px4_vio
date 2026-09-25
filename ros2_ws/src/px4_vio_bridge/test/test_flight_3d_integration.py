@@ -18,7 +18,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profi
 from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import PoseStamped
 from octomap_msgs.msg import Octomap
-from px4_msgs.msg import VehicleLocalPosition, VehicleControlMode, VehicleOdometry, VehicleCommand, TrajectorySetpoint
+from px4_msgs.msg import VehicleLocalPosition, VehicleControlMode, VehicleOdometry, VehicleCommand, VehicleStatus, TrajectorySetpoint
 from rtabmap_msgs.msg import OdomInfo
 from std_msgs.msg import String
 from px4_vio_bridge.process_singleton import ProcessSingleton
@@ -63,6 +63,7 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
     for kind, topic, qos in [
         (VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', durable),
         (VehicleControlMode, '/fmu/out/vehicle_control_mode', durable),
+        (VehicleStatus, '/fmu/out/vehicle_status_v1', durable),
         (VehicleOdometry, '/fmu/in/vehicle_visual_odometry', qos_profile_sensor_data),
         (PoseStamped, '/rtabmap/vio_pose', 10), (OdomInfo, '/rtabmap/vio_odom_info_lite', qos_profile_sensor_data),
         (Octomap, '/rtabmap/octomap', durable), (String, '/rtabmap/octomap_metadata', durable),
@@ -103,11 +104,15 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
               'command_vertical_acceleration': .6, 'min_vio_features': 20,
               'climb_rate': .25, 'climb_leash': .12, 'climb_release': .05,
               'climb_feedforward': True,
+              'rate_hz': 10., 'path_timeout': 3.5, 'px4_timeout': .5,
+              'vehicle_control_mode_timeout': .75, 'follower_rejoin_grace': 1.5,
+              'require_px4_preflight_status': True, 'px4_preflight_timeout': 1.,
               'stream_time': .2, 'climb_timeout': 8., 'planner_fault_land_time': 1.5,
               'max_flight_time': 90., 'goal_hold_time': 20., 'keyboard_kill': False,
               'keyboard_land': False, 'yaw_follows_heading': auto_arm, 'yaw_rate_deg': 180.}
     for k,v in params.items(): args += ['-p', f'{k}:={str(v).lower()}']
     for topic in ['/fmu/out/vehicle_local_position_v1', '/fmu/out/vehicle_control_mode',
+                  '/fmu/out/vehicle_status_v1',
                   '/fmu/in/vehicle_visual_odometry', '/fmu/in/vehicle_command',
                   '/fmu/in/trajectory_setpoint', '/fmu/in/offboard_control_mode', '/fmu/out/sensor_combined']:
         args += ['-r', f'{topic}:={prefix}{topic}']
@@ -118,6 +123,7 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
     armed = False; offboard = False; generation = 0; map_stamp = 0; goal_generation = 1
     goal = [.7,.1,.65]; next_map = 0.; next_path = 0.; last_pump = 0.; command_index = 0
     pre_hover_path_pending = True; path_generation_lag = 0; map_history = {}
+    preflight_ready = False
     fault = None; obstacle = None; external_offset = [0., 0., 0.]
     # Use native voxel centres. Coordinates on cell boundaries can round into
     # an adjacent OctoMap key and leave a checkerboard of accidental unknowns.
@@ -150,7 +156,10 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         pub['/fmu/out/vehicle_local_position_v1'].publish(local)
         mode = VehicleControlMode();mode.timestamp = ns//1000;mode.flag_armed = armed
         mode.flag_control_offboard_enabled = offboard
-        pub['/fmu/out/vehicle_control_mode'].publish(mode)
+        if fault != 'mode': pub['/fmu/out/vehicle_control_mode'].publish(mode)
+        vehicle_status = VehicleStatus();vehicle_status.timestamp = ns//1000
+        vehicle_status.pre_flight_checks_pass = preflight_ready
+        pub['/fmu/out/vehicle_status_v1'].publish(vehicle_status)
         body = [.1+position[1]-ground[1], .1+position[0]-ground[0], .2+ground[2]-position[2]]
         pose = PoseStamped();pose.header.stamp.sec,pose.header.stamp.nanosec = divmod(ns,10**9)
         pose.header.frame_id = 'rtabmap_odom';pose.pose.position.x,pose.pose.position.y,pose.pose.position.z = body
@@ -213,6 +222,13 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         raise AssertionError(f'{status()}\n{(tmp_path/"adapter.log").read_text()[-4000:]}')
 
     try:
+        # With no RC/GCS, PX4 may not make its aggregate preflight result true
+        # until Offboard has been requested. The adapter must therefore enter
+        # ENGAGE and request the mode, while still withholding ARM.
+        wait(lambda: offboard and status().get('fault') == 'PX4_PREFLIGHT_CHECKS' and
+             status().get('flight_state') == 'ENGAGE')
+        assert not any(m.command == 400 and m.param1 == 1 for m in received['commands'])
+        preflight_ready = True
         wait(lambda:status().get('state')=='WAITING_FOR_GOAL')
         hover_status = status()
         assert hover_status['flight_state'] == 'WAITING_FOR_ROUTE'
@@ -274,12 +290,29 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         for injected,expected in [('pose','POSE_STALE'),('correction','POSE_MAP_MISMATCH'),('path_frame','PATH_STALE')]:
             fault=injected;next_path=0.
             wait(lambda:status().get('state')=='HOLD' and status().get('fault')==expected,seconds=1.3)
+            assert status()['follower_latched'] is True
+            assert status()['follower_latch_reason'] == expected
             held=[float(x) for x in received['setpoints'][-1].position]
             until=time.monotonic()+.15
             wait(lambda:time.monotonic()>=until,seconds=.4)
             assert math.dist([float(x) for x in received['setpoints'][-1].position],held)<1e-6
             fault=None;next_path=0.
             wait(lambda:status().get('state')=='FOLLOWING')
+            assert status()['follower_latched'] is False
+        assert status()['equivalent_replans_retained'] > 0
+        # The observed 0.66 s control-mode gap must not trip the stricter
+        # 0.50 s local-position watchdog. The independently configured 0.75 s
+        # mode watchdog still freezes the command if the gap persists.
+        fault='mode'
+        until=time.monotonic()+.60
+        wait(lambda:time.monotonic()>=until,seconds=.9)
+        assert not (status().get('state')=='HOLD' and
+                    status().get('fault')=='PX4_STATE_STALE_OR_INVALID')
+        wait(lambda:status().get('state')=='HOLD' and
+             status().get('fault')=='PX4_STATE_STALE_OR_INVALID',seconds=.5)
+        assert status()['follower_latched'] is True
+        fault=None
+        wait(lambda:status().get('state')=='FOLLOWING')
         obstacle=[.1+position[1]-ground[1]+.15,.1+position[0]-ground[0],.2+ground[2]-position[2]]
         next_map=0.;next_path=0.
         wait(lambda:status().get('state')=='HOLD' and ('OBSTACLE' in status().get('fault','') or 'BLOCKED' in status().get('fault','')))

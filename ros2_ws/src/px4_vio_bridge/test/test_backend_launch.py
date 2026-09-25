@@ -138,6 +138,7 @@ def test_ros_navigation_monitor_uses_one_map_producer_and_atomic_body_pose():
     monitor = next(a for a in ld.entities if isinstance(a, IncludeLaunchDescription))
     args = dict(monitor.launch_arguments)
     assert args['octomap_producer'] == 'false'
+    assert args['route_follower'] == 'false'
     assert args['pose_snapshot_topic'] == '/planner3d/pose_snapshot'
     assert args['vio_frame_id'] == 'rtabmap_odom'
     defaults = {a.name: a for a in ld.entities if isinstance(a, DeclareLaunchArgument)}
@@ -166,9 +167,17 @@ def test_ros_perception_tuning_reaches_backend_and_mapper():
     backend = next(a for a in monitor.entities if type(a) is ExecuteProcess)
     command = [perform_substitutions(context, part) for part in backend.cmd]
     for argument in ('range_min:=0.80', 'grid_depth_decimation:=2',
-                     'grid_noise_min_neighbors:=6', 'mapping_rate_hz:=0.5'):
+                     'grid_noise_min_neighbors:=6', 'mapping_rate_hz:=0.5',
+                     'odometry_topic_queue_size:=2',
+                     'odometry_sync_queue_size:=2'):
         assert argument in command
+    camera_argument = next(argument for argument in command
+                           if argument.startswith('camera_config:='))
+    assert camera_argument.endswith('/config/oak_v3_rtabmap_tracked_10hz.yaml')
     native = load('ros_rtabmap_oak_v3_native_features.launch.py')
+    for action in native.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
     include = next(a for a in native.entities if isinstance(a, IncludeLaunchDescription))
     forwarded = dict(include.launch_arguments)
     assert perform_substitutions(context, [forwarded['grid_depth_decimation']]) == '2'
@@ -190,6 +199,12 @@ def test_ros_perception_tuning_reaches_backend_and_mapper():
     assert parameters['Grid/RangeMin'] == '0.80'
     assert parameters['Grid/NoiseFilteringMinNeighbors'] == '6'
     assert parameters['Rtabmap/DetectionRate'] == '0.5'
+    odometry = next(node for node in components
+                    if perform_substitutions(context, node.node_plugin) ==
+                    'rtabmap_odom::RGBDOdometry')
+    odometry_parameters = evaluate_parameters(context, odometry.parameters)[0]
+    assert odometry_parameters['topic_queue_size'] == 2
+    assert odometry_parameters['sync_queue_size'] == 2
 
 
 def test_test_clear_requires_owned_backend_and_is_disabled_by_default():
@@ -251,7 +266,14 @@ def test_unknown_aware_flight_launch_uses_raw_vio_and_verified_prefix_policy():
     assert context.launch_configurations['adapter_start_delay'] == '5.0'
     assert context.launch_configurations['route_speed'] == '0.15'
     assert context.launch_configurations['command_speed'] == '0.15'
-    assert context.launch_configurations['rate_hz'] == '20.0'
+    assert context.launch_configurations['rate_hz'] == '10.0'
+    assert context.launch_configurations['path_timeout'] == '3.5'
+    assert context.launch_configurations['px4_timeout'] == '0.50'
+    assert context.launch_configurations['vehicle_control_mode_timeout'] == '0.75'
+    assert context.launch_configurations['follower_rejoin_grace'] == '1.5'
+    assert context.launch_configurations['route_equivalence_tolerance'] == '0.10'
+    assert context.launch_configurations['require_px4_preflight_status'] == 'true'
+    assert context.launch_configurations['px4_preflight_timeout'] == '1.0'
     adapter_timer = next(a for a in ld.entities if isinstance(a, TimerAction))
     assert len(adapter_timer.actions) == 1
     assert isinstance(adapter_timer.actions[0], Node)
@@ -269,7 +291,14 @@ def test_unknown_aware_flight_launch_uses_raw_vio_and_verified_prefix_policy():
     assert flight['vio_info_topic'] == '/rtabmap/vio_odom_info_lite'
     assert flight['max_vio_source_age'] == 0.30
     assert flight['command_speed'] == 0.15
-    assert flight['rate_hz'] == 20.0
+    assert flight['rate_hz'] == 10.0
+    assert flight['path_timeout'] == 3.5
+    assert flight['px4_timeout'] == 0.50
+    assert flight['vehicle_control_mode_timeout'] == 0.75
+    assert flight['follower_rejoin_grace'] == 1.5
+    assert flight['route_equivalence_tolerance'] == 0.10
+    assert flight['require_px4_preflight_status'] is True
+    assert flight['px4_preflight_timeout'] == 1.0
     assert bridge['input_odometry_topic'] == '/rtabmap/vio_odometry'
     assert bridge['frame_transform'] == 'enu_flu_to_ned_frd'
     assert bridge['vio_yaw_offset_deg'] == flight['vio_yaw_offset_deg']

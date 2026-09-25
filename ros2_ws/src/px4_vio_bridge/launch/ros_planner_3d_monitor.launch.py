@@ -70,12 +70,16 @@ def generate_launch_description():
                                   "px4_vio_bridge", "ros_rtabmap_backend"]),
              "foxglove:=false", "use_imu:=false", "odometry_rate_hz:=0.0",
              "odom_reset_countdown:=0", "keep_latest_frame:=true",
+             "odometry_topic_queue_size:=2", "odometry_sync_queue_size:=2",
              "odom_key_frame_thr:=0.3", "odom_vis_keyframe_thr:=150",
              ["use_sim_time:=", LaunchConfiguration("use_sim_time")],
              ["voxel_size:=", LaunchConfiguration("voxel_size")],
              *[[key + ":=", LaunchConfiguration(key)] for key in defaults
                if key.startswith("grid_") or key in ("mapping_rate_hz", "range_min", "range_max")],
-             ["camera_config:=", PathJoinSubstitution([share, "config", "oak_v3_rtabmap_tracked.yaml"])],
+             # The 30 Hz source outran the 12-13 Hz F2M worker and filled its
+             # synchronizer queue. Use the validated 10 Hz source so each
+             # selected frame can finish before the next one arrives.
+             ["camera_config:=", PathJoinSubstitution([share, "config", "oak_v3_rtabmap_tracked_10hz.yaml"])],
              ["odom_config_path:=", PathJoinSubstitution([share, "config", "rtabmap_ros_parity.ini"])],
              ["test_start_clear_radius:=", LaunchConfiguration("test_start_clear_radius")],
              *[[key + ":=", LaunchConfiguration(key)] for key in defaults
@@ -92,6 +96,10 @@ def generate_launch_description():
                 "max_marker_voxels", "process_monitor", "goal_height_mode", "exploration_route",
                 "current_goal_min_height_above_start")},
             "octomap_producer": "false", "simulate": "false",
+            # The flight adapter has its own stateful 3D follower and validates
+            # every current OctoMap. The monitor follower duplicates swept
+            # chord checks without contributing to flight authority.
+            "route_follower": "false",
             "pose_snapshot_topic": "/planner3d/pose_snapshot", "vio_frame_id": "rtabmap_odom",
         }.items(),
     )

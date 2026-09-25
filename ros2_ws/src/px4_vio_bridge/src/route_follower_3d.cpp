@@ -54,6 +54,47 @@ Point3 segment_velocity_3d(const Point3 & displacement, const Point3 & velocity,
 namespace
 {
 
+bool suffix_near(
+  const Polyline3D & source, double source_along,
+  const Polyline3D & target, double target_along, double tolerance)
+{
+  const auto remaining = std::max(0.0, source.length() - source_along);
+  // Uniform arc-length samples catch equivalent routes with different vertex
+  // spacing. Bound the work for malformed or unusually dense input paths.
+  const auto samples = std::clamp<std::size_t>(
+    static_cast<std::size_t>(std::ceil(remaining / std::max(tolerance * 0.5, 0.01))),
+    1, 512);
+  for (std::size_t index = 0; index <= samples; ++index) {
+    const auto along = source_along + remaining * static_cast<double>(index) /
+      static_cast<double>(samples);
+    const auto projection = target.project(source.point_at(along));
+    if (projection.distance > tolerance + 1.0e-12 ||
+      projection.along + tolerance < target_along)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool equivalent_suffixes(
+  const Polyline3D & first, const Polyline3D & second,
+  const Point3 & pose, double tolerance)
+{
+  const auto first_pose = first.project(pose);
+  const auto second_pose = second.project(pose);
+  if (first_pose.distance > tolerance || second_pose.distance > tolerance ||
+    distance_3d(first.points().back(), second.points().back()) > tolerance)
+  {
+    return false;
+  }
+  const auto first_remaining = first.length() - first_pose.along;
+  const auto second_remaining = second.length() - second_pose.along;
+  if (std::abs(first_remaining - second_remaining) > 2.0 * tolerance) {return false;}
+  return suffix_near(first, first_pose.along, second, second_pose.along, tolerance) &&
+         suffix_near(second, second_pose.along, first, first_pose.along, tolerance);
+}
+
 Point3 limit_velocity(const Point3 & target, const Follower3DConfig & config)
 {
   Point3 limited = target;
@@ -113,6 +154,39 @@ bool RouteFollower3D::set_path(const std::vector<Point3> & points, const Point3 
   target_vertex_=path_->project(pose).segment+1;
   velocity_ = {};
   initialized_ = true;
+  return true;
+}
+
+bool RouteFollower3D::replace_equivalent_path(
+  const std::vector<Point3> & points, const Point3 & pose, double tolerance,
+  const ChordValidator & validator)
+{
+  if (!path_ || !initialized_ || !std::isfinite(tolerance) || tolerance <= 0.0) {
+    return false;
+  }
+  std::unique_ptr<Polyline3D> replacement;
+  try {
+    replacement = std::make_unique<Polyline3D>(points);
+  } catch (const std::invalid_argument &) {
+    return false;
+  }
+  if (!equivalent_suffixes(*path_, *replacement, pose, tolerance)) {return false;}
+
+  const auto pose_projection = replacement->project(pose);
+  const auto carrot_projection = replacement->project(carrot_);
+  if (carrot_projection.distance > tolerance) {return false;}
+  // Never carry route progress behind the aircraft. This is the bounded rejoin
+  // used after a short hold or a slightly shifted replacement route.
+  const auto carried_along = std::max(pose_projection.along, carrot_projection.along);
+  const auto carried_carrot = replacement->point_at(carried_along);
+  if (!validator || !validator(pose, carried_carrot)) {return false;}
+
+  path_ = std::move(replacement);
+  carrot_ = carried_carrot;
+  target_vertex_ = std::min(path_->points().size() - 1,
+    path_->project(carrot_).segment + 1);
+  // velocity_ deliberately survives. The normal update path still applies its
+  // acceleration limits and validates both lookahead and command chords.
   return true;
 }
 

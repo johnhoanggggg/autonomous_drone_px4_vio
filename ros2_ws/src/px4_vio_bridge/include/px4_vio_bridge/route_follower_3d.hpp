@@ -54,8 +54,17 @@ public:
   explicit RouteFollower3D(Follower3DConfig config = {});
   void clear();
   bool set_path(const std::vector<Point3> & points, const Point3 & pose);
+  // Replace a re-published version of the same route without discarding the
+  // command point or its velocity. The forward suffixes from `pose` must stay
+  // within `tolerance`, and the connector to the carried command point must be
+  // clearance checked before any state is changed.
+  bool replace_equivalent_path(
+    const std::vector<Point3> & points, const Point3 & pose, double tolerance,
+    const ChordValidator & validator);
   [[nodiscard]] FollowResult3D update(
     const Point3 & pose, double dt, const ChordValidator & validator);
+
+  [[nodiscard]] Point3 velocity() const {return velocity_;}
 
 private:
   Follower3DConfig config_;

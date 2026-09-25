@@ -108,8 +108,13 @@ OffboardHover::OffboardHover(const std::string & node_name)
   horizontal_error_time_ = declare_parameter<double>("horizontal_error_time", 0.25);
   tracking_arm_grace_ = declare_parameter<double>("tracking_arm_grace", 1.0);
   vio_reset_persist_ = declare_parameter<double>("vio_reset_persist", 0.2);
+  require_px4_preflight_status_ =
+    declare_parameter<bool>("require_px4_preflight_status", false);
+  px4_preflight_timeout_ = declare_parameter<double>("px4_preflight_timeout", 1.0);
 
-  if (!std::isfinite(rate_hz_) || rate_hz_ <= 0.0) {
+  if (!std::isfinite(rate_hz_) || rate_hz_ <= 0.0 ||
+    !std::isfinite(px4_preflight_timeout_) || px4_preflight_timeout_ <= 0.0)
+  {
     throw std::invalid_argument("rate_hz must be finite and positive");
   }
   dt_ = 1.0 / rate_hz_;
@@ -126,11 +131,15 @@ OffboardHover::OffboardHover(const std::string & node_name)
     [this](px4_msgs::msg::VehicleLocalPosition::ConstSharedPtr msg) {
       on_local_position(*msg);
     });
-  // This PX4 build's dds_topics.yaml publishes vehicle_control_mode (not
-  // vehicle_status), so arm/offboard state is confirmed from its flags.
+  // Arm/offboard state is confirmed from the higher-rate control-mode flags.
   control_mode_sub_ = create_subscription<px4_msgs::msg::VehicleControlMode>(
     "/fmu/out/vehicle_control_mode", px4_sub_qos(),
     [this](px4_msgs::msg::VehicleControlMode::ConstSharedPtr msg) {on_control_mode(*msg);});
+  // The versioned status topic supplies the authoritative PX4 arming-check
+  // result. It is optional for legacy launchers and mandatory for 3D flight.
+  vehicle_status_sub_ = create_subscription<px4_msgs::msg::VehicleStatus>(
+    "/fmu/out/vehicle_status_v1", px4_sub_qos(),
+    [this](px4_msgs::msg::VehicleStatus::ConstSharedPtr msg) {on_vehicle_status(*msg);});
   vio_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
     vio_pose_topic, 10,
     [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {on_vio_pose(*msg);});
@@ -353,6 +362,12 @@ void OffboardHover::on_control_mode(const px4_msgs::msg::VehicleControlMode & ms
   vcm_ = msg;
 }
 
+void OffboardHover::on_vehicle_status(const px4_msgs::msg::VehicleStatus & msg)
+{
+  vehicle_status_ = msg;
+  vehicle_status_received_ = monotonic_time();
+}
+
 void OffboardHover::on_vio_pose(const geometry_msgs::msg::PoseStamped & msg)
 {
   const double now = monotonic_time();
@@ -426,6 +441,12 @@ bool OffboardHover::is_armed() const {return vcm_ && vcm_->flag_armed;}
 bool OffboardHover::is_offboard() const
 {
   return vcm_ && vcm_->flag_control_offboard_enabled;
+}
+bool OffboardHover::px4_preflight_ready() const
+{
+  return !require_px4_preflight_status_ ||
+    (vehicle_status_ && vehicle_status_->pre_flight_checks_pass &&
+    !stale(vehicle_status_received_, px4_preflight_timeout_));
 }
 bool OffboardHover::pos_valid() const {return pos_ && pos_->xy_valid && pos_->z_valid;}
 
@@ -559,6 +580,12 @@ void OffboardHover::request_offboard()
 
 void OffboardHover::arm()
 {
+  if (!px4_preflight_ready()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "ARM inhibited: waiting for fresh PX4 pre_flight_checks_pass");
+    return;
+  }
   send_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0);
 }
 

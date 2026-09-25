@@ -93,12 +93,19 @@ def generate_launch_description():
         'route_speed': '0.15', 'command_speed': LaunchConfiguration('route_speed'),
         'command_vertical_speed': '0.05',
         'command_acceleration': '0.30', 'command_vertical_acceleration': '0.20',
-        # 20 Hz remains far above PX4's offboard requirement and avoids doing
-        # the full 3D chord revalidation 50 times per second on the Pi.
-        'rate_hz': '20.0', 'climb_timeout': '15.0', 'max_flight_time': '180.0',
+        # 10 Hz remains above PX4's offboard requirement and halves repeated
+        # swept-chord work relative to the previous 20 Hz flight loop.
+        'rate_hz': '10.0', 'climb_timeout': '15.0', 'max_flight_time': '180.0',
         'planner_fault_land_time': '3.0', 'goal_hold_time': '3.0',
+        # The flight backend now bounds VIO queueing to about 0.12 s p95.
+        # Retain the original fail-closed 0.30 s source-time budget rather than
+        # masking a future perception backlog with a wider acceptance window.
         'map_timeout': '3.0', 'pose_timeout': '0.5', 'max_vio_source_age': '0.30',
-        'path_timeout': '2.0', 'vio_info_topic': '/rtabmap/vio_odom_info_lite',
+        'path_timeout': '3.5', 'px4_timeout': '0.50',
+        'vehicle_control_mode_timeout': '0.75', 'follower_rejoin_grace': '1.5',
+        'route_equivalence_tolerance': '0.10',
+        'require_px4_preflight_status': 'true', 'px4_preflight_timeout': '1.0',
+        'vio_info_topic': '/rtabmap/vio_odom_info_lite',
         'vio_yaw_offset_deg': '0.0', 'min_vio_features': '20',
         # Match the 2D adapter: an existing goal may be used, but only after the
         # planner publishes a new coherent route snapshot from the hover state.
@@ -108,6 +115,7 @@ def generate_launch_description():
         'foxglove_teleop': 'true',
     }
     booleans = {'auto_arm', 'climb_feedforward', 'require_goal_after_hover', 'yaw_follows_heading',
+                'require_px4_preflight_status',
                 'keyboard_kill', 'keyboard_land', 'foxglove_teleop'}
     strings = {'vio_info_topic'}
     excluded = {'start_vio_bridge', 'record_bag', 'bag_output', 'adapter_start_delay',

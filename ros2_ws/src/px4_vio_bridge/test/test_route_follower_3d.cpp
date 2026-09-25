@@ -146,3 +146,49 @@ TEST(RouteFollower3D, BrakesAtShortEndpointWithoutAccelerationSpike)
     EXPECT_NEAR(p::distance_3d(previous_velocity, {}), 0.0, 1e-6);
   }
 }
+
+TEST(RouteFollower3D, EquivalentReplacementPreservesVelocityAndUsesVerifiedRejoin)
+{
+  p::Follower3DConfig config;
+  config.lookahead = 0.50;
+  config.max_horizontal_speed = 0.20;
+  config.max_horizontal_acceleration = 0.50;
+  config.max_cross_track = 0.20;
+  p::RouteFollower3D follower(config);
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {2.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  p::FollowResult3D before;
+  for (int i = 0; i < 8; ++i) {
+    before = follower.update({0.05, 0.0, 0.5}, 0.1,
+      [](const auto &, const auto &) {return true;});
+    ASSERT_TRUE(before.valid) << before.reason;
+  }
+  ASSERT_GT(before.velocity.x, 0.10);
+  int rejoin_checks = 0;
+  ASSERT_TRUE(follower.replace_equivalent_path(
+    {{0.05, 0.02, 0.5}, {2.0, 0.02, 0.5}}, {0.05, 0.0, 0.5}, 0.10,
+    [&rejoin_checks](const auto &, const auto &) {++rejoin_checks; return true;}));
+  EXPECT_EQ(rejoin_checks, 1);
+  EXPECT_NEAR(follower.velocity().x, before.velocity.x, 1.0e-12);
+  const auto after = follower.update({0.05, 0.0, 0.5}, 0.1,
+    [](const auto &, const auto &) {return true;});
+  ASSERT_TRUE(after.valid) << after.reason;
+  EXPECT_GT(after.velocity.x, 0.10);
+}
+
+TEST(RouteFollower3D, ReplacementRejectsDifferentRouteOrBlockedRejoin)
+{
+  p::Follower3DConfig config;
+  config.max_cross_track = 0.20;
+  p::RouteFollower3D follower(config);
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {2.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  EXPECT_FALSE(follower.replace_equivalent_path(
+    {{0.0, 0.25, 0.5}, {2.0, 0.25, 0.5}}, {0.0, 0.0, 0.5}, 0.10,
+    [](const auto &, const auto &) {return true;}));
+  EXPECT_FALSE(follower.replace_equivalent_path(
+    {{0.0, 0.02, 0.5}, {2.0, 0.02, 0.5}}, {0.0, 0.0, 0.5}, 0.10,
+    [](const auto &, const auto &) {return false;}));
+  const auto unchanged = follower.update({0.0, 0.0, 0.5}, 0.1,
+    [](const auto &, const auto &) {return true;});
+  EXPECT_TRUE(unchanged.valid);
+  EXPECT_NEAR(unchanged.lookahead.y, 0.0, 1.0e-12);
+}

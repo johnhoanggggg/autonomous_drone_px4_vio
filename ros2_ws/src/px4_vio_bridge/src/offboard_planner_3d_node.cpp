@@ -38,8 +38,11 @@ public:
     map_timeout_=declare_parameter<double>("map_timeout",3.0);
     pose_timeout_=declare_parameter<double>("pose_timeout",.5);
     max_vio_source_age_=declare_parameter<double>("max_vio_source_age",.3);
-    path_timeout_=declare_parameter<double>("path_timeout",2.0);
+    path_timeout_=declare_parameter<double>("path_timeout",3.5);
     px4_timeout_=declare_parameter<double>("px4_timeout",.5);
+    vehicle_control_mode_timeout_=declare_parameter<double>("vehicle_control_mode_timeout",.75);
+    follower_rejoin_grace_=declare_parameter<double>("follower_rejoin_grace",1.5);
+    route_equivalence_tolerance_=declare_parameter<double>("route_equivalence_tolerance",.10);
     fault_land_time_=declare_parameter<double>("planner_fault_land_time",3.0);
     goal_hold_time_=declare_parameter<double>("goal_hold_time",3.0);
     fresh_goal_=declare_parameter<bool>("require_goal_after_hover",false);
@@ -60,6 +63,7 @@ public:
     config_.arrival_tolerance=declare_parameter<double>("arrival_tolerance",.10);
     info_topic_=declare_parameter<std::string>("vio_info_topic","/rtabmap/vio_odom_info_lite");
     for (double v : {radius_,geofence_,max_height_,map_timeout_,pose_timeout_,max_vio_source_age_,path_timeout_,px4_timeout_,
+      vehicle_control_mode_timeout_,follower_rejoin_grace_,route_equivalence_tolerance_,
       fault_land_time_,goal_hold_time_,leash_xy_,leash_z_,config_.max_horizontal_speed,
       config_.max_vertical_speed,config_.max_horizontal_acceleration,config_.max_vertical_acceleration,
       config_.lookahead,config_.max_cross_track,config_.max_vertical_track,config_.arrival_tolerance}) {
@@ -67,7 +71,8 @@ public:
     }
     if (!std::isfinite(min_height_) || min_height_<0 || min_height_>=hover_height_ ||
       hover_height_>max_height_ || geofence_<=radius_ || !std::isfinite(yaw_offset_) ||
-      !std::isfinite(yaw_align_) || !std::isfinite(yaw_resume_) || yaw_resume_<0 || yaw_align_<yaw_resume_)
+      !std::isfinite(yaw_align_) || !std::isfinite(yaw_resume_) || yaw_resume_<0 || yaw_align_<yaw_resume_ ||
+      route_equivalence_tolerance_>std::min(config_.max_cross_track,config_.max_vertical_track))
     {throw std::invalid_argument("invalid 3D flight bounds or yaw limits");}
     limiter_=std::make_unique<FlightPositionLimiter3D>(config_);
     const auto durable=rclcpp::QoS(1).reliable().transient_local();
@@ -119,6 +124,10 @@ public:
       {"takeoff_vertical_feedforward",climb_feedforward_},{"route_feedforward",false},
       {"fault_hold_policy","last_safe_command"},
       {"route_map_policy","odom_retained_revalidated_each_map"},
+      {"path_timeout",path_timeout_},{"px4_position_timeout",px4_timeout_},
+      {"vehicle_control_mode_timeout",vehicle_control_mode_timeout_},
+      {"follower_rejoin_grace",follower_rejoin_grace_},
+      {"route_equivalence_tolerance",route_equivalence_tolerance_},
       {"vio_info_topic",info_topic_},{"max_vio_source_age",max_vio_source_age_},
       {"feature_health","configured OdomInfo inliers and lost"},{"min_inliers",min_vio_features_},
       {"position_control",true}}.dump(); config_pub_->publish(cfg);
@@ -150,6 +159,7 @@ protected:
   {
     const auto reason=health(false);
     if (!reason.empty()) {publish_status("ARM_INHIBITED",reason); return;}
+    if (!px4_preflight_ready()) {publish_status("ARM_INHIBITED","PX4_PREFLIGHT_CHECKS");return;}
     const Point3 hover{ground_->x,ground_->y,ground_->z-hover_height_};
     const auto body=point3(pose_->position);
     const auto target=add_3d(body,ned_delta_to_map(subtract_3d(hover,local_point()),correction_->orientation,yaw_offset_));
@@ -177,12 +187,32 @@ protected:
     if (state_==State::Land || state_==State::Abort || state_==State::Done) {return false;}
     const bool routing=state_==State::Route;
     const auto reason=health(routing);
-    if (!reason.empty()) {fault(reason);return true;}
-    if (state_==State::Stream || state_==State::Engage) {
-      // A pre-arm fault is only an arming inhibitor. Do not let its elapsed
-      // watchdog time carry into the first armed sample and request LAND.
-      clear_fault();command_=*ground_;vertical_velocity_.reset();limiter_->reset(*command_);return false;
+    if (state_==State::Stream) {
+      // Do not start the finite ENGAGE timeout until the adapter contract is
+      // ready. PX4 preflight is deliberately *not* a STREAM gate: with no RC
+      // or GCS, PX4 may require the requested Offboard mode before its aggregate
+      // preflight flag can pass. arm() still inhibits ARM until that flag is
+      // fresh and true.
+      command_=*ground_;vertical_velocity_.reset();limiter_->reset(*command_);
+      if (!reason.empty()) {
+        latch_hold();fault_since_.reset();publish_setpoint(0.0);
+        publish_status("ARM_INHIBITED",reason);
+        return true;
+      }
+      clear_fault();return false;
     }
+    if (state_==State::Engage) {
+      // Never let a transient health fault suppress the base sequencer's
+      // periodic OFFBOARD/ARM retry. arm() independently rechecks every health
+      // contract, so an unhealthy retry emits no ARM command.
+      command_=*ground_;vertical_velocity_.reset();limiter_->reset(*command_);
+      if (!reason.empty() || !px4_preflight_ready()) {
+        latch_hold();fault_since_.reset();
+        publish_status("ARM_INHIBITED",reason.empty()?"PX4_PREFLIGHT_CHECKS":reason);
+      } else {clear_fault();}
+      return false;
+    }
+    if (!reason.empty()) {fault(reason);return true;}
     if (state_==State::ClimbHold) {
       if (auto error=move_takeoff();!error.empty()) {fault(error);return true;}
       clear_fault();publish_setpoint(hover_height_);
@@ -205,7 +235,7 @@ protected:
         *path_received_>*hover_ready_since_;
       const auto route_health=health(true);
       if (path_goal_>=minimum_goal_ && post_hover_path && route_health.empty()) {
-        set_state(State::Route);follower_.reset();publish_status("ROUTE_START","");
+        set_state(State::Route);follower_.reset();follower_goal_=0;publish_status("ROUTE_START","");
       } else {
         std::string gate;
         if (path_goal_<minimum_goal_) {gate="click a waypoint after hover";}
@@ -221,13 +251,21 @@ protected:
     if (!follower_ || follower_path_stamp_!=path_stamp_ ||
       follower_generation_!=path_validated_generation_)
     {
-      if ((path_points_.size()!=active_points_.size() || !std::equal(path_points_.begin(),path_points_.end(),active_points_.begin(),
-        [](const Point3&a,const Point3&b){return a.x==b.x && a.y==b.y && a.z==b.z;})) || !follower_) {
+      const bool exact_path = path_points_.size()==active_points_.size() &&
+        std::equal(path_points_.begin(),path_points_.end(),active_points_.begin(),
+        [](const Point3&a,const Point3&b){return a.x==b.x && a.y==b.y && a.z==b.z;});
+      bool retained = follower_ && exact_path && follower_goal_==path_goal_;
+      if (!retained && follower_ && follower_goal_==path_goal_) {
+        retained=follower_->replace_equivalent_path(path_points_,body,
+          route_equivalence_tolerance_,[this](const Point3&a,const Point3&b){return chord(a,b);});
+        if (retained) {++equivalent_replans_retained_;}
+      }
+      if (!retained) {
         const auto up=rotate(correction_->orientation,{0,0,1});
         follower_=std::make_unique<RouteFollower3D>(limits_for_map_tilt(config_,up.z));
         if (!follower_->set_path(path_points_,body)) {fault("INVALID_ROUTE");return true;}
-        active_points_=path_points_;
       }
+      active_points_=path_points_;follower_goal_=path_goal_;
       follower_generation_=path_validated_generation_;
       follower_path_stamp_=path_stamp_;
     }
@@ -332,8 +370,13 @@ private:
       path_source_points_=std::move(points);path_points_.clear();path_stamp_=stamp;
       path_map_stamp_=j.at("map_stamp_ns");path_validated_generation_=0;path_validated_map_stamp_=0;
       path_generation_=j.at("map_generation");path_goal_=goal;path_exact_=info.value("goal_exact",false);
-      path_received_=monotonic_time();
-    } catch (...) {path_source_points_.clear();path_points_.clear();follower_.reset();}
+      path_received_=monotonic_time();path_input_valid_=true;
+    } catch (...) {
+      // A malformed replacement is a fail-closed input fault, but the last
+      // accepted route and follower state remain available for a bounded
+      // recovery if the publisher resumes with a coherent snapshot.
+      path_input_valid_=false;
+    }
   }
   Point3 local_point() const {return {pos_->x,pos_->y,pos_->z};}
   bool chord(const Point3 & a,const Point3 & b) const
@@ -376,7 +419,8 @@ private:
   {
     const auto ns=now().nanoseconds();const auto clock=monotonic_time();
     if (!fatal_.empty()) {return fatal_;}
-    if (!local_valid_ || !pos_ || !ground_ || stale(local_received_,px4_timeout_) || stale(mode_received_,px4_timeout_)) {return "PX4_STATE_STALE_OR_INVALID";}
+    if (!local_valid_ || !pos_ || !ground_ || stale(local_received_,px4_timeout_) ||
+      stale(mode_received_,vehicle_control_mode_timeout_)) {return "PX4_STATE_STALE_OR_INVALID";}
     if (!tree_ || stale(map_received_,map_timeout_) || !fresh_stamp(map_stamp_,ns,map_timeout_)) {return "MAP_STALE";}
     if (!pose_ || !correction_ || stale(pose_received_,pose_timeout_) ||
       !fresh_stamp(pose_stamp_,ns,max_vio_source_age_)) {return "POSE_STALE";}
@@ -391,7 +435,7 @@ private:
     if (vio_at_origin_since_ && clock-*vio_at_origin_since_>=vio_reset_persist_) {return "VIO_ORIGIN_RESET";}
     if (vio_yaw_error_since_ && clock-*vio_yaw_error_since_>=vio_yaw_error_time_) {return "VIO_YAW_MISMATCH";}
     if (require_path) {
-      if (path_source_points_.size()<2 || stale(path_received_,path_timeout_) ||
+      if (!path_input_valid_ || path_source_points_.size()<2 || stale(path_received_,path_timeout_) ||
         !fresh_stamp(path_stamp_,ns,path_timeout_)) {return "PATH_STALE";}
       if (path_validated_generation_!=generation_ || path_validated_map_stamp_!=map_stamp_) {
         if (const auto reason=validate_path_for_current_map();!reason.empty()) {return reason;}
@@ -464,18 +508,39 @@ private:
     vertical_velocity_=0.0;
     if (command_) {limiter_->reset(*command_);}
   }
-  void clear_fault() {fault_since_.reset();holding_=false;}
+  static bool follower_rejoin_fault(const std::string & reason)
+  {
+    return reason=="POSE_STALE" || reason=="POSE_MAP_MISMATCH" ||
+      reason=="PATH_STALE" || reason=="PX4_STATE_STALE_OR_INVALID";
+  }
+  void clear_fault()
+  {
+    fault_since_.reset();holding_=false;follower_latch_since_.reset();
+    follower_latch_reason_.clear();
+  }
   void fault(const std::string & reason)
   {
-    latch_hold(!fatal_.empty());follower_.reset();goal_since_.reset();
+    latch_hold(!fatal_.empty());goal_since_.reset();
+    const auto clock=monotonic_time();
+    const bool retain=follower_ && fatal_.empty() && follower_rejoin_fault(reason);
+    if (retain) {
+      if (!follower_latch_since_) {follower_latch_since_=clock;}
+      follower_latch_reason_=reason;
+      if (clock-*follower_latch_since_>=follower_rejoin_grace_) {
+        follower_.reset();follower_goal_=0;
+      }
+    } else {
+      follower_.reset();follower_goal_=0;follower_latch_since_.reset();
+      follower_latch_reason_.clear();
+    }
     // Fault time before arming must never consume the armed landing grace
     // period. Start (and retain) that countdown only while actually armed.
     if (is_armed()) {
-      if (!fault_since_) {fault_since_=monotonic_time();}
+      if (!fault_since_) {fault_since_=clock;}
     } else {fault_since_.reset();}
     publish_setpoint(hover_height_);publish_status("HOLD",reason);
     if (is_armed() && fault_since_ &&
-      (monotonic_time()-*fault_since_>=fault_land_time_ || !fatal_.empty())) {
+      (clock-*fault_since_>=fault_land_time_ || !fatal_.empty())) {
       trigger_landing("3D adapter: "+reason);
     }
   }
@@ -494,6 +559,16 @@ private:
     j["minimum_goal_generation"]=minimum_goal_;
     j["post_hover_path"]=path_received_ && hover_ready_since_ &&
       *path_received_>*hover_ready_since_;
+    j["follower_latched"]=follower_latch_since_.has_value() && follower_!=nullptr;
+    j["follower_latch_elapsed_s"]=follower_latch_since_ ?
+      monotonic_time()-*follower_latch_since_:0.0;
+    j["follower_rejoin_grace_s"]=follower_rejoin_grace_;
+    j["follower_latch_reason"]=follower_latch_reason_;
+    j["equivalent_replans_retained"]=equivalent_replans_retained_;
+    if (follower_) {
+      const auto velocity=follower_->velocity();
+      j["follower_velocity_map"]={velocity.x,velocity.y,velocity.z};
+    }
     if (vertical_velocity_) {j["vertical_velocity_feedforward"]=*vertical_velocity_;}
     if (ground_) {j["ground_ned"]={ground_->x,ground_->y,ground_->z};}
     if (command_) {j["command_ned"]={command_->x,command_->y,command_->z};}
@@ -509,21 +584,24 @@ private:
   }
   bool allow_unknown_{},fresh_goal_{},yaw_track_{},yaw_holding_{},hover_ready_{},holding_{},terminal_hold_{};
   bool clearance_checked_{},local_valid_{},ev_valid_{},info_lost_{true},path_exact_{},path_terminal_{},artificial_clear_{};
-  std::string frame_,odom_frame_,path_topic_,info_topic_,fatal_;
+  bool path_input_valid_{true};
+  std::string frame_,odom_frame_,path_topic_,info_topic_,fatal_,follower_latch_reason_;
   double radius_{},geofence_{},min_height_{},max_height_{},map_timeout_{},pose_timeout_{},max_vio_source_age_{},path_timeout_{},px4_timeout_{};
+  double vehicle_control_mode_timeout_{},follower_rejoin_grace_{},route_equivalence_tolerance_{};
   double fault_land_time_{},goal_hold_time_{},yaw_offset_{},yaw_align_{},yaw_resume_{},leash_xy_{},leash_z_{};
   Follower3DConfig config_;
   std::unique_ptr<FlightPositionLimiter3D> limiter_;
   std::unique_ptr<RouteFollower3D> follower_;
   std::optional<Point3> ground_,command_,last_map_command_;
-  std::optional<double> yaw_target_,vertical_velocity_,local_received_,mode_received_,map_received_,pose_received_,path_received_,hover_ready_since_,fault_since_,goal_since_;
+  std::optional<double> yaw_target_,vertical_velocity_,local_received_,mode_received_,map_received_,pose_received_,path_received_,hover_ready_since_,fault_since_,goal_since_,follower_latch_since_;
   std::optional<Pose3> pose_,correction_;Pose3 map_correction_;
   std::optional<std::array<unsigned,3>> resets_;std::optional<unsigned> ev_reset_;
   std::uint64_t local_stamp_{},last_setpoint_us_{};
   Point3 previous_map_command_{},command_origin_{};
   std::int64_t generation_{},map_stamp_{},pending_stamp_{},pose_stamp_{},pose_generation_{},pose_map_stamp_{},info_stamp_{};
   std::int64_t path_stamp_{},path_generation_{},path_map_stamp_{},path_validated_generation_{},path_validated_map_stamp_{};
-  std::int64_t path_goal_{},latest_goal_{},minimum_goal_{},follower_path_stamp_{},follower_generation_{};
+  std::int64_t path_goal_{},latest_goal_{},minimum_goal_{},follower_path_stamp_{},follower_generation_{},follower_goal_{};
+  std::uint64_t equivalent_replans_retained_{};
   std::vector<Point3> path_source_points_,path_points_,active_points_;
   struct MapFrame {std::int64_t generation;std::int64_t stamp;Pose3 correction;};
   std::deque<MapFrame> map_frames_;

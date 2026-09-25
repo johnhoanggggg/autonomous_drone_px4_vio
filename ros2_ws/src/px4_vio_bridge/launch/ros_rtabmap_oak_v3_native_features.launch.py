@@ -49,6 +49,11 @@ def generate_launch_description():
         "keep_latest_frame": "false",
         "keep_next_frame": "false",
         "processing_queue_size": "0",
+        # Bound pre-odometry latency. The inputs are hardware-synchronised and
+        # constrained to a 1 ms matching window, so two samples are sufficient
+        # to pair a tuple without retaining hundreds of milliseconds of work.
+        "odometry_topic_queue_size": "2",
+        "odometry_sync_queue_size": "2",
         "octomap_pose_update_tolerance_m": "0.01",
         "octomap_pose_update_tolerance_rad": "0.01",
     }

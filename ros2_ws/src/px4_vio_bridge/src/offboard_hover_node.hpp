@@ -20,6 +20,7 @@
 #include "px4_msgs/msg/vehicle_control_mode.hpp"
 #include "px4_msgs/msg/vehicle_local_position.hpp"
 #include "px4_msgs/msg/vehicle_odometry.hpp"
+#include "px4_msgs/msg/vehicle_status.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/int32.hpp"
 
@@ -79,6 +80,7 @@ protected:
 
   bool is_armed() const;
   bool is_offboard() const;
+  bool px4_preflight_ready() const;
   bool pos_valid() const;
   bool check_flight_position();
 
@@ -129,11 +131,15 @@ protected:
   double horizontal_error_time_{};
   double tracking_arm_grace_{};
   double vio_reset_persist_{};
+  bool require_px4_preflight_status_{};
+  double px4_preflight_timeout_{};
   double dt_{};
 
   // --- state --------------------------------------------------------------
   std::optional<px4_msgs::msg::VehicleLocalPosition> pos_;
   std::optional<px4_msgs::msg::VehicleControlMode> vcm_;
+  std::optional<px4_msgs::msg::VehicleStatus> vehicle_status_;
+  std::optional<double> vehicle_status_received_;
   std::optional<double> x0_, y0_, yaw0_;
   std::optional<double> yaw_cmd_;
   std::optional<double> z_cmd_;
@@ -166,6 +172,7 @@ protected:
 private:
   FlightAuthority flight_authority_;
   void on_control_mode(const px4_msgs::msg::VehicleControlMode & msg);
+  void on_vehicle_status(const px4_msgs::msg::VehicleStatus & msg);
   void on_vio_pose(const geometry_msgs::msg::PoseStamped & msg);
   void on_vio_feature_count(const std_msgs::msg::Int32 & msg);
   void on_vio_odometry(const px4_msgs::msg::VehicleOdometry & msg);
@@ -179,6 +186,7 @@ private:
 
   rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr local_position_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleControlMode>::SharedPtr control_mode_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr vio_pose_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr vio_feature_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vio_odometry_sub_;
