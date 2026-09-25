@@ -16,10 +16,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -36,6 +38,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "px4_vio_bridge/grid_planner_3d.hpp"
+#include "px4_vio_bridge/flight_geometry_3d.hpp"
 #include "px4_vio_bridge/octomap_grid.hpp"
 #include "px4_vio_bridge/navigation_snapshot.hpp"
 
@@ -62,7 +65,53 @@ struct MapMetadata
   double resolution{};
   std::string frame_id;
   std::string source_pose_generation;
+  Pose3 map_from_odom;
 };
+
+struct GeofenceMask
+{
+  std::size_t width{};
+  std::size_t height{};
+  double resolution{};
+  Point3 origin;
+  Point3 center;
+  double radius{};
+  std::vector<std::uint8_t> inside;
+
+  [[nodiscard]] bool matches(const VoxelGrid & grid, const Point3 & requested_center,
+    double requested_radius) const
+  {
+    return width == grid.width() && height == grid.height() &&
+      resolution == grid.resolution() && origin.x == grid.origin().x &&
+      origin.y == grid.origin().y && center.x == requested_center.x &&
+      center.y == requested_center.y && radius == requested_radius;
+  }
+};
+
+std::shared_ptr<const GeofenceMask> make_geofence_mask(
+  const VoxelGrid & grid, const Point3 & center, double radius)
+{
+  auto mask = std::make_shared<GeofenceMask>();
+  mask->width = grid.width();
+  mask->height = grid.height();
+  mask->resolution = grid.resolution();
+  mask->origin = grid.origin();
+  mask->center = center;
+  mask->radius = radius;
+  mask->inside.resize(grid.width() * grid.height());
+  const long double radius_squared = static_cast<long double>(radius) * radius;
+  for (std::size_t y = 0; y < grid.height(); ++y) {
+    const long double dy = static_cast<long double>(grid.origin().y) +
+      (static_cast<long double>(y) + 0.5L) * grid.resolution() - center.y;
+    for (std::size_t x = 0; x < grid.width(); ++x) {
+      const long double dx = static_cast<long double>(grid.origin().x) +
+        (static_cast<long double>(x) + 0.5L) * grid.resolution() - center.x;
+      mask->inside[y * grid.width() + x] =
+        dx * dx + dy * dy <= radius_squared ? 1U : 0U;
+    }
+  }
+  return mask;
+}
 
 class ProcessSingleton
 {
@@ -142,6 +191,9 @@ public:
     max_z_ = declare_parameter<double>("max_z", 2.00);
     map_timeout_ = declare_parameter<double>("map_timeout", 3.0);
     pose_timeout_ = declare_parameter<double>("pose_timeout", 1.0);
+    map_preparation_period_ = declare_parameter<double>("map_preparation_period", 2.0);
+    planning_pose_drift_tolerance_ =
+      declare_parameter<double>("planning_pose_drift_tolerance", 0.10);
     max_marker_voxels_ = static_cast<std::size_t>(
       std::max<int64_t>(0, declare_parameter<int64_t>("max_marker_voxels", 20000)));
     config_.lethal_radius = robot_radius_ + safety_margin_;
@@ -157,7 +209,7 @@ public:
     const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     map_sub_ = create_subscription<octomap_msgs::msg::Octomap>(
       map_topic_, map_qos,
-      [this](octomap_msgs::msg::Octomap::ConstSharedPtr message) {on_map(*message);});
+      [this](octomap_msgs::msg::Octomap::ConstSharedPtr message) {on_map(std::move(message));});
     metadata_sub_ = create_subscription<std_msgs::msg::String>(
       map_metadata_topic_, map_qos,
       [this](std_msgs::msg::String::ConstSharedPtr message) {on_metadata(*message);});
@@ -222,17 +274,15 @@ private:
   struct PlanningRequest
   {
     std::shared_ptr<const VoxelGrid> raw;
+    std::shared_ptr<const GeofenceMask> geofence_mask;
     Point3 pose;
     Point3 goal;
-    Point3 takeoff_center;
     Planner3DConfig config;
     std::int64_t map_generation{};
     std::int64_t map_stamp_ns{};
     std::int64_t goal_generation{};
+    Pose3 map_from_odom;
     bool exploration_route{};
-    double planning_radius_xy{};
-    double min_z{};
-    double max_z{};
     double grid_ms{};
   };
 
@@ -249,6 +299,7 @@ private:
     std::int64_t map_generation{};
     std::int64_t map_stamp_ns{};
     std::int64_t goal_generation{};
+    Pose3 map_from_odom;
     bool exploration_route{};
   };
 
@@ -259,14 +310,6 @@ private:
     bool exploration_route{};
     std::optional<PreparedPlanner3D> planner;
   };
-
-  static bool request_inside_geofence(const PlanningRequest & request, const Point3 & point)
-  {
-    return std::hypot(
-      point.x - request.takeoff_center.x, point.y - request.takeoff_center.y) <=
-      request.planning_radius_xy + 1.0e-12 && point.z >= request.min_z &&
-      point.z <= request.max_z;
-  }
 
   static ForwardProbe make_forward_probe(
     const VoxelGrid & raw, const Point3 & pose, const Point3 & goal, double radius)
@@ -295,7 +338,10 @@ private:
           for (int y = 0; y < static_cast<int>(optimistic.height()); ++y) {
             for (int x = 0; x < static_cast<int>(optimistic.width()); ++x) {
               const Voxel voxel{x, y, z};
-              if (!request_inside_geofence(request, optimistic.voxel_center(voxel))) {
+              if (!request.geofence_mask->inside[
+                  static_cast<std::size_t>(y) * optimistic.width() +
+                  static_cast<std::size_t>(x)])
+              {
                 optimistic.set(voxel, VoxelState::Occupied);
               } else if (request.raw->at(voxel) == VoxelState::Unknown) {
                 optimistic.set(voxel, VoxelState::Free);
@@ -367,6 +413,7 @@ private:
     output.map_generation = request.map_generation;
     output.map_stamp_ns = request.map_stamp_ns;
     output.goal_generation = request.goal_generation;
+    output.map_from_odom = request.map_from_odom;
     output.exploration_route = request.exploration_route;
     return output;
   }
@@ -391,7 +438,10 @@ private:
       safety_margin_ + 1.0e-12 < max_cross_track_ ||
       !std::isfinite(planning_radius_xy_) || planning_radius_xy_ <= 0.0 ||
       !std::isfinite(min_z_) || !std::isfinite(max_z_) || min_z_ >= max_z_ ||
-      !std::isfinite(inflation_extra_) || inflation_extra_ < 0.0)
+      !std::isfinite(inflation_extra_) || inflation_extra_ < 0.0 ||
+      !std::isfinite(map_preparation_period_) || map_preparation_period_ < 0.0 ||
+      !std::isfinite(planning_pose_drift_tolerance_) ||
+      planning_pose_drift_tolerance_ <= 0.0)
     {
       throw std::invalid_argument(
               "invalid 3D configuration (requires safety_margin>=0.10 and "
@@ -399,31 +449,32 @@ private:
     }
   }
 
-  void on_map(const octomap_msgs::msg::Octomap & message)
+  void on_map(octomap_msgs::msg::Octomap::ConstSharedPtr message)
   {
-    if (message.header.frame_id != frame_id_) {
+    if (message->header.frame_id != frame_id_) {
       publish_status("MAP_FRAME_REJECTED");
       return;
     }
-    if (!std::isfinite(message.resolution) || message.resolution <= 0.0 ||
-      message.data.empty())
+    if (!std::isfinite(message->resolution) || message->resolution <= 0.0 ||
+      message->data.empty())
     {
       publish_status("MAP_GEOMETRY_REJECTED");
       return;
     }
-    std::unique_ptr<octomap::AbstractOcTree> abstract(octomap_msgs::msgToMap(message));
-    if (dynamic_cast<octomap::OcTree *>(abstract.get()) == nullptr &&
-      dynamic_cast<octomap::ColorOcTree *>(abstract.get()) == nullptr)
+    if (message->id != "OcTree" && message->id != "ColorOcTree")
     {
       publish_status("MAP_TYPE_REJECTED");
       return;
     }
-    pending_octree_ = std::move(abstract);
-    pending_map_stamp_ = rclcpp::Time(message.header.stamp);
+    // Pair and retain the serialized latest map cheaply. Deserializing every
+    // 1 Hz update consumed almost as much CPU as inflation even when that map
+    // was intentionally skipped by the preparation throttle.
+    pending_map_message_ = std::move(message);
+    pending_map_stamp_ = rclcpp::Time(pending_map_message_->header.stamp);
     if (!require_map_metadata_) {
       pending_metadata_ = MapMetadata{
-        map_generation_ + 1, pending_map_stamp_.nanoseconds(), message.resolution,
-        message.header.frame_id, "unpaired"};
+        map_generation_ + 1, pending_map_stamp_.nanoseconds(), pending_map_message_->resolution,
+        pending_map_message_->header.frame_id, "unpaired", Pose3{}};
     }
     try_accept_map();
   }
@@ -441,7 +492,8 @@ private:
         json.at("stamp_ns").get<std::int64_t>(),
         json.at("resolution").get<double>(),
         json.at("frame_id").get<std::string>(),
-        json.at("source_pose_generation").get<std::string>()};
+        json.at("source_pose_generation").get<std::string>(),
+        snapshot_pose(json.at("map_from_odom"))};
       try_accept_map();
     } catch (const std::exception & error) {
       RCLCPP_ERROR_THROTTLE(
@@ -452,31 +504,29 @@ private:
 
   void try_accept_map()
   {
-    if (!pending_octree_ || !pending_metadata_) {return;}
+    if (!pending_map_message_ || !pending_metadata_) {return;}
     if (pending_metadata_->stamp_ns != pending_map_stamp_.nanoseconds() ||
       pending_metadata_->frame_id != frame_id_ ||
-      std::abs(pending_metadata_->resolution - pending_octree_->getResolution()) > 1.0e-9 ||
+      std::abs(pending_metadata_->resolution - pending_map_message_->resolution) > 1.0e-9 ||
       pending_metadata_->generation <= map_generation_ ||
       !fresh_stamp(pending_metadata_->stamp_ns, now().nanoseconds(), map_timeout_))
     {
       publish_status("MAP_METADATA_MISMATCH");
       return;
     }
-    octree_ = std::move(pending_octree_);
+    map_message_ = std::move(pending_map_message_);
     map_stamp_ = pending_map_stamp_;
     map_received_ = steady_seconds();
     map_generation_ = pending_metadata_->generation;
-    raw_grid_.reset();
-    raw_grid_generation_ = -1;
-    raw_grid_ms_ = 0.0;
-    reference_path_.clear();
-    reference_info_ = nlohmann::ordered_json::object();
+    map_from_odom_ = pending_metadata_->map_from_odom;
     source_pose_generation_ = pending_metadata_->source_pose_generation;
     pending_metadata_.reset();
     std_msgs::msg::Int32 generation;
     generation.data = static_cast<std::int32_t>(map_generation_);
     map_generation_pub_->publish(generation);
-    plan_dirty_ = true;
+    // Keep serving the previous source-tagged route while preparation of the
+    // newest map is throttled. The flight adapter independently reframes and
+    // collision-checks that route against every accepted OctoMap.
   }
 
   void on_snapshot(const std_msgs::msg::String & message)
@@ -493,6 +543,7 @@ private:
       msg.pose.position.z = pose.position.z;
       pose_generation_ = value.at("map_generation");
       pose_map_stamp_ = value.at("map_stamp_ns");
+      pose_map_from_odom_ = snapshot_pose(value.at("correction"));
       on_pose(msg);
     } catch (const std::exception &) {publish_status("POSE_SNAPSHOT_REJECTED");}
   }
@@ -507,6 +558,10 @@ private:
     }
     pose_stamp_ = rclcpp::Time(message.header.stamp).nanoseconds();
     pose_ = point;
+    if (snapshot_topic_.empty()) {
+      // The legacy pose topic is already expressed in the current map frame.
+      pose_map_from_odom_ = map_from_odom_;
+    }
     pose_received_ = steady_seconds();
     if (!takeoff_center_) {
       takeoff_center_ = point;
@@ -576,7 +631,7 @@ private:
     // Transient freshness faults report status without withdrawing a route.
     // The worker below keeps this executor responsive while inflation and A*
     // run; consumers independently hold on stale map/pose/path snapshots.
-    if (!octree_ || now - map_received_ > map_timeout_ ||
+    if (!map_message_ || now - map_received_ > map_timeout_ ||
       !fresh_stamp(map_stamp_.nanoseconds(), this->now().nanoseconds(), map_timeout_))
     {
       publish_status("MAP_STALE");
@@ -589,7 +644,8 @@ private:
       return;
     }
     if (!snapshot_topic_.empty() && (pose_generation_ != map_generation_ ||
-      pose_map_stamp_ != map_stamp_.nanoseconds()))
+      pose_map_stamp_ != map_stamp_.nanoseconds() ||
+      !same_snapshot_transform(pose_map_from_odom_, map_from_odom_)))
     {
       publish_status("POSE_MAP_MISMATCH");
       return;
@@ -602,7 +658,11 @@ private:
       fail_closed("START_ENVELOPE_OUTSIDE_GEOFENCE");
       return;
     }
-    if (!plan_dirty_) {
+    const bool map_preparation_pending = raw_grid_generation_ != map_generation_ ||
+      raw_grid_map_stamp_ns_ != map_stamp_.nanoseconds();
+    const bool map_preparation_due = !raw_grid_ || (map_preparation_pending &&
+      now - last_map_preparation_ >= map_preparation_period_);
+    if (!plan_dirty_ && !map_preparation_due) {
       publish_path(accepted_path_, path_pub_);
       publish_reference();
       std_msgs::msg::Int32 path_generation;
@@ -620,21 +680,28 @@ private:
       }
       try {
         auto output = planning_future_.get();
-        const bool pose_matches =
-          std::hypot(pose_->x - output.planned_pose.x, pose_->y - output.planned_pose.y) <
-          voxel_size_ * 0.5 &&
-          std::abs(pose_->z - output.planned_pose.z) < voxel_size_ * 0.5;
-        const bool current = output.map_generation == map_generation_ &&
-          output.map_stamp_ns == map_stamp_.nanoseconds() &&
-          output.goal_generation == goal_generation_ && pose_matches;
+        const auto pose_in_source = reframe_map_point_3d(
+          *pose_, map_from_odom_, output.map_from_odom);
+        const bool pose_matches = std::hypot(
+          std::hypot(pose_in_source.x - output.planned_pose.x,
+          pose_in_source.y - output.planned_pose.y),
+          pose_in_source.z - output.planned_pose.z) <= planning_pose_drift_tolerance_;
+        const bool connector_clear = output.result.path.empty() || swept_sphere_clear(
+          *output.raw, pose_in_source, output.result.path.front(), config_.lethal_radius);
+        const bool source_is_current = output.map_generation == map_generation_ &&
+          output.map_stamp_ns == map_stamp_.nanoseconds();
+        const bool current = output.goal_generation == goal_generation_ && pose_matches &&
+          connector_clear && (source_is_current || output.result.found());
         if (current) {
           reference_path_ = std::move(output.reference_path);
           reference_info_ = std::move(output.reference_info);
+          reference_map_generation_ = output.map_generation;
+          reference_map_stamp_ns_ = output.map_stamp_ns;
           plan_timing_ = std::move(output.timing);
           publish_reference();
           publish_candidate(output.exploration_route ? reference_path_ : output.result.path);
           publish_markers(*output.raw, output.result, output.probe);
-          last_planned_pose_ = output.planned_pose;
+          last_planned_pose_ = *pose_;
           if (!output.result.found()) {
             fail_closed(output.result.reason, &output.probe);
             // The same immutable inputs cannot produce a different answer.
@@ -646,6 +713,7 @@ private:
           accepted_goal_terminal_ = output.result.goal && output.result.goal->terminal;
           accepted_path_ = output.result.path;
           path_map_generation_ = output.map_generation;
+          path_map_stamp_ns_ = output.map_stamp_ns;
           publish_path(accepted_path_, path_pub_);
           std_msgs::msg::Int32 path_generation;
           path_generation.data = static_cast<std::int32_t>(path_map_generation_);
@@ -658,6 +726,14 @@ private:
         // The completed job is obsolete. There is deliberately no queue: the
         // latest coherent map/pose/goal snapshot below replaces every update
         // which arrived while this job was running.
+        if (!source_is_current) {
+          // Do not spin on a negative or disconnected result from an older
+          // prepared map. Keep the retained route (if any) and wait until the
+          // bounded map-preparation interval permits a current-map refresh.
+          plan_dirty_ = false;
+          publish_status("WAITING_FOR_MAP_PREPARATION");
+          return;
+        }
         plan_dirty_ = true;
       } catch (const std::exception & error) {
         RCLCPP_ERROR(get_logger(), "3D planning worker failed: %s", error.what());
@@ -666,27 +742,33 @@ private:
       }
     }
 
-    if (!raw_grid_ || raw_grid_generation_ != map_generation_) {
+    if (map_preparation_due) {
       const auto grid_begin = steady_seconds();
       auto grid = make_planning_grid();
       if (!grid) {fail_closed("MAP_CROP_INVALID"); return;}
       raw_grid_ = std::make_shared<const VoxelGrid>(std::move(*grid));
       raw_grid_generation_ = map_generation_;
+      raw_grid_map_stamp_ns_ = map_stamp_.nanoseconds();
+      raw_grid_map_from_odom_ = map_from_odom_;
       raw_grid_ms_ = (steady_seconds() - grid_begin) * 1000.0;
+      last_map_preparation_ = now;
+      ++map_preparation_count_;
+    }
+    if (!raw_grid_) {
+      publish_status("WAITING_FOR_MAP_PREPARATION");
+      return;
     }
     PlanningRequest request;
     request.raw = raw_grid_;
-    request.pose = *pose_;
+    request.geofence_mask = geofence_mask_;
+    request.pose = reframe_map_point_3d(*pose_, map_from_odom_, raw_grid_map_from_odom_);
     request.goal = *goal_;
-    request.takeoff_center = *takeoff_center_;
     request.config = config_;
-    request.map_generation = map_generation_;
-    request.map_stamp_ns = map_stamp_.nanoseconds();
+    request.map_generation = raw_grid_generation_;
+    request.map_stamp_ns = raw_grid_map_stamp_ns_;
     request.goal_generation = goal_generation_;
+    request.map_from_odom = raw_grid_map_from_odom_;
     request.exploration_route = exploration_route_;
-    request.planning_radius_xy = planning_radius_xy_;
-    request.min_z = min_z_;
-    request.max_z = max_z_;
     request.grid_ms = raw_grid_ms_;
     auto cache = planning_worker_cache_;
     planning_future_ = std::async(
@@ -725,17 +807,43 @@ private:
     status["current_goal_min_height_above_start"] = current_goal_min_height_above_start_;
     status["goal_height_pending"] = pending_current_goal_.has_value();
     status["exploration_route"] = exploration_route_;
-    if (!reference_info_.empty() && reference_info_["map_generation"] == map_generation_ &&
-      reference_info_["goal_generation"] == goal_generation_) {status["reference_route"] = reference_info_;}
-    if (!plan_timing_.empty() && plan_timing_["map_generation"] == map_generation_) {
+    status["prepared_map_generation"] = raw_grid_generation_;
+    status["prepared_map_stamp_ns"] = raw_grid_map_stamp_ns_;
+    status["map_preparation_pending"] = raw_grid_generation_ != map_generation_ ||
+      raw_grid_map_stamp_ns_ != map_stamp_.nanoseconds();
+    status["map_preparation_period_s"] = map_preparation_period_;
+    status["map_preparation_count"] = map_preparation_count_;
+    status["planning_pose_drift_tolerance_m"] = planning_pose_drift_tolerance_;
+    if (!reference_info_.empty() &&
+      reference_info_["goal_generation"] == goal_generation_) {
+      status["reference_route"] = reference_info_;
+      status["reference_route"]["source_is_current"] =
+        reference_map_generation_ == map_generation_ &&
+        reference_map_stamp_ns_ == map_stamp_.nanoseconds();
+    }
+    if (!plan_timing_.empty()) {
       status["last_plan_timing"] = plan_timing_;
+      status["last_plan_timing"]["source_is_current"] =
+        plan_timing_.value("map_generation", std::int64_t(-1)) == map_generation_;
     }
     if (clicked_goal_) {status["clicked_goal"] = {clicked_goal_->x, clicked_goal_->y, clicked_goal_->z};}
   }
 
-  std::optional<VoxelGrid> make_planning_grid() const
+  std::optional<VoxelGrid> make_planning_grid()
   {
-    const auto resolution = octree_->getResolution();
+    std::unique_ptr<octomap::AbstractOcTree> octree;
+    try {
+      octree.reset(octomap_msgs::msgToMap(*map_message_));
+    } catch (const std::exception & error) {
+      RCLCPP_ERROR(get_logger(), "OctoMap deserialization failed: %s", error.what());
+      return std::nullopt;
+    }
+    if (!octree || (dynamic_cast<octomap::OcTree *>(octree.get()) == nullptr &&
+      dynamic_cast<octomap::ColorOcTree *>(octree.get()) == nullptr))
+    {
+      return std::nullopt;
+    }
+    const auto resolution = octree->getResolution();
     // Matching OctoMap's native resolution keeps every planner centre aligned
     // with an OctoMap key and avoids inventing sub-voxel free-space evidence.
     if (std::abs(resolution - voxel_size_) > 1.0e-6) {
@@ -766,44 +874,28 @@ private:
       return std::nullopt;
     }
     VoxelGrid grid(width, height, depth, resolution, origin);
-    if (const auto * tree = dynamic_cast<const octomap::OcTree *>(octree_.get())) {
+    if (const auto * tree = dynamic_cast<const octomap::OcTree *>(octree.get())) {
       fill_native_octomap_grid(*tree, grid);
-    } else if (const auto * tree = dynamic_cast<const octomap::ColorOcTree *>(octree_.get())) {
+    } else if (const auto * tree = dynamic_cast<const octomap::ColorOcTree *>(octree.get())) {
       fill_native_octomap_grid(*tree, grid);
     }
-    for (int z = 0; z < static_cast<int>(depth); ++z) {
-      for (int y = 0; y < static_cast<int>(height); ++y) {
-        for (int x = 0; x < static_cast<int>(width); ++x) {
-          const Voxel voxel{x, y, z};
-          const auto center = grid.voxel_center(voxel);
-          // The cylinder is the takeoff-centred XY geofence. Cells outside it
-          // stay unknown and are therefore hard obstacles.
-          if (std::hypot(
-              center.x - takeoff_center_->x, center.y - takeoff_center_->y) >
-            planning_radius_xy_)
-          {
-            grid.set(voxel, VoxelState::Unknown);
-            continue;
-          }
+    if (!geofence_mask_ || !geofence_mask_->matches(
+        grid, *takeoff_center_, planning_radius_xy_))
+    {
+      geofence_mask_ = make_geofence_mask(grid, *takeoff_center_, planning_radius_xy_);
+    }
+    for (int y = 0; y < static_cast<int>(height); ++y) {
+      for (int x = 0; x < static_cast<int>(width); ++x) {
+        if (geofence_mask_->inside[static_cast<std::size_t>(y) * width +
+          static_cast<std::size_t>(x)]) {continue;}
+        // The cylinder is the takeoff-centred XY geofence. Cells outside it
+        // stay unknown and are therefore hard obstacles.
+        for (int z = 0; z < static_cast<int>(depth); ++z) {
+          grid.set({x, y, z}, VoxelState::Unknown);
         }
       }
     }
     return grid;
-  }
-
-  std::optional<VoxelState> octomap_state(const Point3 & point) const
-  {
-    if (const auto * tree = dynamic_cast<const octomap::OcTree *>(octree_.get())) {
-      const auto * node = tree->search(point.x, point.y, point.z);
-      if (node == nullptr) {return std::nullopt;}
-      return tree->isNodeOccupied(node) ? VoxelState::Occupied : VoxelState::Free;
-    }
-    if (const auto * tree = dynamic_cast<const octomap::ColorOcTree *>(octree_.get())) {
-      const auto * node = tree->search(point.x, point.y, point.z);
-      if (node == nullptr) {return std::nullopt;}
-      return tree->isNodeOccupied(node) ? VoxelState::Occupied : VoxelState::Free;
-    }
-    return std::nullopt;
   }
 
   void publish_path(
@@ -828,8 +920,8 @@ private:
       for (const auto & point : points) {points_json.push_back({point.x, point.y, point.z});}
       std_msgs::msg::String snapshot;
       snapshot.data = nlohmann::json{{"stamp_ns", rclcpp::Time(message.header.stamp).nanoseconds()},
-        {"frame_id", frame_id_}, {"map_generation", map_generation_},
-        {"map_stamp_ns", map_stamp_.nanoseconds()}, {"lethal_radius", config_.lethal_radius},
+        {"frame_id", frame_id_}, {"map_generation", path_map_generation_},
+        {"map_stamp_ns", path_map_stamp_ns_}, {"lethal_radius", config_.lethal_radius},
         {"points", points_json}, {"goal_generation", goal_generation_}, {"goal_exact", accepted_goal_exact_},
         {"goal_terminal", accepted_goal_terminal_}, {"executable", true}}.dump();
       path_snapshot_pub_->publish(snapshot);
@@ -848,7 +940,8 @@ private:
     for (const auto & p : reference_path_) {points.push_back({p.x, p.y, p.z});}
     std_msgs::msg::String message;
     message.data = nlohmann::json{{"stamp_ns", now().nanoseconds()}, {"frame_id", frame_id_},
-      {"map_generation", map_generation_}, {"map_stamp_ns", map_stamp_.nanoseconds()},
+      {"map_generation", reference_map_generation_},
+      {"map_stamp_ns", reference_map_stamp_ns_},
       {"goal_generation", goal_generation_}, {"lethal_radius", config_.lethal_radius},
       {"executable", false}, {"unknown_policy", "penalized"},
       {"points", points}, {"verification", reference_info_}}.dump();
@@ -859,10 +952,14 @@ private:
   {
     if (!probe) {
       reference_path_.clear(); reference_info_ = nlohmann::ordered_json::object();
+      reference_map_generation_ = map_generation_;
+      reference_map_stamp_ns_ = map_stamp_.nanoseconds();
       publish_reference();
     }
     plan_dirty_ = true;
     accepted_path_.clear();
+    path_map_generation_ = map_generation_;
+    path_map_stamp_ns_ = map_stamp_.nanoseconds();
     accepted_goal_exact_ = accepted_goal_terminal_ = false;
     publish_path({}, path_pub_);
     publish_status(reason, probe);
@@ -1053,22 +1150,31 @@ private:
   double max_z_{};
   double map_timeout_{};
   double pose_timeout_{};
+  double map_preparation_period_{};
+  double planning_pose_drift_tolerance_{};
   std::size_t max_marker_voxels_{};
   bool require_map_metadata_{};
   Planner3DConfig config_;
   bool exploration_route_{};
   std::shared_ptr<const VoxelGrid> raw_grid_;
+  std::shared_ptr<const GeofenceMask> geofence_mask_;
   std::int64_t raw_grid_generation_{-1};
+  std::int64_t raw_grid_map_stamp_ns_{-1};
+  Pose3 raw_grid_map_from_odom_;
   double raw_grid_ms_{};
+  double last_map_preparation_{-std::numeric_limits<double>::infinity()};
+  std::uint64_t map_preparation_count_{};
   std::shared_ptr<PlanningWorkerCache> planning_worker_cache_{
     std::make_shared<PlanningWorkerCache>()};
   std::future<PlanningOutput> planning_future_;
   bool worker_completion_notified_{false};
   std::vector<Point3> reference_path_;
+  std::int64_t reference_map_generation_{};
+  std::int64_t reference_map_stamp_ns_{};
   nlohmann::ordered_json reference_info_;
   nlohmann::ordered_json plan_timing_;
-  std::unique_ptr<octomap::AbstractOcTree> octree_;
-  std::unique_ptr<octomap::AbstractOcTree> pending_octree_;
+  octomap_msgs::msg::Octomap::ConstSharedPtr map_message_;
+  octomap_msgs::msg::Octomap::ConstSharedPtr pending_map_message_;
   std::optional<MapMetadata> pending_metadata_;
   rclcpp::Time pending_map_stamp_{0, 0, RCL_ROS_TIME};
   std::optional<Point3> pose_;
@@ -1082,8 +1188,11 @@ private:
   double pose_received_{};
   std::int64_t map_generation_{};
   std::int64_t path_map_generation_{};
+  std::int64_t path_map_stamp_ns_{};
   std::int64_t goal_generation_{};
   rclcpp::Time map_stamp_{0, 0, RCL_ROS_TIME};
+  Pose3 map_from_odom_;
+  Pose3 pose_map_from_odom_;
   std::string source_pose_generation_;
   bool plan_dirty_{true};
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr map_sub_;

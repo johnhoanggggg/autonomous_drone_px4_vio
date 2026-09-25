@@ -81,6 +81,8 @@ def generate_launch_description():
         DeclareLaunchArgument("min_z", default_value="0.20"),
         DeclareLaunchArgument("max_z", default_value="2.00"),
         DeclareLaunchArgument("planning_rate_hz", default_value="2.0"),
+        DeclareLaunchArgument("map_preparation_period", default_value="2.0"),
+        DeclareLaunchArgument("planning_pose_drift_tolerance", default_value="0.10"),
         DeclareLaunchArgument("map_timeout", default_value="3.0"),
         DeclareLaunchArgument("pose_timeout", default_value="1.0"),
         DeclareLaunchArgument("start_recovery_radius", default_value="0.20"),
@@ -131,6 +133,9 @@ def generate_launch_description():
         "min_z": typed("min_z", float),
         "max_z": typed("max_z", float),
         "planning_rate_hz": typed("planning_rate_hz", float),
+        "map_preparation_period": typed("map_preparation_period", float),
+        "planning_pose_drift_tolerance": typed(
+            "planning_pose_drift_tolerance", float),
         "map_timeout": typed("map_timeout", float),
         "pose_timeout": typed("pose_timeout", float),
         "start_recovery_radius": typed("start_recovery_radius", float),

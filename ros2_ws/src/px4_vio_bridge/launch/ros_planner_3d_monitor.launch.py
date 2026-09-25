@@ -53,6 +53,8 @@ def generate_launch_description():
         "grid_cluster_radius": "0.20", "grid_min_cluster_size": "20",
         "planning_radius_xy": "3.0", "robot_radius": "0.25", "safety_margin": "0.10",
         "voxel_size": "0.05", "max_marker_voxels": "5000",
+        "map_preparation_period": "2.0",
+        "planning_pose_drift_tolerance": "0.10",
         "camera_position_frd_x": "0.100", "camera_position_frd_y": "-0.036",
         "camera_position_frd_z": "0.056",
     }
@@ -94,7 +96,8 @@ def generate_launch_description():
                 "foxglove", "record_bag", "use_sim_time", "min_z", "max_z",
                 "planning_radius_xy", "robot_radius", "safety_margin", "voxel_size",
                 "max_marker_voxels", "process_monitor", "goal_height_mode", "exploration_route",
-                "current_goal_min_height_above_start")},
+                "current_goal_min_height_above_start", "map_preparation_period",
+                "planning_pose_drift_tolerance")},
             "octomap_producer": "false", "simulate": "false",
             # The flight adapter has its own stateful 3D follower and validates
             # every current OctoMap. The monitor follower duplicates swept

@@ -111,7 +111,11 @@ def test_ros_octomap_navigation_faults(tmp_path):
         start("rtabmap_octomap_node")
         pose_process = start("cpp_ros_planner_pose")
         common = {"pose_snapshot_topic": "/planner3d/pose_snapshot", "min_z": 0.2,
-                  "max_z": 2.0, "planning_radius_xy": 3.0}
+                  "max_z": 2.0, "planning_radius_xy": 3.0,
+                  # This legacy observation follower only consumes routes from
+                  # the exact current generation. Flight uses the independent
+                  # adapter, which reframes and validates retained routes.
+                  "map_preparation_period": 0.0}
         planner_process = start("cpp_astar_planner_3d", {**common, "voxel_size": 0.1, "planning_timeout_ms": 1000.0})
         start("cpp_route_follower_3d", {**common, "vio_frame_id": "rtabmap_odom"})
         last_odom = last_map = last_goal = 0.0
@@ -426,8 +430,12 @@ def test_ros_octomap_navigation_faults(tmp_path):
         assert value("/planner3d/status")["goal_height_pending"]
         mode = "normal"
         # The rejected click is buffered. Recovery must not depend on another
-        # publication or another user click.
+        # publication or another user click. Freeze generation churn because
+        # this legacy observation follower (unlike the flight adapter) accepts
+        # only an exact-generation path.
+        map_enabled = False
         wait_for(following, pump=pump)
+        map_enabled = True
         assert not value("/planner3d/status")["goal_height_pending"]
         assert value("/planner3d/status")["requested_goal"][2] == pytest.approx(1.156)
         goal_enabled = True

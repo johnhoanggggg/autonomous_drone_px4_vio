@@ -237,6 +237,8 @@ def test_3d_recording_includes_cpu_and_artificial_start_evidence():
             action.execute(context)
     assert context.launch_configurations['process_monitor'] == 'true'
     assert context.launch_configurations['exploration_route'] == 'true'
+    assert context.launch_configurations['map_preparation_period'] == '2.0'
+    assert context.launch_configurations['planning_pose_drift_tolerance'] == '0.10'
     recorder = next(a for a in ld.entities if type(a) is ExecuteProcess)
     command = [perform_substitutions(context, part) for part in recorder.cmd]
     for topic in ('/perf/processes', '/perf/cpu_percent', '/perf/throttled',
