@@ -314,9 +314,12 @@ def test_ros_octomap_navigation_faults(tmp_path):
         # Drain a map already published by pump before freezing the pose relay;
         # otherwise the ordinary one-generation handoff can mask the injected
         # same-generation correction fault with POSE_STALE.
+        drain_until = time.monotonic() + 0.3
+        wait_for(lambda: time.monotonic() >= drain_until, pump=pump)
         wait_for(lambda: following() and
                  value("/planner3d/follower/status").get("pose_map_generation") ==
-                 value("/planner3d/follower/status").get("map_generation"), pump=pump)
+                 value("/planner3d/follower/status").get("map_generation") ==
+                 value("/planner3d/pose_status").get("map_generation"), pump=pump)
         os.killpg(pose_process.pid, signal.SIGSTOP)
         try:
             bad = value("/planner3d/pose_snapshot")
