@@ -76,6 +76,27 @@ TEST(GridPlanner3D, SweptSphereRejectsUnknownAndOutsideVolume)
   EXPECT_FALSE(p::swept_sphere_clear(raw, {0.05, 0.5, 0.5}, {0.5, 0.5, 0.5}, 0.1));
 }
 
+TEST(GridPlanner3D, ExplorationConnectorAllowsUnknownButNeverOccupied)
+{
+  p::VoxelGrid raw(20, 20, 20, 0.1, {0.0, 0.0, 0.0}, p::VoxelState::Unknown);
+  const p::Point3 start{0.5, 0.5, 0.5}, end{1.5, 0.5, 0.5};
+  EXPECT_FALSE(p::swept_sphere_clear(raw, start, end, 0.1));
+  EXPECT_TRUE(p::swept_sphere_clear_with_unknown_policy(raw, start, end, 0.1, true));
+  raw.set({10, 5, 5}, p::VoxelState::Occupied);
+  EXPECT_FALSE(p::swept_sphere_clear_with_unknown_policy(raw, start, end, 0.1, true));
+}
+
+TEST(GridPlanner3D, ExplorationConnectorRetainsHardCylindricalGeofence)
+{
+  const p::Point3 center{0.0, 0.0, 0.0};
+  EXPECT_TRUE(p::swept_sphere_inside_cylinder(
+    {0.0, 0.0, 0.5}, {0.7, 0.0, 0.5}, center, 1.0, 0.0, 1.0, 0.2));
+  EXPECT_FALSE(p::swept_sphere_inside_cylinder(
+    {0.0, 0.0, 0.5}, {0.81, 0.0, 0.5}, center, 1.0, 0.0, 1.0, 0.2));
+  EXPECT_FALSE(p::swept_sphere_inside_cylinder(
+    {0.0, 0.0, 0.5}, {0.7, 0.0, 0.85}, center, 1.0, 0.0, 1.0, 0.2));
+}
+
 TEST(GridPlanner3D, ExactSphereClearanceAllowsVoxelizedHalfMetreBubble)
 {
   constexpr double resolution = 0.05;

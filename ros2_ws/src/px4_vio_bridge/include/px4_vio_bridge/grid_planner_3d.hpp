@@ -139,6 +139,18 @@ struct SphereBlockers3D
   const VoxelGrid & raw, const Point3 & start, const Point3 & end,
   double radius);
 
+// The exploration flight policy may traverse unknown space, but never known
+// occupied voxels. Map bounds remain hard in both modes.
+[[nodiscard]] bool swept_sphere_clear_with_unknown_policy(
+  const VoxelGrid & raw, const Point3 & start, const Point3 & end,
+  double radius, bool allow_unknown);
+
+// A cylinder is convex, so keeping both segment endpoints inside its
+// sphere-shrunken bounds proves the complete swept envelope remains inside.
+[[nodiscard]] bool swept_sphere_inside_cylinder(
+  const Point3 & start, const Point3 & end, const Point3 & center,
+  double cylinder_radius, double min_z, double max_z, double sphere_radius);
+
 [[nodiscard]] std::vector<Point3> simplify_path_3d(
   const VoxelGrid & raw, const std::vector<Point3> & path, double radius);
 

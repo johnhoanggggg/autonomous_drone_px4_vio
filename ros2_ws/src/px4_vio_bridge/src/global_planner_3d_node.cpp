@@ -289,6 +289,7 @@ private:
   struct PlanningOutput
   {
     std::shared_ptr<const VoxelGrid> raw;
+    std::shared_ptr<const GeofenceMask> geofence_mask;
     Point3 planned_pose;
     Point3 requested_goal;
     PlanResult3D result;
@@ -403,6 +404,7 @@ private:
       *request.raw, request.pose, request.goal, request.config.lethal_radius);
     PlanningOutput output;
     output.raw = std::move(request.raw);
+    output.geofence_mask = std::move(request.geofence_mask);
     output.planned_pose = request.pose;
     output.requested_goal = request.goal;
     output.result = std::move(result);
@@ -693,30 +695,49 @@ private:
           pose_in_source.z - output.planned_pose.z);
         const bool pose_matches =
           pose_drift <= planning_pose_drift_tolerance_ + 1.0e-12;
-        const Point3 * route_entry = !output.result.path.empty() ?
-          &output.result.path.front() : (!output.reference_path.empty() ?
-          &output.reference_path.front() : nullptr);
-        const bool connector_clear = !route_entry || swept_sphere_clear(
+        const bool has_reference_route = output.exploration_route &&
+          output.reference_path.size() >= 2;
+        const bool route_found = output.result.found() || has_reference_route;
+        const Point3 * route_entry = has_reference_route ?
+          &output.reference_path.front() : (!output.result.path.empty() ?
+          &output.result.path.front() : nullptr);
+        const bool strict_connector_clear = !route_entry || swept_sphere_clear(
           *output.raw, pose_in_source, *route_entry, config_.lethal_radius);
+        const bool connector_inside_geofence = !route_entry ||
+          (output.geofence_mask && swept_sphere_inside_cylinder(
+            pose_in_source, *route_entry, output.geofence_mask->center,
+            output.geofence_mask->radius, min_z_, max_z_, config_.lethal_radius));
+        const bool connector_clear = !route_entry || (connector_inside_geofence &&
+          swept_sphere_clear_with_unknown_policy(
+            *output.raw, pose_in_source, *route_entry, config_.lethal_radius,
+            has_reference_route));
         const bool source_is_current = output.map_generation == map_generation_ &&
           output.map_stamp_ns == map_stamp_.nanoseconds();
         const bool current = output.goal_generation == goal_generation_ && pose_matches &&
-          connector_clear && (source_is_current || output.result.found());
+          connector_clear && (source_is_current || route_found);
         if (current) {
           // A completed plan remains usable after bounded motion only if the
           // verified connector is part of the route handed to consumers.
           if (pose_drift > 1.0e-9) {
-            if (!output.result.path.empty()) {
+            if (!output.result.path.empty() && strict_connector_clear) {
               output.result.path.insert(output.result.path.begin(), pose_in_source);
+            } else if (!strict_connector_clear) {
+              output.result.path.clear();
             }
             if (!output.reference_path.empty()) {
               output.reference_path.insert(output.reference_path.begin(), pose_in_source);
               output.reference_info["length_m"] =
                 output.reference_info.value("length_m", 0.0) + pose_drift;
-              output.reference_info["verified_prefix_m"] =
-                output.reference_info.value("verified_prefix_m", 0.0) + pose_drift;
-              output.reference_info["verified_local_path_m"] =
-                output.reference_info.value("verified_local_path_m", 0.0) + pose_drift;
+              if (strict_connector_clear) {
+                output.reference_info["verified_prefix_m"] =
+                  output.reference_info.value("verified_prefix_m", 0.0) + pose_drift;
+                output.reference_info["verified_local_path_m"] =
+                  output.reference_info.value("verified_local_path_m", 0.0) + pose_drift;
+              } else {
+                output.reference_info["fully_verified"] = false;
+                output.reference_info["verified_prefix_m"] = 0.0;
+                output.reference_info["verified_local_path_m"] = 0.0;
+              }
             }
           }
           reference_path_ = std::move(output.reference_path);
@@ -754,7 +775,19 @@ private:
         // The completed job is obsolete. There is deliberately no queue: the
         // latest coherent map/pose/goal snapshot below replaces every update
         // which arrived while this job was running.
-        if (!source_is_current) {
+        if (output.goal_generation != goal_generation_ || !pose_matches) {
+          // Reuse the prepared source map immediately for a new goal or pose;
+          // these inputs can change the result without another preparation.
+          plan_dirty_ = true;
+        } else if (!connector_clear) {
+          // The immutable route cannot be joined safely from this pose. Do not
+          // recompute the identical job every 20 ms; pose motion or the next
+          // prepared map will make it dirty again.
+          last_planned_pose_ = *pose_;
+          plan_dirty_ = false;
+          publish_status("PLAN_CONNECTOR_BLOCKED");
+          return;
+        } else if (!source_is_current) {
           // Do not spin on a negative or disconnected result from an older
           // prepared map. Keep the retained route (if any) and wait until the
           // bounded map-preparation interval permits a current-map refresh.
@@ -762,7 +795,6 @@ private:
           publish_status("WAITING_FOR_MAP_PREPARATION");
           return;
         }
-        plan_dirty_ = true;
       } catch (const std::exception & error) {
         RCLCPP_ERROR(get_logger(), "3D planning worker failed: %s", error.what());
         fail_closed("PLANNING_WORKER_FAILED");

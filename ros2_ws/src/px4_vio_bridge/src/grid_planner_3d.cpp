@@ -635,6 +635,13 @@ SearchResult3D astar_3d(
 bool swept_sphere_clear(
   const VoxelGrid & raw, const Point3 & start, const Point3 & end, double radius)
 {
+  return swept_sphere_clear_with_unknown_policy(raw, start, end, radius, false);
+}
+
+bool swept_sphere_clear_with_unknown_policy(
+  const VoxelGrid & raw, const Point3 & start, const Point3 & end, double radius,
+  bool allow_unknown)
+{
   if (!std::isfinite(radius) || radius < 0.0 ||
     !std::isfinite(start.x) || !std::isfinite(start.y) || !std::isfinite(start.z) ||
     !std::isfinite(end.x) || !std::isfinite(end.y) || !std::isfinite(end.z))
@@ -683,7 +690,10 @@ bool swept_sphere_clear(
     for (int y = low_y; y <= high_y; ++y) {
       for (int x = low_x; x <= high_x; ++x) {
         const Voxel voxel{x, y, z};
-        if (raw.at(voxel) == VoxelState::Free) {continue;}
+        const auto state = raw.at(voxel);
+        if (state == VoxelState::Free || (allow_unknown && state == VoxelState::Unknown)) {
+          continue;
+        }
         const Point3 lower{
           raw.origin().x + x * resolution,
           raw.origin().y + y * resolution,
@@ -699,6 +709,30 @@ bool swept_sphere_clear(
     }
   }
   return true;
+}
+
+bool swept_sphere_inside_cylinder(
+  const Point3 & start, const Point3 & end, const Point3 & center,
+  double cylinder_radius, double min_z, double max_z, double sphere_radius)
+{
+  if (!std::isfinite(start.x) || !std::isfinite(start.y) || !std::isfinite(start.z) ||
+    !std::isfinite(end.x) || !std::isfinite(end.y) || !std::isfinite(end.z) ||
+    !std::isfinite(center.x) || !std::isfinite(center.y) || !std::isfinite(center.z) ||
+    !std::isfinite(cylinder_radius) || !std::isfinite(min_z) || !std::isfinite(max_z) ||
+    !std::isfinite(sphere_radius) || cylinder_radius <= 0.0 || sphere_radius < 0.0 ||
+    min_z >= max_z || sphere_radius > cylinder_radius ||
+    min_z + sphere_radius > max_z - sphere_radius)
+  {
+    return false;
+  }
+  const auto usable_radius = cylinder_radius - sphere_radius;
+  const auto inside = [&](const Point3 & point) {
+      return std::hypot(point.x - center.x, point.y - center.y) <=
+             usable_radius + 1.0e-12 &&
+             point.z >= min_z + sphere_radius - 1.0e-12 &&
+             point.z <= max_z - sphere_radius + 1.0e-12;
+    };
+  return inside(start) && inside(end);
 }
 
 std::vector<Point3> simplify_path_3d(
