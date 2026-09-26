@@ -126,6 +126,7 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
     pre_hover_path_pending = True; path_generation_lag = 0; map_history = {}
     preflight_ready = False
     fault = None; obstacle = None; external_offset = [0., 0., 0.]; drift_velocity = [0., 0.]
+    pose_lag = False; map_published_at = 0.
     # Use native voxel centres. Coordinates on cell boundaries can round into
     # an adjacent OctoMap key and leave a checkerboard of accidental unknowns.
     free_points = [((x+.5)*.05, (y+.5)*.05, (z+.5)*.05)
@@ -135,7 +136,7 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
     def status(): return json.loads(received['status'][-1].data) if received['status'] else {}
 
     def pump():
-        nonlocal armed, offboard, generation, map_stamp, next_map, next_path, last_pump, command_index, pre_hover_path_pending
+        nonlocal armed, offboard, generation, map_stamp, next_map, next_path, last_pump, command_index, pre_hover_path_pending, map_published_at
         now = time.monotonic()
         if now-last_pump < .02: return
         last_pump = now
@@ -176,7 +177,7 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         info=OdomInfo();info.header.stamp=pose.header.stamp;info.inliers=100;info.lost=False
         if fault != 'lost_info': pub['/rtabmap/vio_odom_info_lite'].publish(info)
         if now>=next_map:
-            generation += 1;map_stamp=ns;next_map=now+1.
+            generation += 1;map_stamp=ns;next_map=now+1.;map_published_at=now
             tree=Octomap();tree.header.frame_id='world';tree.header.stamp=pose.header.stamp
             tree.id='OcTree';tree.binary=True;tree.resolution=.05
             tree.data=(occupied_tree([obstacle], free_points=free_points)
@@ -189,8 +190,12 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
             pub['/rtabmap/octomap_metadata'].publish(metadata_msg);record('/rtabmap/octomap_metadata',metadata_msg)
         correction=[.1 if fault=='correction' else 0,0,0,0,0,0,1]
         mapped=[body[0]+correction[0],body[1],body[2]]
+        # The real pose relay pairs with a new map ~0.1 s after it is published.
+        pose_generation, pose_map_stamp = generation, map_stamp
+        if pose_lag and now-map_published_at < .15 and generation-1 in map_history:
+            pose_generation = generation-1; pose_map_stamp = map_history[pose_generation][0]
         snapshot={'stamp_ns':ns,'frame_id':'world','odom_frame_id':'rtabmap_odom',
-                  'map_generation':generation,'map_stamp_ns':map_stamp,'raw_pose':body+[0,0,pose.pose.orientation.z,pose.pose.orientation.w],
+                  'map_generation':pose_generation,'map_stamp_ns':pose_map_stamp,'raw_pose':body+[0,0,pose.pose.orientation.z,pose.pose.orientation.w],
                   'pose':mapped+[0,0,pose.pose.orientation.z,pose.pose.orientation.w],'correction':correction}
         if fault != 'pose': pub['/planner3d/pose_snapshot'].publish(String(data=json.dumps(snapshot)))
         if goal is not None and now>=next_path:
@@ -255,6 +260,15 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         wait(lambda:time.monotonic()>=until,seconds=.4)
         assert status().get('state')=='WAITING_FOR_GOAL'
         external_offset[2] = 0.
+        # While hovering for the route: a pose relay that lags each new map by 0.15 s must not fault: the
+        # adapter adopts a map only together with a matching pose snapshot.
+        pose_lag=True;first_status=len(received['status'])
+        until=time.monotonic()+2.3
+        wait(lambda:time.monotonic()>=until,seconds=2.8)
+        lagged=[json.loads(m.data) for m in received['status'][first_status:]]
+        assert lagged and not any(s.get('fault')=='POSE_MAP_MISMATCH' for s in lagged)
+        assert max(s['map_generation'] for s in lagged)>min(s['map_generation'] for s in lagged)
+        pose_lag=False
         # A transient input fault must freeze the last safe command, not adopt
         # the disturbed vehicle position. Alternating fault/recovery did the
         # latter in flight and ratcheted the takeoff hold by 0.51 m.
@@ -302,6 +316,12 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
             assert abs(math.remainder(float(received['setpoints'][-1].yaw)-yaw_before,2*math.pi))<math.radians(2.)
             external_offset[0]=0.;next_path=0.
             wait(lambda:status().get('state')=='FOLLOWING')
+        # Following feeds the limiter velocity forward, bounded by command_speed.
+        wait(lambda:status().get('state')=='FOLLOWING' and
+             math.isfinite(float(received['setpoints'][-1].velocity[0])),seconds=2.)
+        feedforward=[float(x) for x in received['setpoints'][-1].velocity]
+        assert all(math.isfinite(x) for x in feedforward)
+        assert math.hypot(feedforward[0],feedforward[1])<=.3*1.01
         before=position[:]
         for injected,expected in [('pose','POSE_STALE'),('correction','POSE_MAP_MISMATCH'),('path_frame','PATH_STALE')]:
             fault=injected;next_path=0.
@@ -312,6 +332,8 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
             until=time.monotonic()+.15
             wait(lambda:time.monotonic()>=until,seconds=.4)
             assert math.dist([float(x) for x in received['setpoints'][-1].position],held)<1e-6
+            # Holds are pure position control: no velocity feedforward.
+            assert math.isnan(float(received['setpoints'][-1].velocity[0]))
             fault=None;next_path=0.
             wait(lambda:status().get('state')=='FOLLOWING')
             assert status()['follower_latched'] is False

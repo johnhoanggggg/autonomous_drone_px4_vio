@@ -63,6 +63,15 @@ public:
     // 20260926T003738Z yawed 98->78->98 deg on one and slid into a corner.
     config_.heading_lookahead=declare_parameter<double>("heading_lookahead",.60);
     yaw_deadband_=declare_parameter<double>("yaw_deadband_deg",10.0)*M_PI/180;
+    // Position-only following trails the command by speed/MPC_XY_P (~0.16 m
+    // at 0.15 m/s), so every lateral correction starts late (20260926T021056Z
+    // wall contacts). Feed the limiter's velocity forward while a clearance-
+    // checked route command advances; holds and escapes stay pure position.
+    route_velocity_ff_=declare_parameter<bool>("route_velocity_feedforward",true);
+    // A new map is only adopted together with a pose snapshot of the same
+    // generation, so the ~0.1 s relay lag no longer faults POSE_MAP_MISMATCH
+    // every map update. After this long unpaired, adopt it anyway (old path).
+    map_pair_wait_=declare_parameter<double>("map_pose_pair_wait",.30);
     config_.max_cross_track=declare_parameter<double>("max_cross_track",.15);
     config_.max_vertical_track=declare_parameter<double>("max_vertical_track",.15);
     config_.stop_at_vertices=true;
@@ -96,6 +105,7 @@ public:
       hover_height_>max_height_ || geofence_<=radius_ || !std::isfinite(yaw_offset_) ||
       !std::isfinite(yaw_align_) || !std::isfinite(yaw_resume_) || yaw_resume_<0 || yaw_align_<yaw_resume_ ||
       !std::isfinite(config_.heading_lookahead) || config_.heading_lookahead<0 ||
+      !std::isfinite(map_pair_wait_) || map_pair_wait_<0 ||
       !std::isfinite(yaw_deadband_) || yaw_deadband_<0 || yaw_deadband_>=yaw_resume_ ||
       route_equivalence_tolerance_>std::min(config_.max_cross_track,config_.max_vertical_track))
     {throw std::invalid_argument("invalid 3D flight bounds or yaw limits");}
@@ -158,7 +168,7 @@ public:
       {"command_vertical_acceleration",config_.max_vertical_acceleration},
       {"takeoff_profile","2d_ramp_z"},{"climb_rate",commanded_climb_rate_},
       {"climb_leash",climb_leash_},{"climb_release",climb_release_},
-      {"takeoff_vertical_feedforward",climb_feedforward_},{"route_feedforward",false},
+      {"takeoff_vertical_feedforward",climb_feedforward_},{"route_feedforward",route_velocity_ff_},{"map_pose_pair_wait",map_pair_wait_},
       {"fault_hold_policy","last_safe_command"},
       {"route_map_policy","odom_retained_revalidated_each_map"},
       {"path_timeout",path_timeout_},{"px4_position_timeout",px4_timeout_},
@@ -226,6 +236,10 @@ protected:
     m.timestamp=now_us();m.position={static_cast<float>(command_->x),static_cast<float>(command_->y),static_cast<float>(command_->z)};
     const float nan=std::numeric_limits<float>::quiet_NaN();
     m.velocity={nan,nan,vertical_velocity_?static_cast<float>(*vertical_velocity_):nan};
+    if (route_velocity_ff_ && state_==State::Route && !holding_ && clearance_checked_) {
+      const auto v=limiter_->velocity();
+      m.velocity={static_cast<float>(v.x),static_cast<float>(v.y),static_cast<float>(v.z)};
+    }
     const auto damping=hold_damping();
     m.acceleration={static_cast<float>(damping.first),static_cast<float>(damping.second),nan};
     m.jerk={nan,nan,nan};
@@ -235,6 +249,7 @@ protected:
   bool handle_flight_state() override
   {
     clearance_checked_=false;
+    commit_pairs();
     if (state_==State::Land || state_==State::Abort || state_==State::Done) {return false;}
     const bool routing=state_==State::Route;
     const auto reason=health(routing);
@@ -355,6 +370,8 @@ protected:
   }
 private:
   using Json=nlohmann::json;
+  struct StagedPose {Pose3 pose,correction;std::int64_t stamp{},generation{},map_stamp{};double received{};};
+  std::optional<StagedPose> staged_pose_;
   static std::int64_t stamp_of(const builtin_interfaces::msg::Time & t)
   {return static_cast<std::int64_t>(t.sec)*1000000000LL+t.nanosec;}
   void on_map(const octomap_msgs::msg::Octomap & m)
@@ -381,12 +398,44 @@ private:
     if (!pending_tree_ || pending_metadata_.is_null() || pending_metadata_.at("stamp_ns")!=pending_stamp_) {return;}
     if (!fresh_stamp(pending_stamp_,now().nanoseconds(),map_timeout_) ||
       std::abs(pending_tree_->getResolution()-pending_metadata_.at("resolution").get<double>())>1e-9) {return;}
-    tree_=std::move(pending_tree_);map_stamp_=pending_stamp_;generation_=pending_metadata_.at("generation");
-    map_correction_=snapshot_pose(pending_metadata_.at("map_from_odom"));
+    auto staged=std::make_unique<StagedMap>();
+    staged->tree=std::move(pending_tree_);staged->stamp=pending_stamp_;
+    staged->generation=pending_metadata_.at("generation");
+    staged->correction=snapshot_pose(pending_metadata_.at("map_from_odom"));
+    staged->artificial_clear=pending_metadata_.value("test_start_clear",Json::object()).value("enabled",false);
+    staged->since=monotonic_time();
+    staged_map_=std::move(staged);pending_metadata_=Json();
+    commit_pairs();
+  }
+  void commit_map()
+  {
+    tree_=std::move(staged_map_->tree);map_stamp_=staged_map_->stamp;generation_=staged_map_->generation;
+    map_correction_=staged_map_->correction;
     map_frames_.push_back({generation_,map_stamp_,map_correction_});
     while (map_frames_.size()>64) {map_frames_.pop_front();}
-    artificial_clear_=pending_metadata_.value("test_start_clear",Json::object()).value("enabled",false);
-    map_received_=monotonic_time();pending_metadata_=Json();
+    artificial_clear_=staged_map_->artificial_clear;
+    map_received_=monotonic_time();staged_map_.reset();
+  }
+  void apply_pose(const StagedPose & p)
+  {
+    pose_=p.pose;correction_=p.correction;pose_stamp_=p.stamp;pose_generation_=p.generation;
+    pose_map_stamp_=p.map_stamp;pose_received_=p.received;
+  }
+  // Adopt a staged map only with a pose snapshot of the same generation, so
+  // map, pose and correction always change together.
+  void commit_pairs()
+  {
+    if (!staged_map_) {return;}
+    const bool first=!tree_ || !pose_;
+    const bool pose_matches=pose_ && pose_generation_==staged_map_->generation &&
+      pose_map_stamp_==staged_map_->stamp;
+    const bool staged_matches=staged_pose_ && staged_pose_->generation==staged_map_->generation &&
+      staged_pose_->map_stamp==staged_map_->stamp;
+    const bool expired=monotonic_time()-staged_map_->since>=map_pair_wait_;
+    if (!(first || pose_matches || staged_matches || expired)) {return;}
+    commit_map();
+    if (staged_matches) {apply_pose(*staged_pose_);}
+    if (staged_pose_ && staged_pose_->generation<=generation_) {staged_pose_.reset();}
   }
   void on_pose(const std_msgs::msg::String & m)
   {
@@ -397,8 +446,12 @@ private:
         !fresh_stamp(stamp,now().nanoseconds(),max_vio_source_age_)) {throw std::invalid_argument("invalid pose time/frame");}
       const auto raw=snapshot_pose(j.at("raw_pose")),corr=snapshot_pose(j.at("correction")),pose=snapshot_pose(j.at("pose"));
       if (!same_snapshot_transform(apply_correction(corr,raw),pose)) {throw std::invalid_argument("inconsistent body pose");}
-      pose_=pose;correction_=corr;pose_stamp_=stamp;pose_generation_=j.at("map_generation");
-      pose_map_stamp_=j.at("map_stamp_ns");pose_received_=monotonic_time();
+      const StagedPose snapshot{pose,corr,stamp,j.at("map_generation").get<std::int64_t>(),
+        j.at("map_stamp_ns").get<std::int64_t>(),monotonic_time()};
+      // A pose for a map this node has not adopted yet waits (briefly) for
+      // that map instead of mismatching the current one.
+      if (tree_ && snapshot.generation>generation_) {staged_pose_=snapshot;commit_pairs();return;}
+      apply_pose(snapshot);commit_pairs();
     } catch (...) {pose_.reset();}
   }
   void on_path(const std_msgs::msg::String & m)
@@ -775,6 +828,10 @@ private:
   std::deque<MapFrame> map_frames_;
   Json pending_metadata_;
   std::unique_ptr<octomap::AbstractOcTree> tree_,pending_tree_;
+  struct StagedMap {std::unique_ptr<octomap::AbstractOcTree> tree;std::int64_t stamp{},generation{};
+    Pose3 correction;bool artificial_clear{};double since{};};
+  std::unique_ptr<StagedMap> staged_map_;
+  bool route_velocity_ff_{};double map_pair_wait_{};
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr map_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr metadata_sub_,pose_sub_,path_sub_;
   rclcpp::Subscription<rtabmap_msgs::msg::OdomInfo>::SharedPtr info_sub_;
