@@ -101,6 +101,56 @@ TEST(RouteFollower3D, ValidatesLookaheadAndCommandChords)
   EXPECT_EQ(calls, 2);
 }
 
+TEST(RouteFollower3D, RouteAheadChordIgnoresLateralErrorButTurnsBeforeCorners)
+{
+  p::Follower3DConfig config;
+  config.lookahead = 0.25;
+  config.max_cross_track = 0.20;
+  config.max_vertical_track = 0.20;
+  const auto clear = [](const auto &, const auto &) {return true;};
+  p::RouteFollower3D straight(config);
+  ASSERT_TRUE(straight.set_path({{0.0, 0.0, 0.5}, {2.0, 0.0, 0.5}}, {0.5, 0.10, 0.5}));
+  const auto offset = straight.update({0.5, 0.10, 0.5}, 0.1, clear);
+  ASSERT_TRUE(offset.valid);
+  // 10 cm left of a straight route: the chord stays exactly along the route.
+  EXPECT_NEAR(offset.route_ahead.x - offset.projection.point.x, 0.25, 1e-9);
+  EXPECT_NEAR(offset.route_ahead.y - offset.projection.point.y, 0.0, 1e-9);
+
+  p::RouteFollower3D corner(config);
+  ASSERT_TRUE(corner.set_path({{0.0, 0.0, 0.5}, {1.0, 0.0, 0.5}, {1.0, 1.0, 0.5}}, {0.9, 0.0, 0.5}));
+  const auto turning = corner.update({0.9, 0.0, 0.5}, 0.1, clear);
+  ASSERT_TRUE(turning.valid);
+  // 0.10 m before the corner the chord already bends onto the next leg.
+  EXPECT_NEAR(turning.route_ahead.x, 1.0, 1e-9);
+  EXPECT_NEAR(turning.route_ahead.y, 0.15, 1e-9);
+}
+
+TEST(RouteFollower3D, LongerHeadingChordDilutesAShortSidewaysConnector)
+{
+  p::Follower3DConfig config;
+  config.lookahead = 0.25;
+  config.max_cross_track = 0.20;
+  config.max_vertical_track = 0.20;
+  const auto clear = [](const auto &, const auto &) {return true;};
+  // A recovery route: a 6 cm sideways connector, then straight along +x.
+  const std::vector<p::Point3> route{{0.0, 0.0, 0.5}, {0.0, 0.06, 0.5}, {2.0, 0.06, 0.5}};
+  const auto heading = [](const p::FollowResult3D & r) {
+      return std::atan2(r.route_ahead.y - r.projection.point.y,
+        r.route_ahead.x - r.projection.point.x) * 180.0 / M_PI;
+    };
+  p::RouteFollower3D short_chord(config);
+  ASSERT_TRUE(short_chord.set_path(route, {0.0, 0.0, 0.5}));
+  const auto short_result = short_chord.update({0.0, 0.0, 0.5}, 0.1, clear);
+  ASSERT_TRUE(short_result.valid);
+  config.heading_lookahead = 0.60;
+  p::RouteFollower3D long_chord(config);
+  ASSERT_TRUE(long_chord.set_path(route, {0.0, 0.0, 0.5}));
+  const auto long_result = long_chord.update({0.0, 0.0, 0.5}, 0.1, clear);
+  ASSERT_TRUE(long_result.valid);
+  EXPECT_GT(heading(short_result), 15.0);  // 0.25 m chord: ~17 deg off the route
+  EXPECT_LT(heading(long_result), 7.0);    // 0.60 m chord: ~6 deg, inside a 10 deg deadband
+}
+
 TEST(RouteFollower3D, ArrivalUsesActualXYZEndpoint)
 {
   p::Follower3DConfig config;

@@ -23,6 +23,7 @@ def generate_launch_description():
         "grid_noise_radius": "0.15", "grid_noise_min_neighbors": "4",
         "grid_cluster_radius": "0.20", "grid_min_cluster_size": "20",
         "test_start_clear_radius": "0.0",
+        "test_start_clear_follow_disarmed": "true",
         "octomap_use_checkpoints": "true",
         "camera_position_frd_x": "0.100",
         "camera_position_frd_y": "-0.036",

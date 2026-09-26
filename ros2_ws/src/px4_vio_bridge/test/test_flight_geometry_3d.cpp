@@ -113,3 +113,51 @@ TEST(Flight3D, CornersDoNotRequireMillimetrePerfectVehicleTracking)
   }
   EXPECT_TRUE(reached);
 }
+
+namespace
+{
+px4_vio_bridge::BlockingBoxes3D wall_boxes(const std::vector<double> & wall_x)
+{
+  px4_vio_bridge::BlockingBoxes3D boxes;
+  boxes.half_size = 0.025;
+  boxes.cap = 0.5;
+  for (const double x : wall_x) {
+    for (int y = -12; y <= 12; ++y) {
+      for (int z = -12; z <= 12; ++z) {boxes.centers.push_back({x, 0.05 * y, 0.05 * z});}
+    }
+  }
+  return boxes;
+}
+}  // namespace
+
+TEST(Flight3D, HeldEscapeStepsAwayFromAWallAndNeverCloser)
+{
+  namespace p = px4_vio_bridge;
+  // Wall face at x=0.025; a body at x=0.285 is 0.26 m clear (flight B).
+  const auto boxes = wall_boxes({0.0});
+  const p::Point3 pose{0.285, 0.0, 0.0};
+  const double start = boxes.clearance(pose);
+  ASSERT_NEAR(start, 0.26, 1e-9);
+  const auto step = p::best_clearance_escape_step_3d(boxes, pose, 0.05, start, 0.01);
+  ASSERT_TRUE(step.has_value());
+  EXPECT_NEAR(p::distance_3d(*step, pose), 0.05, 1e-9);
+  EXPECT_GE(boxes.clearance(*step), start + 0.01);
+  EXPECT_GE(boxes.chord_clearance(pose, *step), start - 1e-6);
+  EXPECT_NEAR(step->x - pose.x, 0.05, 1e-9);  // straight away from the wall
+}
+
+TEST(Flight3D, HeldEscapeRefusesWhenNoStepGainsWithoutClosingOnSomething)
+{
+  namespace p = px4_vio_bridge;
+  // Centred in a slot between two tall walls: any sideways step closes on one
+  // wall, and vertical steps gain nothing within the walls' extent.
+  const auto boxes = wall_boxes({-0.3, 0.3});
+  const p::Point3 pose{0.0, 0.0, 0.0};
+  const double start = boxes.clearance(pose);
+  EXPECT_FALSE(p::best_clearance_escape_step_3d(boxes, pose, 0.05, start, 0.01).has_value());
+  // Open space is capped: nothing to gain, nothing proposed.
+  px4_vio_bridge::BlockingBoxes3D empty;
+  empty.half_size = 0.025;
+  empty.cap = 0.5;
+  EXPECT_FALSE(p::best_clearance_escape_step_3d(empty, pose, 0.05, empty.clearance(pose), 0.01).has_value());
+}

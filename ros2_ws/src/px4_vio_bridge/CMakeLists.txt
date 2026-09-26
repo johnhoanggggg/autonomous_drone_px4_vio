@@ -104,7 +104,7 @@ target_link_libraries(
   rtabmap_octomap_node rtabmap_octomap_cpp slam_pose_relay_cpp nlohmann_json::nlohmann_json
   rtabmap_conversions::rtabmap_conversions ${OCTOMAP_LIBRARIES})
 ament_target_dependencies(rtabmap_octomap_node
-  geometry_msgs nav_msgs octomap_msgs rclcpp rtabmap_conversions rtabmap_msgs std_msgs
+  geometry_msgs nav_msgs octomap_msgs px4_msgs rclcpp rtabmap_conversions rtabmap_msgs std_msgs
   visualization_msgs
 )
 

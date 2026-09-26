@@ -59,6 +59,7 @@ def generate_launch_description():
         DeclareLaunchArgument("start_mapper", default_value="true"),
         DeclareLaunchArgument("start_octomap", default_value="true"),
         DeclareLaunchArgument("test_start_clear_radius", default_value="0.0"),
+        DeclareLaunchArgument("test_start_clear_follow_disarmed", default_value="true"),
         DeclareLaunchArgument("octomap_use_checkpoints", default_value="true"),
         DeclareLaunchArgument("camera_position_frd_x", default_value="0.100"),
         DeclareLaunchArgument("camera_position_frd_y", default_value="-0.036"),
@@ -387,6 +388,7 @@ def generate_launch_description():
             "frame_id": "world",
             "octomap_topic": "/rtabmap/octomap",
             "test_start_clear_radius": typed("test_start_clear_radius", float),
+            "test_start_clear_follow_disarmed": typed("test_start_clear_follow_disarmed", bool),
             "octomap_use_checkpoints": typed("octomap_use_checkpoints", bool),
             **{key: typed(key, float) for key in (
                 "camera_position_frd_x", "camera_position_frd_y", "camera_position_frd_z")},

@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
+#include <px4_msgs/msg/vehicle_status.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rtabmap_conversions/MsgConversion.h>
 #include <rtabmap_msgs/msg/map_data.hpp>
@@ -60,7 +61,8 @@ public:
     }
     max_marker_voxels_ = static_cast<std::size_t>(max_marker_voxels);
     test_clear_radius_ = declare_parameter<double>("test_start_clear_radius", 0.0);
-    test_offset_ = {declare_parameter<double>("camera_position_frd_x", 0.100),
+    test_follow_disarmed_ = declare_parameter<bool>("test_start_clear_follow_disarmed", true);
+    test_offset_ ={declare_parameter<double>("camera_position_frd_x", 0.100),
       declare_parameter<double>("camera_position_frd_y", -0.036),
       declare_parameter<double>("camera_position_frd_z", 0.056)};
     if (!std::isfinite(test_clear_radius_) || test_clear_radius_ < 0.0 || test_clear_radius_ > 0.5 ||
@@ -68,7 +70,22 @@ public:
       std::hypot(test_offset_.x, test_offset_.y, test_offset_.z) > 1.0)
     {throw std::invalid_argument("invalid test start clearing configuration");}
     if (test_clear_radius_ > 0.0) {
-      RCLCPP_WARN(get_logger(), "TEST MAP: forcing a %.2f m start sphere free; re-anchor on each fresh waypoint", test_clear_radius_);
+      RCLCPP_WARN(get_logger(), "TEST MAP: forcing a %.2f m start sphere free; re-anchor on each fresh waypoint%s",
+        test_clear_radius_, test_follow_disarmed_ ? " and follow the body while PX4 reports disarmed" : "");
+      if (test_follow_disarmed_) {
+        // The adapter checks the takeoff chord before ARM. Re-flying without a
+        // new click left the sphere at the previous start (20260925T104250Z:
+        // 0.83 m away, TAKEOFF_OBSTACLE). While PX4 freshly reports DISARMED,
+        // track the body; once armed or stale, the takeoff anchor stays fixed.
+        test_status_sub_ = create_subscription<px4_msgs::msg::VehicleStatus>(
+          "/fmu/out/vehicle_status_v1",
+          rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().transient_local(),
+          [this](px4_msgs::msg::VehicleStatus::ConstSharedPtr msg) {
+            test_px4_disarmed_ =
+              msg->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED;
+            test_status_received_ = std::chrono::steady_clock::now();
+          });
+      }
       test_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         "/rtabmap/vio_odometry", rclcpp::SensorDataQoS().keep_last(1),
         [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
@@ -87,6 +104,14 @@ public:
               test_start_raw_ = test_latest_raw_;
               test_start_stamp_ = stamp;
               test_anchor_sequence_ = 1;
+              test_anchor_reason_ = "startup";
+            } else if (test_px4_disarmed_ && test_status_received_ &&
+              std::chrono::steady_clock::now() - *test_status_received_ <= kTestStatusTimeout)
+            {
+              test_start_raw_ = test_latest_raw_;
+              test_start_stamp_ = stamp;
+              ++test_anchor_sequence_;
+              test_anchor_reason_ = "disarmed";
             }
           } catch (const std::exception &) {return;}
         });
@@ -108,6 +133,7 @@ public:
           test_start_stamp_ = test_latest_stamp_;
           test_goal_stamp_ = stamp;
           ++test_anchor_sequence_;
+          test_anchor_reason_ = "waypoint";
         });
     }
     const auto output_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -234,7 +260,7 @@ private:
         {"center", {center.x, center.y, center.z}}, {"anchor_frame", "rtabmap_odom"},
         {"anchor_stamp_ns", test_start_stamp_}, {"raw_body_pose", pose_json(*test_start_raw_)},
         {"anchor_sequence", test_anchor_sequence_},
-        {"anchor_reason", test_goal_stamp_ > 0 ? "waypoint" : "startup"},
+        {"anchor_reason", test_anchor_reason_},
         {"goal_stamp_ns", test_goal_stamp_},
         {"cleared_voxels", cells}, {"observed_free", false}};
     }
@@ -395,6 +421,13 @@ private:
   std::int64_t test_latest_stamp_{};
   std::int64_t test_goal_stamp_{};
   std::int64_t test_anchor_sequence_{};
+  std::string test_anchor_reason_{"startup"};
+  bool test_follow_disarmed_{};
+  bool test_px4_disarmed_{};
+  // PX4 publishes vehicle_status at ~2 Hz; a stale report freezes the anchor.
+  static constexpr std::chrono::milliseconds kTestStatusTimeout{1500};
+  std::optional<std::chrono::steady_clock::time_point> test_status_received_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr test_status_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr test_goal_sub_;
   std::int64_t test_start_stamp_{};
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr test_odom_sub_;

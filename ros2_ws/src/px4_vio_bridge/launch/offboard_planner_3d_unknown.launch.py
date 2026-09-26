@@ -113,10 +113,13 @@ def generate_launch_description():
         'require_goal_after_hover': 'false', 'yaw_follows_heading': 'true',
         'yaw_rate_deg': '20.0', 'keyboard_kill': 'true', 'keyboard_land': 'true',
         'foxglove_teleop': 'true',
+        # Opt-in hold damping (gain 0.75, 0.10 m/s2 cap): opposes measured drift
+        # only while ROUTE holds a frozen command. Default OFF until flown.
+        'brake_damping': 'false',
     }
     booleans = {'auto_arm', 'climb_feedforward', 'require_goal_after_hover', 'yaw_follows_heading',
                 'require_px4_preflight_status',
-                'keyboard_kill', 'keyboard_land', 'foxglove_teleop'}
+                'keyboard_kill', 'keyboard_land', 'foxglove_teleop', 'brake_damping'}
     strings = {'vio_info_topic'}
     excluded = {'start_vio_bridge', 'record_bag', 'bag_output', 'adapter_start_delay',
                 'route_speed'}

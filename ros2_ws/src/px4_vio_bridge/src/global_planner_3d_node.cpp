@@ -203,8 +203,17 @@ public:
     config_.cost_weight = declare_parameter<double>("cost_weight", 2.0);
     config_.timeout_ms = declare_parameter<double>("planning_timeout_ms", 150.0);
     config_.start_recovery_radius = declare_parameter<double>("start_recovery_radius", 0.20);
+    // Matches the 3D flight adapter's narrow-gap required_clearance. Capped at
+    // lethal_radius; 0 restores RECOVERY_REQUIRED with no route.
+    recovery_connector_radius_ =
+      declare_parameter<double>("start_recovery_connector_radius", 0.30);
+    // Shortcuts keep up to this much clearance beyond lethal_radius, never
+    // more than the A* path they replace. Routes graze the lethal limit at 0.
+    config_.simplify_margin = declare_parameter<double>("route_margin", 0.10);
     const auto rate_hz = declare_parameter<double>("planning_rate_hz", 2.0);
     validate_config();
+    config_.recovery_connector_radius =
+      std::min(recovery_connector_radius_, config_.lethal_radius);
 
     const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     map_sub_ = create_subscription<octomap_msgs::msg::Octomap>(
@@ -389,6 +398,7 @@ private:
         {"local_route_mode", "prefix"},
         {"known_fallback_used", false},
         {"goal_exact", result.goal && result.goal->exact},
+        {"start_recovery", result.recovery_connector},
         {"executable", false}};
       result.path = std::move(verified);
       if (!complete && result.goal) {
@@ -448,7 +458,9 @@ private:
       !std::isfinite(inflation_extra_) || inflation_extra_ < 0.0 ||
       !std::isfinite(map_preparation_period_) || map_preparation_period_ < 0.0 ||
       !std::isfinite(planning_pose_drift_tolerance_) ||
-      planning_pose_drift_tolerance_ <= 0.0)
+      planning_pose_drift_tolerance_ <= 0.0 ||
+      !std::isfinite(recovery_connector_radius_) || recovery_connector_radius_ < 0.0 ||
+      !std::isfinite(config_.simplify_margin) || config_.simplify_margin < 0.0)
     {
       throw std::invalid_argument(
               "invalid 3D configuration (requires safety_margin>=0.10 and "
@@ -707,9 +719,13 @@ private:
           (output.geofence_mask && swept_sphere_inside_cylinder(
             pose_in_source, *route_entry, output.geofence_mask->center,
             output.geofence_mask->radius, min_z_, max_z_, config_.lethal_radius));
+        // A recovery plan starts inside lethal_radius by construction; join it
+        // at the same explicit radius the planner used for its first leg.
+        const double connector_radius = output.result.recovery_connector ?
+          config_.recovery_connector_radius : config_.lethal_radius;
         const bool connector_clear = !route_entry || (connector_inside_geofence &&
           swept_sphere_clear_with_unknown_policy(
-            *output.raw, pose_in_source, *route_entry, config_.lethal_radius,
+            *output.raw, pose_in_source, *route_entry, connector_radius,
             has_reference_route));
         const bool source_is_current = output.map_generation == map_generation_ &&
           output.map_stamp_ns == map_stamp_.nanoseconds();
@@ -861,6 +877,8 @@ private:
       {"min_center_z", min_z_ + config_.lethal_radius},
       {"max_center_z", max_z_ - config_.lethal_radius}};
     status["lethal_radius"] = config_.lethal_radius;
+    status["recovery_connector_radius"] = config_.recovery_connector_radius;
+    status["route_margin"] = config_.simplify_margin;
     if (pose_) {status["start"] = {pose_->x, pose_->y, pose_->z};}
     if (goal_) {status["requested_goal"] = {goal_->x, goal_->y, goal_->z};}
     status["goal_height_mode"] = goal_height_mode_;
@@ -1222,6 +1240,7 @@ private:
   double pose_timeout_{};
   double map_preparation_period_{};
   double planning_pose_drift_tolerance_{};
+  double recovery_connector_radius_{};
   std::size_t max_marker_voxels_{};
   bool require_map_metadata_{};
   Planner3DConfig config_;

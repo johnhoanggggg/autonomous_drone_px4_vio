@@ -109,7 +109,8 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
               'require_px4_preflight_status': True, 'px4_preflight_timeout': 1.,
               'stream_time': .2, 'climb_timeout': 8., 'planner_fault_land_time': 1.5,
               'max_flight_time': 90., 'goal_hold_time': 20., 'keyboard_kill': False,
-              'keyboard_land': False, 'yaw_follows_heading': auto_arm, 'yaw_rate_deg': 180.}
+              'keyboard_land': False, 'yaw_follows_heading': auto_arm, 'yaw_rate_deg': 180.,
+              'brake_damping': True}
     for k,v in params.items(): args += ['-p', f'{k}:={str(v).lower()}']
     for topic in ['/fmu/out/vehicle_local_position_v1', '/fmu/out/vehicle_control_mode',
                   '/fmu/out/vehicle_status_v1',
@@ -124,7 +125,7 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
     goal = [.7,.1,.65]; next_map = 0.; next_path = 0.; last_pump = 0.; command_index = 0
     pre_hover_path_pending = True; path_generation_lag = 0; map_history = {}
     preflight_ready = False
-    fault = None; obstacle = None; external_offset = [0., 0., 0.]
+    fault = None; obstacle = None; external_offset = [0., 0., 0.]; drift_velocity = [0., 0.]
     # Use native voxel centres. Coordinates on cell boundaries can round into
     # an adjacent OctoMap key and leave a checkerboard of accidental unknowns.
     free_points = [((x+.5)*.05, (y+.5)*.05, (z+.5)*.05)
@@ -150,6 +151,8 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         local = VehicleLocalPosition(); local.timestamp = ns//1000
         local.xy_valid = local.z_valid = True
         local.x,local.y,local.z = position
+        local.v_xy_valid = True
+        local.vx,local.vy = drift_velocity
         heading=float(received['setpoints'][-1].yaw) if received['setpoints'] else (0. if auto_arm else math.pi/2)
         local.heading = heading
         local.xy_reset_counter = 1 if fault=='px4_reset' else 0
@@ -286,6 +289,19 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         assert status()['path_validated_map_generation'] == status()['map_generation']
         wait(lambda:position[1]-ground[1]>.08 and ground[2]-position[2]>.32)
         assert not any(m.command==400 and m.param1==1 for m in received['commands']) if not auto_arm else armed
+        if auto_arm:
+            # Heading follows the route, not the body: a lateral offset must
+            # not turn the nose toward the lookahead (~18 deg for 8 cm).
+            wait(lambda:status().get('state')=='FOLLOWING')
+            next_path=float('inf')
+            yaw_before=float(received['setpoints'][-1].yaw)
+            external_offset[0]=.08
+            until=time.monotonic()+.4
+            wait(lambda:time.monotonic()>=until,seconds=.7)
+            assert status().get('state')=='FOLLOWING'
+            assert abs(math.remainder(float(received['setpoints'][-1].yaw)-yaw_before,2*math.pi))<math.radians(2.)
+            external_offset[0]=0.;next_path=0.
+            wait(lambda:status().get('state')=='FOLLOWING')
         before=position[:]
         for injected,expected in [('pose','POSE_STALE'),('correction','POSE_MAP_MISMATCH'),('path_frame','PATH_STALE')]:
             fault=injected;next_path=0.
@@ -314,10 +330,63 @@ def test_unknown_flight_adapter_mock_px4(tmp_path, auto_arm, terminal_fault):
         fault=None
         wait(lambda:status().get('state')=='FOLLOWING')
         obstacle=[.1+position[1]-ground[1]+.15,.1+position[0]-ground[0],.2+ground[2]-position[2]]
+        # Sliding east (map +x) at 0.2 m/s, towards the obstacle.
+        drift_velocity[:]=[0.,.2]
         next_map=0.;next_path=0.
         wait(lambda:status().get('state')=='HOLD' and ('OBSTACLE' in status().get('fault','') or 'BLOCKED' in status().get('fault','')))
+        # Held 0.125 m from the voxel (inside required_clearance): escape
+        # steps the command away from it (map -x = NED -y) instead of pinning.
+        # Escape only moves an armed vehicle; the disarmed mock just holds.
+        hold_start=list(status()['command_ned'])
+        if armed:
+            wait(lambda:status().get('escape',{}).get('escaping') is True and
+                 status()['command_ned'][1]<hold_start[1]-.03,seconds=2.)
+            escape=status()['escape']
+            assert escape['clearance']<.35 and escape['travel']<=.5+1e-6
+            # A slide towards the obstacle gets a braking lead (0.2 m/s x 0.5 s)
+            # and damping stays active against the escape's own velocity.
+            assert abs(escape['lead']-.10)<.02
+            assert status()['damping_reason']=='braking_or_hold'
+        drift_velocity[:]=[0.,0.]
+        if armed:
+            assert abs(status()['command_ned'][0]-hold_start[0])<.03
+        else:
+            until=time.monotonic()+.3
+            wait(lambda:time.monotonic()>=until,seconds=.6)
+            assert status()['escape']['escaping'] is False
+            assert math.dist(status()['command_ned'],hold_start)<1e-6
         obstacle=None;next_map=0.;next_path=0.
         wait(lambda:status().get('state')=='FOLLOWING')
+        if auto_arm:
+            # A fault hold freezes heading as well as position. Reverse the
+            # route so YAW_ALIGN starts a long ramp, then fault mid-turn: the
+            # nose must stop, not finish turning toward the failed route.
+            route_goal=goal[:]
+            goal[:]=[.1,.1,.65];next_path=0.
+            wait(lambda:status().get('state')=='YAW_ALIGN')
+            fault='correction'
+            wait(lambda:status().get('state')=='HOLD' and status().get('fault')=='POSE_MAP_MISMATCH',seconds=1.3)
+            held_yaw=float(received['setpoints'][-1].yaw)
+            until=time.monotonic()+.4
+            wait(lambda:time.monotonic()>=until,seconds=.7)
+            assert status().get('state')=='HOLD'
+            assert abs(float(received['setpoints'][-1].yaw)-held_yaw)<1e-6
+            # Opt-in hold damping opposes measured drift, bounded by its 0.10
+            # m/s2 limit, without moving the frozen position command.
+            held=[float(x) for x in received['setpoints'][-1].position]
+            drift_velocity[:]=[.12,-.06]
+            until=time.monotonic()+.5
+            wait(lambda:time.monotonic()>=until,seconds=.8)
+            braking=[float(x) for x in received['setpoints'][-1].acceleration]
+            assert status().get('state')=='HOLD' and status()['damping_reason']=='braking_or_hold'
+            assert braking[0]<-.05 and braking[1]>.02 and math.hypot(braking[0],braking[1])<=.10+1e-6
+            assert math.dist([float(x) for x in received['setpoints'][-1].position],held)<1e-6
+            drift_velocity[:]=[0.,0.]
+            fault=None;goal[:]=route_goal;next_path=0.
+            wait(lambda:status().get('state')=='FOLLOWING')
+            # Route following stays pure position control.
+            wait(lambda:status().get('state')=='FOLLOWING' and
+                 math.isnan(float(received['setpoints'][-1].acceleration[0])))
         # A non-fatal fault may inhibit arming indefinitely, but none of that
         # pre-arm time may consume the armed LAND grace period.
         fault=terminal_fault

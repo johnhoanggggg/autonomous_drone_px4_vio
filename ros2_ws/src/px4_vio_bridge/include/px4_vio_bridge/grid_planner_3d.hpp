@@ -52,6 +52,13 @@ struct Planner3DConfig
   double cost_weight{2.0};
   double timeout_ms{150.0};
   double start_recovery_radius{0.20};
+  // When > 0, a start inside lethal_radius (e.g. after brushing a wall) plans
+  // from the recovered voxel and publishes start -> recovered -> route, with
+  // that first leg checked at this smaller radius. 0 keeps RECOVERY_REQUIRED.
+  double recovery_connector_radius{0.0};
+  // Clearance beyond lethal_radius that route shortcuts try to keep (see
+  // simplify_path_3d). 0 keeps the historical lethal-radius shortcuts.
+  double simplify_margin{0.0};
   bool project_blocked_goal{false};
 };
 
@@ -83,6 +90,9 @@ struct PlanResult3D
   std::vector<Point3> path;
   std::optional<GoalSelection3D> goal;
   std::optional<Voxel> recovered_start;
+  // True when path.front() -> path[1] is a recovery connector that was only
+  // checked at recovery_connector_radius, not lethal_radius.
+  bool recovery_connector{false};
   std::string reason;
 
   [[nodiscard]] bool found() const {return !path.empty();}
@@ -151,8 +161,12 @@ struct SphereBlockers3D
   const Point3 & start, const Point3 & end, const Point3 & center,
   double cylinder_radius, double min_z, double max_z, double sphere_radius);
 
+// With margin > 0 a shortcut must also keep the clearance of the path it
+// replaces, up to radius + margin: open-space routes keep the margin while a
+// gap narrower than 2*(radius + margin) stays on the A* centre line.
 [[nodiscard]] std::vector<Point3> simplify_path_3d(
-  const VoxelGrid & raw, const std::vector<Point3> & path, double radius);
+  const VoxelGrid & raw, const std::vector<Point3> & path, double radius,
+  double margin = 0.0);
 
 [[nodiscard]] double path_length_3d(const std::vector<Point3> & path);
 

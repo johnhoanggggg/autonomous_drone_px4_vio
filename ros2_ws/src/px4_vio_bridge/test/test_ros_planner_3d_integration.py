@@ -24,6 +24,7 @@ from nav_msgs.msg import Odometry
 from rtabmap_msgs.msg import MapData
 from std_msgs.msg import String, Bool
 from octomap_msgs.msg import Octomap
+from px4_msgs.msg import VehicleStatus
 
 
 def test_ros_octomap_navigation_faults(tmp_path):
@@ -492,6 +493,7 @@ def test_start_clear_accepts_earlier_map_stamp_and_keeps_raw_anchor(tmp_path):
     odom_pub = node.create_publisher(Odometry, '/rtabmap/vio_odometry', qos_profile_sensor_data)
     map_pub = node.create_publisher(MapData, '/rtabmap/mapData', durable)
     goal_pub = node.create_publisher(PointStamped, '/waypoint/clicked', 10)
+    status_pub = node.create_publisher(VehicleStatus, '/fmu/out/vehicle_status_v1', durable)
 
     def start(executable, *params):
         log = (tmp_path / f'{executable}.log').open('w')
@@ -615,6 +617,45 @@ def test_start_clear_accepts_earlier_map_stamp_and_keeps_raw_anchor(tmp_path):
         reclicked = new_map()
         assert reclicked['anchor_sequence'] == 3
         assert reclicked['center'] == pytest.approx([-0.3, 0.364, 0.856])
+
+        # A fresh DISARMED report makes the anchor follow the body, so a
+        # re-flight without a new click still clears its own takeoff column.
+        status = VehicleStatus()
+        status.arming_state = VehicleStatus.ARMING_STATE_DISARMED
+
+        def publish_disarmed_body():
+            status_pub.publish(status)
+            publish_body()
+
+        odom.pose.pose.position.x = 0.4
+        deadline = time.monotonic() + 0.2
+        wait_for(lambda: time.monotonic() >= deadline, publish_disarmed_body)
+        followed = new_map()
+        assert followed['anchor_reason'] == 'disarmed'
+        assert followed['anchor_sequence'] > reclicked['anchor_sequence']
+        assert followed['center'] == pytest.approx([0.3, 0.364, 0.856])
+
+        # Once armed, the takeoff anchor is fixed while the body moves.
+        status.arming_state = VehicleStatus.ARMING_STATE_ARMED
+        deadline = time.monotonic() + 0.2
+        wait_for(lambda: time.monotonic() >= deadline, lambda: status_pub.publish(status))
+        odom.pose.pose.position.x = 0.9
+        deadline = time.monotonic() + 0.2
+        wait_for(lambda: time.monotonic() >= deadline, publish_disarmed_body)
+        armed = new_map()
+        assert armed['raw_body_pose'] == followed['raw_body_pose']
+        assert armed['anchor_sequence'] == followed['anchor_sequence']
+
+        # A stale DISARMED report must not move it either.
+        status.arming_state = VehicleStatus.ARMING_STATE_DISARMED
+        status_pub.publish(status)
+        deadline = time.monotonic() + 1.8
+        wait_for(lambda: time.monotonic() >= deadline)
+        odom.pose.pose.position.x = 1.2
+        deadline = time.monotonic() + 0.1
+        wait_for(lambda: time.monotonic() >= deadline, publish_body)
+        stale = new_map()
+        assert stale['raw_body_pose'] == followed['raw_body_pose']
 
     finally:
         for process in reversed(processes):

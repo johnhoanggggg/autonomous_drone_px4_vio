@@ -13,6 +13,8 @@ namespace px4_vio_bridge
 struct Follower3DConfig
 {
   double lookahead{0.35};
+  // Arc length for route_ahead (the heading chord). 0 uses `lookahead`.
+  double heading_lookahead{0.0};
   double max_horizontal_speed{0.10};
   double max_vertical_speed{0.05};
   double max_horizontal_acceleration{0.30};
@@ -38,6 +40,9 @@ struct FollowResult3D
   bool reached{};
   Point3 carrot{};
   Point3 lookahead{};
+  // On-route point `heading_lookahead` (else `lookahead`) beyond the projection. Together with
+  // projection.point it gives a heading chord that lateral error cannot turn.
+  Point3 route_ahead{};
   Point3 displacement{};
   Point3 velocity{};
   Point3 acceleration{};

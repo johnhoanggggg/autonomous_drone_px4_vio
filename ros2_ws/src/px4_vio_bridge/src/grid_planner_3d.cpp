@@ -736,8 +736,28 @@ bool swept_sphere_inside_cylinder(
 }
 
 std::vector<Point3> simplify_path_3d(
-  const VoxelGrid & raw, const std::vector<Point3> & path, double radius)
+  const VoxelGrid & raw, const std::vector<Point3> & path, double radius, double margin)
 {
+  // Per-vertex clearance in [radius, radius + margin], to 5 mm. A vertex that
+  // is not even clear at `radius` (a recovery start) contributes `radius`.
+  std::vector<double> clearance(path.size(), radius);
+  if (margin > 0.0) {
+    for (std::size_t i = 0; i < path.size(); ++i) {
+      if (!swept_sphere_clear(raw, path[i], path[i], radius)) {continue;}
+      double low = radius, high = radius + margin;
+      if (swept_sphere_clear(raw, path[i], path[i], high)) {clearance[i] = high; continue;}
+      while (high - low > 0.005) {
+        const double mid = 0.5 * (low + high);
+        (swept_sphere_clear(raw, path[i], path[i], mid) ? low : high) = mid;
+      }
+      clearance[i] = low;
+    }
+  }
+  const auto shortcut_radius = [&](std::size_t from, std::size_t to) {
+      double keep = radius + margin;
+      for (std::size_t k = from; k <= to; ++k) {keep = std::min(keep, clearance[k]);}
+      return std::max(radius, keep - 0.005);
+    };
   if (path.empty()) {return {};}
   if (path.size() == 1) {
     return swept_sphere_clear(raw, path.front(), path.front(), radius) ? path : std::vector<Point3>{};
@@ -747,7 +767,9 @@ std::vector<Point3> simplify_path_3d(
   while (anchor + 1 < path.size()) {
     std::size_t selected = anchor + 1;
     for (std::size_t candidate = path.size() - 1; candidate > anchor + 1; --candidate) {
-      if (swept_sphere_clear(raw, path[anchor], path[candidate], radius)) {
+      if (swept_sphere_clear(raw, path[anchor], path[candidate],
+          margin > 0.0 ? shortcut_radius(anchor, candidate) : radius))
+      {
         selected = candidate;
         break;
       }
@@ -776,7 +798,10 @@ PlanResult3D plan_path_3d(
   const Planner3DConfig & config)
 {
   PlanResult3D result;
-  if (config.lethal_radius <= 0.0 || config.inflation_radius < config.lethal_radius) {
+  if (config.lethal_radius <= 0.0 || config.inflation_radius < config.lethal_radius ||
+    !(config.recovery_connector_radius >= 0.0) || !(config.simplify_margin >= 0.0) ||
+    config.recovery_connector_radius > config.lethal_radius)
+  {
     result.reason = "INVALID_CONFIG";
     return result;
   }
@@ -865,9 +890,22 @@ PlanResult3D PreparedPlanner3D::plan(const Point3 & start, const Point3 & reques
   // not an ordinary route segment. This planner identifies the monotonically
   // safer recovery target but deliberately does not publish it as a flyable
   // A* path.
-  if (!start_clear && *recovered != *start_voxel) {
-    result.reason = "RECOVERY_REQUIRED";
-    return result;
+  // Brushing past an obstacle puts the body inside its own lethal envelope.
+  // Dropping the route there arms the flight adapter's land timer while the
+  // aircraft is merely close to something (20260925T133624Z/133715Z both
+  // landed at a 0.85 m gap mouth). Like the 2D planner, plan from the
+  // monotonically safer recovered voxel instead, but only when the connector
+  // to it clears the explicit, smaller recovery radius.
+  const double connector_radius = start_clear ? config.lethal_radius :
+    config.recovery_connector_radius;
+  if (!start_clear) {
+    if (!(connector_radius > 0.0) ||
+      !swept_sphere_clear(raw, start, raw.voxel_center(*recovered), connector_radius))
+    {
+      result.reason = *recovered != *start_voxel ? "RECOVERY_REQUIRED" : "START_ENVELOPE_BLOCKED";
+      return result;
+    }
+    result.recovery_connector = true;
   }
   // The common case is an exact known-free goal. Search it directly instead
   // of flood-filling the entire connected planning volume merely to prove it
@@ -925,9 +963,9 @@ PlanResult3D PreparedPlanner3D::plan(const Point3 & start, const Point3 & reques
   for (const auto & voxel : result.search.voxels) {
     centres.push_back(raw.voxel_center(voxel));
   }
-  result.path = simplify_path_3d(raw, centres, config.lethal_radius);
+  result.path = simplify_path_3d(raw, centres, config.lethal_radius, config.simplify_margin);
   if (result.path.empty()) {result.reason = "CONTINUOUS_CLEARANCE_FAILED"; return result;}
-  if (!swept_sphere_clear(raw, start, result.path.front(), config.lethal_radius)) {
+  if (!swept_sphere_clear(raw, start, result.path.front(), connector_radius)) {
     result.path.clear();
     result.reason = "START_ENVELOPE_BLOCKED";
     return result;
@@ -947,7 +985,19 @@ PlanResult3D PreparedPlanner3D::plan(const Point3 & start, const Point3 & reques
   }
   // The actual body and exact waypoint need the same visibility pass as the
   // grid centers. Otherwise short paths kink through an unnecessary center.
-  result.path = simplify_path_3d(raw, result.path, config.lethal_radius);
+  // A recovery connector is only valid at its own radius, so keep that first
+  // leg fixed and apply the lethal-radius visibility pass to the rest.
+  if (result.recovery_connector && result.path.size() >= 2 &&
+    distance(start, result.path.front()) <= 1.0e-9)
+  {
+    auto tail = simplify_path_3d(
+      raw, std::vector<Point3>(result.path.begin() + 1, result.path.end()),
+      config.lethal_radius, config.simplify_margin);
+    if (!tail.empty()) {tail.insert(tail.begin(), start);}
+    result.path = std::move(tail);
+  } else {
+    result.path = simplify_path_3d(raw, result.path, config.lethal_radius, config.simplify_margin);
+  }
   if (result.path.empty()) {result.reason = "CONTINUOUS_CLEARANCE_FAILED"; return result;}
   result.reason = result.goal->exact ? "PATH_VALID" :
     (result.goal->terminal ? "SAFE_APPROACH" : "EXPLORING");

@@ -367,6 +367,103 @@ TEST(GridPlanner3D, ConnectsClearOffCenterBodyWithoutFalseRecovery)
   EXPECT_EQ(blocked.reason, "RECOVERY_REQUIRED");
 }
 
+TEST(GridPlanner3D, BrushedStartPlansFromRecoveredVoxelThroughExplicitConnector)
+{
+  // Wall face at x=0.55 m. Lethal 0.35 needs x>=0.90; connector 0.30, x>=0.85.
+  p::VoxelGrid raw(40, 40, 30, 0.05, {0.0, 0.0, 0.0}, p::VoxelState::Free);
+  for (int z = 0; z < 30; ++z) {
+    for (int y = 0; y < 40; ++y) {raw.set({10, y, z}, p::VoxelState::Occupied);}
+  }
+  p::Planner3DConfig config;
+  config.lethal_radius = 0.35;
+  config.inflation_radius = 0.55;
+  config.start_recovery_radius = 0.20;
+  const p::Point3 brushed{0.87, 1.0, 0.75}, goal{1.6, 1.0, 0.75};
+  ASSERT_FALSE(p::swept_sphere_clear(raw, brushed, brushed, config.lethal_radius));
+
+  // Default (connector disabled) keeps the historical no-route behaviour.
+  const auto refused = p::plan_path_3d(raw, brushed, goal, config);
+  EXPECT_FALSE(refused.found());
+  EXPECT_EQ(refused.reason, "RECOVERY_REQUIRED");
+
+  config.recovery_connector_radius = 0.30;
+  const auto recovered = p::plan_path_3d(raw, brushed, goal, config);
+  ASSERT_TRUE(recovered.found()) << recovered.reason;
+  EXPECT_TRUE(recovered.recovery_connector);
+  ASSERT_GE(recovered.path.size(), 3U);
+  EXPECT_DOUBLE_EQ(recovered.path.front().x, brushed.x);
+  // The connector moves away from the wall and clears the explicit radius;
+  // every later leg keeps the full lethal radius.
+  EXPECT_GT(recovered.path[1].x, brushed.x);
+  EXPECT_TRUE(p::swept_sphere_clear(raw, recovered.path[0], recovered.path[1], 0.30));
+  for (std::size_t i = 2; i < recovered.path.size(); ++i) {
+    EXPECT_TRUE(p::swept_sphere_clear(
+      raw, recovered.path[i - 1], recovered.path[i], config.lethal_radius));
+  }
+
+  // A body already inside the connector radius is still refused.
+  const auto too_close = p::plan_path_3d(raw, {0.82, 1.0, 0.75}, goal, config);
+  EXPECT_FALSE(too_close.found());
+  EXPECT_FALSE(too_close.recovery_connector);
+
+  config.recovery_connector_radius = 0.40;
+  EXPECT_EQ(p::plan_path_3d(raw, brushed, goal, config).reason, "INVALID_CONFIG");
+}
+
+namespace
+{
+double route_min_clearance(const p::VoxelGrid & raw, const std::vector<p::Point3> & path)
+{
+  double worst = 1.0;
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    double low = 0.0, high = 1.0;
+    while (high - low > 0.002) {
+      const double mid = 0.5 * (low + high);
+      (p::swept_sphere_clear(raw, path[i - 1], path[i], mid) ? low : high) = mid;
+    }
+    worst = std::min(worst, low);
+  }
+  return worst;
+}
+}  // namespace
+
+TEST(GridPlanner3D, RouteMarginCentresShortcutsInANarrowGapWithoutVertexExplosion)
+{
+  // A 0.85 m slot (faces y=0.575 and y=1.425) over x in [1.5, 2.5], 1.5 m tall.
+  p::VoxelGrid raw(72, 40, 30, 0.05, {0.0, 0.0, 0.0}, p::VoxelState::Free);
+  for (int x = 30; x < 50; ++x) {
+    for (int z = 0; z < 30; ++z) {
+      for (int y = 0; y < 40; ++y) {
+        if (y < 11 || y >= 29) {raw.set({x, y, z}, p::VoxelState::Occupied);}
+      }
+    }
+  }
+  p::Planner3DConfig config;
+  config.lethal_radius = 0.35;
+  config.inflation_radius = 0.55;
+  config.timeout_ms = 3000.0;
+  const p::Point3 start{0.9, 1.45, 0.75}, goal{3.1, 0.55, 0.75};
+  const auto grazing = p::plan_path_3d(raw, start, goal, config);
+  ASSERT_TRUE(grazing.found()) << grazing.reason;
+  config.simplify_margin = 0.10;
+  const auto centred = p::plan_path_3d(raw, start, goal, config);
+  ASSERT_TRUE(centred.found()) << centred.reason;
+  const double grazing_clearance = route_min_clearance(raw, grazing.path);
+  const double centred_clearance = route_min_clearance(raw, centred.path);
+  // Lethal-only shortcuts cut the slot's corners at the lethal limit; the
+  // margin keeps (nearly) the slot's 0.425 m centre-line clearance.
+  EXPECT_LT(grazing_clearance, 0.38);
+  EXPECT_GT(centred_clearance, 0.41);
+  // Staying centred must not keep every 5 cm A* voxel: the follower brakes at
+  // each vertex.
+  EXPECT_LE(centred.path.size(), 8U);
+  for (std::size_t i = 1; i < centred.path.size(); ++i) {
+    EXPECT_TRUE(p::swept_sphere_clear(raw, centred.path[i - 1], centred.path[i], config.lethal_radius));
+  }
+  config.simplify_margin = -0.1;
+  EXPECT_EQ(p::plan_path_3d(raw, start, goal, config).reason, "INVALID_CONFIG");
+}
+
 TEST(GridPlanner3D, PreparedMapOwnsItsEvidenceAndReplacementChangesClearance)
 {
   p::VoxelGrid raw(24, 20, 20, 0.1, {0.0, 0.0, 0.0}, p::VoxelState::Free);

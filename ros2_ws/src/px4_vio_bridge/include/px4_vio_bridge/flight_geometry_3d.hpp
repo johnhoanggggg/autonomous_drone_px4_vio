@@ -1,7 +1,9 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 #include "px4_vio_bridge/grid_planner_3d.hpp"
 #include "px4_vio_bridge/navigation_snapshot.hpp"
 #include "px4_vio_bridge/octomap_grid.hpp"
@@ -101,4 +103,105 @@ private:
   Follower3DConfig config_;
   Point3 position_{}, velocity_{};
 };
+
+/// Blocking voxel boxes near a point, for clearance-escape decisions.
+///
+/// clearance() is the box distance to the nearest blocking voxel, capped at
+/// `cap` when none lies within the collected crop (so the cap must not exceed
+/// the crop radius used to build it).
+struct BlockingBoxes3D
+{
+  std::vector<Point3> centers;
+  double half_size{};
+  double cap{};
+  [[nodiscard]] double clearance(const Point3 & p) const
+  {
+    double best = cap;
+    for (const auto & c : centers) {
+      const double qx = std::max(std::abs(p.x - c.x) - half_size, 0.0);
+      const double qy = std::max(std::abs(p.y - c.y) - half_size, 0.0);
+      const double qz = std::max(std::abs(p.z - c.z) - half_size, 0.0);
+      best = std::min(best, std::sqrt(qx * qx + qy * qy + qz * qz));
+    }
+    return best;
+  }
+  /// Minimum clearance along a chord, sampled at a quarter voxel.
+  [[nodiscard]] double chord_clearance(const Point3 & a, const Point3 & b) const
+  {
+    const double length = distance_3d(a, b);
+    const int samples = std::max(1, static_cast<int>(std::ceil(length / std::max(half_size * 0.5, 1e-3))));
+    double best = cap;
+    for (int i = 0; i <= samples; ++i) {
+      const double t = static_cast<double>(i) / samples;
+      best = std::min(best, clearance({a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), a.z + t * (b.z - a.z)}));
+    }
+    return best;
+  }
+};
+
+/// Collect occupied (and, unless allow_unknown, unknown) native voxels within
+/// `radius` of `center`, using the same crop policy as flight_chord_clear.
+template<class Tree>
+BlockingBoxes3D collect_blocking_boxes(
+  const Tree & tree, const Point3 & center, double radius, bool allow_unknown)
+{
+  BlockingBoxes3D boxes;
+  const auto r = tree.getResolution();
+  boxes.half_size = r * 0.5;
+  boxes.cap = radius;
+  const double pad = radius + r;
+  const Point3 origin{std::floor((center.x - pad) / r) * r,
+    std::floor((center.y - pad) / r) * r, std::floor((center.z - pad) / r) * r};
+  const auto n = static_cast<std::size_t>(std::ceil(2.0 * pad / r) + 1.0);
+  VoxelGrid crop(n, n, n, r, origin, allow_unknown ? VoxelState::Free : VoxelState::Unknown);
+  fill_native_octomap_grid(tree, crop);
+  for (int z = 0; z < static_cast<int>(n); ++z) {
+    for (int y = 0; y < static_cast<int>(n); ++y) {
+      for (int x = 0; x < static_cast<int>(n); ++x) {
+        const auto state = crop.at({x, y, z});
+        if (state == VoxelState::Occupied || (!allow_unknown && state == VoxelState::Unknown)) {
+          boxes.centers.push_back(crop.voxel_center({x, y, z}));
+        }
+      }
+    }
+  }
+  return boxes;
+}
+
+/// Best short step out of a clearance violation for a held 3D vehicle.
+///
+/// Tries `headings` horizontal directions at three elevations plus straight
+/// up/down, each `step` metres long, and returns the admissible endpoint that
+/// gains the most clearance. Admissible is the 2D adapter's escape rule: no
+/// point of the chord may be closer to a blocking voxel than the pose already
+/// is, and the endpoint must gain at least `minimum_improvement`. So it can
+/// only ever step away from the obstacle; no value means keep holding.
+inline std::optional<Point3> best_clearance_escape_step_3d(
+  const BlockingBoxes3D & boxes, const Point3 & pose, double step,
+  double start_clearance, double minimum_improvement, int headings = 16)
+{
+  if (!(step > 0.0) || !(minimum_improvement > 0.0) || headings < 4) {return std::nullopt;}
+  constexpr double tolerance = 1.0e-6;
+  std::optional<Point3> best;
+  double best_clearance = start_clearance + minimum_improvement - tolerance;
+  const auto consider = [&](const Point3 & direction) {
+      const Point3 end{pose.x + step * direction.x, pose.y + step * direction.y,
+        pose.z + step * direction.z};
+      const double end_clearance = boxes.clearance(end);
+      if (end_clearance < best_clearance) {return;}
+      if (boxes.chord_clearance(pose, end) < start_clearance - tolerance) {return;}
+      best = end;
+      best_clearance = end_clearance;
+    };
+  for (const double elevation : {0.0, M_PI / 6.0, -M_PI / 6.0}) {
+    for (int i = 0; i < headings; ++i) {
+      const double heading = 2.0 * M_PI * i / headings;
+      consider({std::cos(elevation) * std::cos(heading),
+        std::cos(elevation) * std::sin(heading), std::sin(elevation)});
+    }
+  }
+  consider({0.0, 0.0, 1.0});
+  consider({0.0, 0.0, -1.0});
+  return best;
+}
 }

@@ -199,6 +199,10 @@ FollowResult3D RouteFollower3D::update(
   if (!path_) {result.reason = "NO_PATH"; return result;}
   if (!std::isfinite(dt) || dt <= 0.0 || dt > 0.5) {result.reason = "INVALID_DT"; return result;}
   result.projection = path_->project(pose);
+  const double heading_arc =
+    config_.heading_lookahead > 0.0 ? config_.heading_lookahead : config_.lookahead;
+  result.route_ahead = path_->point_at(
+    std::min(path_->length(), result.projection.along + heading_arc));
   result.remaining = std::max(0.0, path_->length() - result.projection.along);
   if (result.projection.horizontal_distance > config_.max_cross_track) {
     result.reason = "CROSS_TRACK";

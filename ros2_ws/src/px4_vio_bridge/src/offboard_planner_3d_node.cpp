@@ -17,6 +17,7 @@
 #include <rtabmap_msgs/msg/odom_info.hpp>
 #include <std_msgs/msg/string.hpp>
 #include "offboard_hover_node.hpp"
+#include "px4_vio_bridge/brake_damping.hpp"
 #include "px4_vio_bridge/flight_geometry_3d.hpp"
 
 namespace px4_vio_bridge
@@ -57,11 +58,33 @@ public:
     config_.max_horizontal_acceleration=declare_parameter<double>("command_acceleration",.30);
     config_.max_vertical_acceleration=declare_parameter<double>("command_vertical_acceleration",.20);
     config_.lookahead=declare_parameter<double>("lookahead",.25);
+    // Heading follows a longer route chord with a deadband, so short route
+    // wiggles (e.g. a 5-7 cm recovery connector) do not swing the nose:
+    // 20260926T003738Z yawed 98->78->98 deg on one and slid into a corner.
+    config_.heading_lookahead=declare_parameter<double>("heading_lookahead",.60);
+    yaw_deadband_=declare_parameter<double>("yaw_deadband_deg",10.0)*M_PI/180;
     config_.max_cross_track=declare_parameter<double>("max_cross_track",.15);
     config_.max_vertical_track=declare_parameter<double>("max_vertical_track",.15);
     config_.stop_at_vertices=true;
     config_.arrival_tolerance=declare_parameter<double>("arrival_tolerance",.10);
     info_topic_=declare_parameter<std::string>("vio_info_topic","/rtabmap/vio_odom_info_lite");
+    const bool brake_damping=declare_parameter<bool>("brake_damping",false);
+    const double damping_gain=declare_parameter<double>("damping_gain",.75);
+    const double damping_limit=declare_parameter<double>("damping_limit",.10);
+    const double damping_time_constant=declare_parameter<double>("damping_time_constant",.10);
+    damping_velocity_timeout_=declare_parameter<double>("damping_velocity_timeout",.10);
+    // Escape-while-held, ported from the 2D adapter. 20260925T133715Z held
+    // 0.26 m from a gap corner (inside required_clearance) with a hold command
+    // the growing map had also made unsafe; nothing could move it, the planner
+    // reported START_BLOCKED and the fault timer landed it. Each tick while a
+    // route-level fault holds inside the clearance, step the command out along
+    // the direction that gains the most clearance, never closer to anything.
+    fault_escape_step_=declare_parameter<double>("fault_escape_step",.05);
+    fault_escape_limit_=declare_parameter<double>("fault_escape_limit",.50);
+    fault_escape_speed_=declare_parameter<double>("fault_escape_speed",.10);
+    fault_escape_brake_lead_time_=declare_parameter<double>("fault_escape_brake_lead_time",.50);
+    fault_escape_brake_lead_max_=declare_parameter<double>("fault_escape_brake_lead_max",.15);
+    escape_minimum_improvement_=declare_parameter<double>("escape_minimum_improvement",.01);
     for (double v : {radius_,geofence_,max_height_,map_timeout_,pose_timeout_,max_vio_source_age_,path_timeout_,px4_timeout_,
       vehicle_control_mode_timeout_,follower_rejoin_grace_,route_equivalence_tolerance_,
       fault_land_time_,goal_hold_time_,leash_xy_,leash_z_,config_.max_horizontal_speed,
@@ -72,8 +95,22 @@ public:
     if (!std::isfinite(min_height_) || min_height_<0 || min_height_>=hover_height_ ||
       hover_height_>max_height_ || geofence_<=radius_ || !std::isfinite(yaw_offset_) ||
       !std::isfinite(yaw_align_) || !std::isfinite(yaw_resume_) || yaw_resume_<0 || yaw_align_<yaw_resume_ ||
+      !std::isfinite(config_.heading_lookahead) || config_.heading_lookahead<0 ||
+      !std::isfinite(yaw_deadband_) || yaw_deadband_<0 || yaw_deadband_>=yaw_resume_ ||
       route_equivalence_tolerance_>std::min(config_.max_cross_track,config_.max_vertical_track))
     {throw std::invalid_argument("invalid 3D flight bounds or yaw limits");}
+    if (!std::isfinite(damping_velocity_timeout_) || damping_velocity_timeout_<=0) {
+      throw std::invalid_argument("damping_velocity_timeout must be finite and positive");
+    }
+    for (double v : {fault_escape_step_,fault_escape_limit_,fault_escape_speed_,
+      fault_escape_brake_lead_time_,fault_escape_brake_lead_max_}) {
+      if (!std::isfinite(v) || v<0) {throw std::invalid_argument("fault escape limits must be finite and non-negative");}
+    }
+    if (!std::isfinite(escape_minimum_improvement_) || escape_minimum_improvement_<=0) {
+      throw std::invalid_argument("escape_minimum_improvement must be positive");
+    }
+    brake_damper_=std::make_unique<BrakeDamping>(brake_damping,damping_gain,damping_limit,
+      damping_time_constant,config_.max_horizontal_acceleration);
     limiter_=std::make_unique<FlightPositionLimiter3D>(config_);
     const auto durable=rclcpp::QoS(1).reliable().transient_local();
     map_sub_=create_subscription<octomap_msgs::msg::Octomap>("/rtabmap/octomap",durable,
@@ -130,7 +167,16 @@ public:
       {"route_equivalence_tolerance",route_equivalence_tolerance_},
       {"vio_info_topic",info_topic_},{"max_vio_source_age",max_vio_source_age_},
       {"feature_health","configured OdomInfo inliers and lost"},{"min_inliers",min_vio_features_},
-      {"position_control",true}}.dump(); config_pub_->publish(cfg);
+      {"position_control",true},{"brake_damping",brake_damper_->enabled()},
+      {"damping_gain",brake_damper_->gain()},{"damping_limit",brake_damper_->correction_limit()},
+      {"damping_time_constant",brake_damper_->time_constant()},
+      {"damping_velocity_timeout",damping_velocity_timeout_},
+      {"damping_scope","route_holds"},{"fault_escape_step",fault_escape_step_},
+      {"fault_escape_limit",fault_escape_limit_},{"fault_escape_speed",fault_escape_speed_},
+      {"fault_escape_brake_lead_time",fault_escape_brake_lead_time_},
+      {"fault_escape_brake_lead_max",fault_escape_brake_lead_max_},
+      {"heading_lookahead",config_.heading_lookahead},{"yaw_deadband_deg",yaw_deadband_*180/M_PI},
+      {"escape_minimum_improvement",escape_minimum_improvement_}}.dump(); config_pub_->publish(cfg);
     setup_keyboard_controls();
     timer_=create_wall_timer(std::chrono::duration<double>(dt_),[this](){tick();});
     RCLCPP_WARN(get_logger(),"3D FLIGHT: unknown=%s, occupied blocked, radius=%.2f m, auto_arm=%d",
@@ -147,6 +193,9 @@ protected:
     if (resets_ && *resets_!=counters && is_armed()) {fatal_="PX4_ESTIMATOR_RESET";}
     if (m.timestamp<=local_stamp_) {return;}
     resets_=counters;local_stamp_=m.timestamp;local_valid_=true;local_received_=monotonic_time();
+    if (m.v_xy_valid && std::isfinite(m.vx) && std::isfinite(m.vy)) {
+      measured_velocity_=Point2{m.vx,m.vy};measured_velocity_received_=local_received_;
+    } else {measured_velocity_.reset();}
     OffboardHover::on_local_position(m);
     if (!ground_) {
       ground_=Point3{m.x,m.y,m.z};limiter_->reset(*ground_);command_=*ground_;
@@ -177,7 +226,9 @@ protected:
     m.timestamp=now_us();m.position={static_cast<float>(command_->x),static_cast<float>(command_->y),static_cast<float>(command_->z)};
     const float nan=std::numeric_limits<float>::quiet_NaN();
     m.velocity={nan,nan,vertical_velocity_?static_cast<float>(*vertical_velocity_):nan};
-    m.acceleration={nan,nan,nan};m.jerk={nan,nan,nan};
+    const auto damping=hold_damping();
+    m.acceleration={static_cast<float>(damping.first),static_cast<float>(damping.second),nan};
+    m.jerk={nan,nan,nan};
     m.yaw=static_cast<float>(ramp.first);m.yawspeed=nan;
     last_setpoint_us_=m.timestamp;sp_pub_->publish(m);
   }
@@ -272,8 +323,15 @@ protected:
     const auto preview=follower_->update(body,dt_,[this](const Point3&a,const Point3&b){return chord(a,b);});
     if (!preview.valid) {fault(preview.reason);return true;}
     if (yaw_track_) {
-      const auto heading=map_delta_to_ned(subtract_3d(preview.lookahead,body),correction_->orientation,yaw_offset_);
-      if (std::hypot(heading.x,heading.y)>.05) {yaw_target_=std::atan2(heading.y,heading.x);}
+      // Aim along the route, not from the body: with a 0.25 m lookahead every
+      // 10 cm of lateral error became ~22 deg of yaw, and that yaw effort
+      // degraded roll tracking into a +/-0.25 m swing (20260925T122118Z).
+      const auto heading=map_delta_to_ned(subtract_3d(preview.route_ahead,preview.projection.point),
+        correction_->orientation,yaw_offset_);
+      if (std::hypot(heading.x,heading.y)>.05) {
+        const double route_yaw=std::atan2(heading.y,heading.x);
+        if (!yaw_target_ || std::abs(wrap_pi(route_yaw-*yaw_target_))>yaw_deadband_) {yaw_target_=route_yaw;}
+      }
       const double error=std::abs(wrap_pi(yaw_target_.value_or(pos_->heading)-pos_->heading));
       if (error>yaw_align_) {yaw_holding_=true;}
       if (error<=yaw_resume_) {yaw_holding_=false;}
@@ -484,6 +542,26 @@ private:
     limiter_->reset(candidate);last_map_command_=mapped;previous_map_command_=previous_mapped;
     command_origin_=actual;clearance_checked_=true;return {};
   }
+  Point2 hold_damping()
+  {
+    // Opt-in velocity feedback while ROUTE holds a frozen command (fault holds
+    // and YAW_ALIGN). The reference is at rest, so the bounded term only
+    // opposes measured drift: 20260925T113902Z slid 0.12 m past its hold into
+    // a wall. Following, climb and LAND keep pure position control (NaN).
+    const double nan=std::numeric_limits<double>::quiet_NaN();
+    const double clock=monotonic_time();
+    const bool fresh=measured_velocity_received_ &&
+      clock-*measured_velocity_received_<=damping_velocity_timeout_;
+    // While escaping, damp towards the escape's own (bounded) velocity rather
+    // than zero, so the correction resists sliding but not the escape step.
+    const bool active=state_==State::Route && holding_ && fatal_.empty() && is_armed();
+    const Point2 reference=escaping_ ? escape_velocity_ : Point2{0.0,0.0};
+    const auto result=brake_damper_->update(reference,{0.0,0.0},
+      fresh ? measured_velocity_ : std::nullopt,clock,active,true);
+    damping_reason_=result.reason;damping_applied_=result.applied_correction;
+    if (result.reason!="braking_or_hold") {return {nan,nan};}
+    return result.acceleration;
+  }
   void latch_hold(bool rebase_to_vehicle=false)
   {
     // A health fault must freeze the last clearance-checked command. Rebasing
@@ -517,6 +595,70 @@ private:
   {
     fault_since_.reset();holding_=false;follower_latch_since_.reset();
     follower_latch_reason_.clear();
+    escape_origin_.reset();escape_active_=false;escaping_=false;escape_clearance_.reset();
+    escape_velocity_={0.0,0.0};escape_lead_=0.0;
+  }
+  bool escape_clearance_while_held()
+  {
+    // Only for route-level faults: pose, map, VIO and PX4 must all be healthy
+    // and mutually consistent, or the escape direction itself is unknown.
+    escape_clearance_.reset();
+    if (state_!=State::Route || !is_armed() || !fatal_.empty() || fault_escape_step_<=0 ||
+      fault_escape_limit_<=0 || fault_escape_speed_<=0 || !command_ || !health(false).empty())
+    {return false;}
+    const auto body=point3(pose_->position);
+    BlockingBoxes3D boxes;
+    try {
+      // Covers every candidate chord (step + brake lead) plus the clearance it
+      // is checked against, so no relevant voxel lies outside the crop.
+      const double radius=radius_+fault_escape_step_+fault_escape_brake_lead_max_+.10;
+      if (const auto * t=dynamic_cast<const octomap::OcTree*>(tree_.get())) {boxes=collect_blocking_boxes(*t,body,radius,allow_unknown_);}
+      else if (const auto * t=dynamic_cast<const octomap::ColorOcTree*>(tree_.get())) {boxes=collect_blocking_boxes(*t,body,radius,allow_unknown_);}
+      else {return false;}
+    } catch (...) {return false;}
+    const double start=boxes.clearance(body);
+    escape_clearance_=start;
+    if (start>=radius_) {return false;}
+    const auto actual=local_point();
+    if (!escape_origin_) {escape_origin_=actual;}
+    if (distance_3d(actual,*escape_origin_)>=fault_escape_limit_) {return false;}
+    const auto target_map=best_clearance_escape_step_3d(
+      boxes,body,fault_escape_step_,start,escape_minimum_improvement_);
+    if (!target_map) {return false;}
+    const auto step_ned=map_delta_to_ned(subtract_3d(*target_map,body),
+      correction_->orientation,yaw_offset_);
+    // Brake lead: a vehicle already sliding towards the obstacle is not
+    // stopped by a hold at its own position (20260926T003738Z coasted from
+    // 0.277 m to contact at 0.2 m/s). Place the command a velocity-scaled lead
+    // along the escape direction so PX4 actively decelerates.
+    double lead=0.0;
+    const double step_h=std::hypot(step_ned.x,step_ned.y);
+    const double clock=monotonic_time();
+    if (step_h>1.0e-6 && measured_velocity_ && measured_velocity_received_ &&
+      clock-*measured_velocity_received_<=damping_velocity_timeout_)
+    {
+      const double toward=-(measured_velocity_->first*step_ned.x+measured_velocity_->second*step_ned.y)/step_h;
+      lead=std::clamp(toward*fault_escape_brake_lead_time_,0.0,fault_escape_brake_lead_max_);
+    }
+    escape_lead_=lead;
+    const Point3 lead_ned{step_ned.x/std::max(step_h,1.0e-6)*lead,step_ned.y/std::max(step_h,1.0e-6)*lead,0.0};
+    const auto target=add_3d(add_3d(actual,step_ned),lead_ned);
+    if (!within_flight_bounds(target,*ground_,geofence_-radius_,min_height_,max_height_)) {return false;}
+    // Restart from the vehicle, not the frozen hold command: the map that
+    // grew under it may have made that command unsafe too.
+    const auto base=escape_active_ ? *command_ : add_3d(actual,lead_ned);
+    const auto delta=subtract_3d(target,base);const double length=distance_3d(target,base);
+    const double reach=fault_escape_speed_*dt_;
+    const auto candidate=length>reach ? add_3d(base,scale_3d(delta,reach/length)) : target;
+    const auto mapped=add_3d(body,ned_delta_to_map(subtract_3d(candidate,actual),
+      correction_->orientation,yaw_offset_));
+    if (boxes.chord_clearance(body,mapped)<start-1.0e-6) {return false;}
+    escape_velocity_=escape_active_ ?
+      Point2{(candidate.x-command_->x)/dt_,(candidate.y-command_->y)/dt_} : Point2{0.0,0.0};
+    command_=candidate;vertical_velocity_=0.0;limiter_->reset(*command_);
+    previous_map_command_=last_map_command_.value_or(mapped);last_map_command_=mapped;
+    command_origin_=actual;escape_active_=true;
+    return true;
   }
   void fault(const std::string & reason)
   {
@@ -538,6 +680,14 @@ private:
     if (is_armed()) {
       if (!fault_since_) {fault_since_=clock;}
     } else {fault_since_.reset();}
+    // Freeze heading with the position. Otherwise the ramp keeps turning toward
+    // the lookahead of the route that just failed: 20260925T104136Z swung the
+    // nose 48 deg during one ROUTE_OBSTACLE hold, exposing new voxels and
+    // flipping the next route. YAW_ALIGN turns are not faults and still ramp.
+    if (fatal_.empty() && yaw_cmd_) {yaw_target_=*yaw_cmd_;}
+    // The land countdown keeps running: escaping buys the planner a chance to
+    // re-route from safer space, it does not excuse the fault.
+    escaping_=escape_clearance_while_held();
     publish_setpoint(hover_height_);publish_status("HOLD",reason);
     if (is_armed() && fault_since_ &&
       (clock-*fault_since_>=fault_land_time_ || !fatal_.empty())) {
@@ -580,6 +730,10 @@ private:
       j["command_origin_ned"]={command_origin_.x,command_origin_.y,command_origin_.z};
       j["map_from_odom"]=pose_json(*correction_);j["vio_yaw_offset_deg"]=yaw_offset_*180/M_PI;
     }
+    j["escape"]={{"escaping",escaping_},{"lead",escape_lead_},{"clearance",escape_clearance_ ? Json(*escape_clearance_) : Json(nullptr)},
+      {"travel",escape_origin_ && pos_ ? Json(distance_3d(local_point(),*escape_origin_)) : Json(nullptr)}};
+    j["damping_reason"]=damping_reason_;
+    j["damping_acceleration_ned"]={damping_applied_.first,damping_applied_.second};
     std_msgs::msg::String m;m.data=j.dump();status_pub_->publish(m);
   }
   bool allow_unknown_{},fresh_goal_{},yaw_track_{},yaw_holding_{},hover_ready_{},holding_{},terminal_hold_{};
@@ -589,6 +743,7 @@ private:
   double radius_{},geofence_{},min_height_{},max_height_{},map_timeout_{},pose_timeout_{},max_vio_source_age_{},path_timeout_{},px4_timeout_{};
   double vehicle_control_mode_timeout_{},follower_rejoin_grace_{},route_equivalence_tolerance_{};
   double fault_land_time_{},goal_hold_time_{},yaw_offset_{},yaw_align_{},yaw_resume_{},leash_xy_{},leash_z_{};
+  double yaw_deadband_{};
   Follower3DConfig config_;
   std::unique_ptr<FlightPositionLimiter3D> limiter_;
   std::unique_ptr<RouteFollower3D> follower_;
@@ -602,6 +757,19 @@ private:
   std::int64_t path_stamp_{},path_generation_{},path_map_stamp_{},path_validated_generation_{},path_validated_map_stamp_{};
   std::int64_t path_goal_{},latest_goal_{},minimum_goal_{},follower_path_stamp_{},follower_generation_{},follower_goal_{};
   std::uint64_t equivalent_replans_retained_{};
+  std::unique_ptr<BrakeDamping> brake_damper_;
+  double fault_escape_step_{},fault_escape_limit_{},fault_escape_speed_{},escape_minimum_improvement_{};
+  double fault_escape_brake_lead_time_{},fault_escape_brake_lead_max_{};
+  Point2 escape_velocity_{0.0,0.0};
+  double escape_lead_{};
+  std::optional<Point3> escape_origin_;
+  std::optional<double> escape_clearance_;
+  bool escape_active_{},escaping_{};
+  double damping_velocity_timeout_{};
+  std::optional<Point2> measured_velocity_;
+  std::optional<double> measured_velocity_received_;
+  std::string damping_reason_{"disabled"};
+  Point2 damping_applied_{0.0,0.0};
   std::vector<Point3> path_source_points_,path_points_,active_points_;
   struct MapFrame {std::int64_t generation;std::int64_t stamp;Pose3 correction;};
   std::deque<MapFrame> map_frames_;

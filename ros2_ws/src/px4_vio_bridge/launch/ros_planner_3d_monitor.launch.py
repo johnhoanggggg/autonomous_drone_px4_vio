@@ -42,6 +42,7 @@ def generate_launch_description():
         "start_backend": "false", "foxglove": "false", "record_bag": "false",
         "use_sim_time": "false", "min_z": "0.20", "max_z": "2.00",
         "test_start_clear_radius": "0.0",
+        "test_start_clear_follow_disarmed": "true",
         "process_monitor": "true",
         "goal_height_mode": "clicked", "exploration_route": "true",
         # When current-height mode is selected for flight, a waypoint clicked
@@ -55,6 +56,8 @@ def generate_launch_description():
         "voxel_size": "0.05", "max_marker_voxels": "5000",
         "map_preparation_period": "2.0",
         "planning_pose_drift_tolerance": "0.10",
+        "start_recovery_connector_radius": "0.30",
+        "route_margin": "0.10",
         "camera_position_frd_x": "0.100", "camera_position_frd_y": "-0.036",
         "camera_position_frd_z": "0.056",
     }
@@ -84,6 +87,8 @@ def generate_launch_description():
              ["camera_config:=", PathJoinSubstitution([share, "config", "oak_v3_rtabmap_tracked_10hz.yaml"])],
              ["odom_config_path:=", PathJoinSubstitution([share, "config", "rtabmap_ros_parity.ini"])],
              ["test_start_clear_radius:=", LaunchConfiguration("test_start_clear_radius")],
+             ["test_start_clear_follow_disarmed:=",
+              LaunchConfiguration("test_start_clear_follow_disarmed")],
              *[[key + ":=", LaunchConfiguration(key)] for key in defaults
                if key.startswith("camera_position_frd_")],
              ["max_marker_voxels:=", LaunchConfiguration("max_marker_voxels")]],
@@ -97,7 +102,8 @@ def generate_launch_description():
                 "planning_radius_xy", "robot_radius", "safety_margin", "voxel_size",
                 "max_marker_voxels", "process_monitor", "goal_height_mode", "exploration_route",
                 "current_goal_min_height_above_start", "map_preparation_period",
-                "planning_pose_drift_tolerance")},
+                "planning_pose_drift_tolerance", "start_recovery_connector_radius",
+                "route_margin")},
             "octomap_producer": "false", "simulate": "false",
             # The flight adapter has its own stateful 3D follower and validates
             # every current OctoMap. The monitor follower duplicates swept
