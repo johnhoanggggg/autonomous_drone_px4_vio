@@ -1,4 +1,4 @@
-"""Fixed-heading, open-area lateral braking experiment. No map/planner input."""
+"""Fixed-heading, open-area braking experiment along body-right (axis=lateral) or the nose (axis=forward). No map/planner input."""
 import json
 import math
 
@@ -47,8 +47,25 @@ class StopProfile:
         return self.distance - p, v, -a, "BRAKE"
 
 
+AXES = ("lateral", "forward")
+
+
+def axis_unit(yaw0, axis="lateral"):
+    """NED unit vector of the test axis: body-right ("lateral") or nose ("forward")."""
+    if axis == "forward":
+        return math.cos(yaw0), math.sin(yaw0)
+    if axis == "lateral":
+        return -math.sin(yaw0), math.cos(yaw0)
+    raise ValueError(f"axis must be one of {AXES}")
+
+
+def axis_xy(x0, y0, yaw0, displacement, axis="lateral"):
+    ux, uy = axis_unit(yaw0, axis)
+    return x0 + ux * displacement, y0 + uy * displacement
+
+
 def lateral_xy(x0, y0, yaw0, displacement):
-    return x0 - math.sin(yaw0) * displacement, y0 + math.cos(yaw0) * displacement
+    return axis_xy(x0, y0, yaw0, displacement, "lateral")
 
 
 class OffboardLateralStop(OffboardHover):
@@ -58,6 +75,27 @@ class OffboardLateralStop(OffboardHover):
                         settle_hold=3.0, settle_dwell=1.0, settle_timeout=10.0,
                         settle_position=0.10, settle_speed=0.06, geofence_radius=1.0)
         for key, value in defaults.items():
+            self.declare_parameter(key, value)
+            value = float(self.get_parameter(key).value)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{key} must be positive and finite")
+            setattr(self, key, value)
+        # "lateral" moves along the latched heading's body-right axis (roll does
+        # the braking); "forward" moves along the nose axis (pitch brakes).
+        self.declare_parameter("axis", "lateral")
+        self.axis = str(self.get_parameter("axis").value)
+        if self.axis not in AXES:
+            raise ValueError(f"axis must be one of {AXES}")
+        # Post-climb altitude gate: the first leg waits until the climb has
+        # really settled (the 4S takeoff creeps the last few cm while the hover
+        # thrust estimate catches up). Inter-leg holds keep reach_tol.
+        # climb_settle_hold: seconds at height (counted from arrival) before leg 0,
+        # so PX4's velocity integrator trims out the lean before the test starts.
+        # climb_settle_position/speed: leg 0 also waits until the drone actually
+        # HOLDS its point, i.e. PX4 has finished learning the in-air tilt it needs
+        # (the drone doesn't rest level, so a ground level check can't do this).
+        for key, value in dict(settle_altitude=0.02, settle_vz=0.05, climb_settle_hold=4.0,
+                               climb_settle_position=0.03, climb_settle_speed=0.04).items():
             self.declare_parameter(key, value)
             value = float(self.get_parameter(key).value)
             if not math.isfinite(value) or value <= 0:
@@ -78,13 +116,15 @@ class OffboardLateralStop(OffboardHover):
         if self.settle_timeout <= max(self.settle_hold, self.settle_dwell):
             raise ValueError("settle_timeout must exceed hold and dwell")
         self.profile = StopProfile(self.distance, self.speed, self.acceleration)
-        budget = 4 * self.profile.duration + 5 * max(self.settle_hold, self.settle_dwell)
+        budget = (4 * self.profile.duration + 4 * max(self.settle_hold, self.settle_dwell)
+                  + max(self.climb_settle_hold, self.settle_dwell))
         if self.max_flight_time < budget + 5:
             raise ValueError("max_flight_time needs the nominal sequence plus 5 s for climb")
         self.endpoints = [self.distance, 0.0, -self.distance, 0.0]
         self.leg = -1
         self.start_offset = self.offset = self.velocity = self.acceleration_sp = 0.0
         self.phase_started = self.stable_since = self.last_update = None
+        self.climb_reached_at = None
         self.local_received = None
         self.phase = "INITIAL_HOLD"
         self.abort_xy = None
@@ -96,6 +136,10 @@ class OffboardLateralStop(OffboardHover):
                            peak_speed=self.profile.speed, ramp_s=self.profile.ramp,
                            brake_start_s=self.profile.brake_start,
                            leg_duration_s=self.profile.duration, heading="latched_initial_NED",
+                           axis=self.axis, settle_altitude=self.settle_altitude,
+                           settle_vz=self.settle_vz, climb_settle_hold=self.climb_settle_hold,
+                           climb_settle_position=self.climb_settle_position,
+                           climb_settle_speed=self.climb_settle_speed,
                            hover_height=self.hover_height, rate_hz=self.rate_hz,
                            max_flight_time=self.max_flight_time)
         self.get_logger().warn("lateral stop test: " + json.dumps(self.config))
@@ -106,7 +150,8 @@ class OffboardLateralStop(OffboardHover):
             return self.abort_xy
         if self.x0 is None or self.yaw0 is None:
             return self.x0, self.y0
-        return lateral_xy(self.x0, self.y0, self.yaw0, getattr(self, "offset", 0.0))
+        return axis_xy(self.x0, self.y0, self.yaw0, getattr(self, "offset", 0.0),
+                       getattr(self, "axis", "lateral"))
 
     def on_local_position(self, msg):
         super().on_local_position(msg)
@@ -134,9 +179,18 @@ class OffboardLateralStop(OffboardHover):
         if self.pos is None or not self.pos.v_xy_valid:
             return False
         x, y = self.hold_point
-        return (abs(-self.pos.z - self.hover_height) <= self.reach_tol and
-                math.hypot(self.pos.x - x, self.pos.y - y) <= self.settle_position and
-                math.hypot(self.pos.vx, self.pos.vy) <= self.settle_speed and
+        altitude_tol = self.reach_tol
+        position_tol, speed_tol = self.settle_position, self.settle_speed
+        if self.state == "CLIMB_HOLD":
+            altitude_tol = min(self.reach_tol, getattr(self, "settle_altitude", self.reach_tol))
+            vz = getattr(self.pos, "vz", 0.0)
+            if not math.isfinite(vz) or abs(vz) > getattr(self, "settle_vz", math.inf):
+                return False
+            position_tol = min(position_tol, getattr(self, "climb_settle_position", position_tol))
+            speed_tol = min(speed_tol, getattr(self, "climb_settle_speed", speed_tol))
+        return (abs(-self.pos.z - self.hover_height) <= altitude_tol and
+                math.hypot(self.pos.x - x, self.pos.y - y) <= position_tol and
+                math.hypot(self.pos.vx, self.pos.vy) <= speed_tol and
                 abs(wrap_pi(self.pos.heading - self.yaw0)) <= math.radians(5))
 
     def publish_setpoint(self, z_up, yaw=None):
@@ -146,8 +200,9 @@ class OffboardLateralStop(OffboardHover):
         active = self.state in ("LATERAL_MOVE", "LATERAL_HOLD")
         v = self.velocity if active else 0.0
         a = self.acceleration_sp if active else 0.0
-        reference_velocity = (-math.sin(self.yaw0) * v, math.cos(self.yaw0) * v)
-        reference_acceleration = (-math.sin(self.yaw0) * a, math.cos(self.yaw0) * a)
+        ux, uy = axis_unit(self.yaw0, getattr(self, "axis", "lateral"))
+        reference_velocity = (ux * v, uy * v)
+        reference_acceleration = (ux * a, uy * a)
         now = self.monotonic_time()
         age = None if self.local_received is None else now - self.local_received
         measured = None
@@ -177,10 +232,8 @@ class OffboardLateralStop(OffboardHover):
                 applied_correction_ned=damping.applied_correction,
                 published_acceleration_ned=[float(value) for value in m.acceleration[:2]])
             if self.pos is not None:
-                row.update(actual_offset=-(self.pos.x-self.x0)*math.sin(self.yaw0) +
-                           (self.pos.y-self.y0)*math.cos(self.yaw0),
-                           actual_velocity=-self.pos.vx*math.sin(self.yaw0) +
-                           self.pos.vy*math.cos(self.yaw0))
+                row.update(actual_offset=(self.pos.x-self.x0)*ux + (self.pos.y-self.y0)*uy,
+                           actual_velocity=self.pos.vx*ux + self.pos.vy*uy)
             message = String()
             message.data = json.dumps(row)
             self.debug_pub.publish(message)
@@ -218,12 +271,24 @@ class OffboardLateralStop(OffboardHover):
             return True
         self.velocity = self.acceleration_sp = 0.0
         self.publish_setpoint(self.hover_height)
+        hold_needed, hold_elapsed = self.settle_hold, elapsed
+        if self.state == "CLIMB_HOLD":
+            # Time the post-climb hold from ARRIVAL at height, not from the start
+            # of the climb (2026-09-28: the ~3 s climb used up settle_hold, so leg 0
+            # began ~1 s after arrival with PX4's horizontal trim still settling).
+            if getattr(self, "climb_reached_at", None) is None and self.pos is not None:
+                tol = getattr(self, "settle_altitude", self.reach_tol)
+                if abs(-self.pos.z - self.hover_height) <= tol:
+                    self.climb_reached_at = now
+            reached = getattr(self, "climb_reached_at", None)
+            hold_needed = getattr(self, "climb_settle_hold", self.settle_hold)
+            hold_elapsed = now - reached if reached is not None else -1.0
         if self.settled():
             if self.stable_since is None:
                 self.stable_since = now
         else:
             self.stable_since = None
-        if (elapsed >= self.settle_hold and self.stable_since is not None and
+        if (hold_elapsed >= hold_needed and self.stable_since is not None and
                 now - self.stable_since >= self.settle_dwell):
             self.leg += 1
             if self.leg == len(self.endpoints):

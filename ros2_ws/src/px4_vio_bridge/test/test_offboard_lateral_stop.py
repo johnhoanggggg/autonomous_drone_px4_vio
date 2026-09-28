@@ -5,7 +5,7 @@ from types import MethodType, SimpleNamespace
 import numpy as np
 import pytest
 
-from px4_vio_bridge.offboard_lateral_stop import OffboardLateralStop, StopProfile, lateral_xy
+from px4_vio_bridge.offboard_lateral_stop import OffboardLateralStop, StopProfile, axis_unit, axis_xy, lateral_xy
 from px4_vio_bridge.brake_damping import BrakeDamping
 
 
@@ -38,6 +38,23 @@ def test_lateral_direction_is_right_relative_to_initial_heading(yaw):
     x, y = lateral_xy(2, -1, yaw, .35)
     assert (x-2)*math.cos(yaw)+(y+1)*math.sin(yaw) == pytest.approx(0)
     assert -(x-2)*math.sin(yaw)+(y+1)*math.cos(yaw) == pytest.approx(.35)
+
+
+@pytest.mark.parametrize("yaw", [0, math.pi/2, -2.4])
+def test_forward_axis_moves_along_initial_heading(yaw):
+    x, y = axis_xy(2, -1, yaw, .35, "forward")
+    assert (x-2)*math.cos(yaw)+(y+1)*math.sin(yaw) == pytest.approx(.35)
+    assert -(x-2)*math.sin(yaw)+(y+1)*math.cos(yaw) == pytest.approx(0)
+
+
+def test_lateral_axis_is_unchanged_default():
+    assert axis_xy(2, -1, .7, .35) == pytest.approx(lateral_xy(2, -1, .7, .35))
+    assert axis_unit(.7) == pytest.approx(axis_unit(.7, "lateral"))
+
+
+def test_unknown_axis_is_refused():
+    with pytest.raises(ValueError):
+        axis_unit(.7, "sideways")
 
 
 def stub():
@@ -279,3 +296,135 @@ def test_published_damping_never_leaks_into_invalid_or_inactive_states(fault):
     s.publish_setpoint(.3)
     assert list(s.messages[-1].acceleration[:2]) == [0., 0.]
     assert s.brake_damper.previous_time is None
+
+
+def test_forward_axis_sequence_moves_and_feeds_forward_along_the_nose():
+    s = stub()
+    s.axis = "forward"
+    fx, fy = math.cos(.7), math.sin(.7)
+    moving = []
+    for _ in range(1000):
+        s.clock += .05
+        s.local_received = s.clock
+        s.handle_flight_state()
+        if s.state == "LAND":
+            break
+        m = s.messages[-1]
+        s.pos.x, s.pos.y = m.position[:2]
+        s.pos.vx, s.pos.vy = m.velocity[:2]
+        if math.hypot(*m.velocity[:2]) > 1e-6:
+            moving.append(m)
+    assert s.state == "LAND" and s.leg == 4
+    assert moving
+    for m in s.messages:
+        assert m.yaw == pytest.approx(.7)
+        # Displacement, velocity and acceleration all lie on the nose axis.
+        dx, dy = m.position[0]-2, m.position[1]+1
+        assert -dx*fy+dy*fx == pytest.approx(0, abs=1e-6)  # float32 message fields
+        assert -m.velocity[0]*fy+m.velocity[1]*fx == pytest.approx(0, abs=1e-6)
+        assert -m.acceleration[0]*fy+m.acceleration[1]*fx == pytest.approx(0, abs=1e-6)
+        assert abs(dx*fx+dy*fy) <= .35+1e-6
+    along = [(m.position[0]-2)*fx+(m.position[1]+1)*fy for m in s.messages]
+    assert max(along) == pytest.approx(.35, abs=1e-6)
+    assert min(along) == pytest.approx(-.35, abs=1e-6)
+
+
+def run_climb_hold(s, seconds, altitude, vz=0.):
+    s.pos.z, s.pos.vz = -altitude, vz
+    for _ in range(int(seconds/.05)):
+        s.clock += .05
+        s.local_received = s.clock
+        s.handle_flight_state()
+        if s.state != "CLIMB_HOLD":
+            break
+
+
+def gated_stub():
+    s = stub()
+    s.settle_altitude, s.settle_vz, s.climb_settle_hold = .02, .05, 4.
+    s.climb_settle_position, s.climb_settle_speed = .03, .04
+    s.climb_reached_at = None
+    return s
+
+
+def test_first_leg_waits_while_climb_is_still_low():
+    s = gated_stub()
+    run_climb_hold(s, 6., altitude=.27)          # 3 cm low: inside reach_tol, outside settle_altitude
+    assert s.state == "CLIMB_HOLD" and s.leg == -1
+    run_climb_hold(s, 3.9, altitude=.285)        # within 2 cm, but not yet 4 s at height
+    assert s.state == "CLIMB_HOLD"
+    run_climb_hold(s, 1., altitude=.285)         # 4 s at height + dwell satisfied
+    assert s.state == "LATERAL_MOVE" and s.leg == 0
+
+
+def test_first_leg_waits_for_vertical_motion_to_stop():
+    s = gated_stub()
+    run_climb_hold(s, 6., altitude=.30, vz=-.08)  # on height but still climbing (NED vz < 0)
+    assert s.state == "CLIMB_HOLD"
+    run_climb_hold(s, 2., altitude=.30, vz=-.01)
+    assert s.state == "LATERAL_MOVE"
+
+
+def test_unsettled_climb_still_times_out_to_landing():
+    s = gated_stub()
+    run_climb_hold(s, 20., altitude=.26)
+    assert s.state == "LAND"
+
+
+def test_inter_leg_holds_keep_the_looser_reach_tolerance():
+    s = gated_stub()
+    s.state = "LATERAL_HOLD"
+    s.pos.z, s.pos.vz = -.25, -.2               # 5 cm low and moving: still OK between legs
+    assert s.settled()
+    s.state = "CLIMB_HOLD"
+    assert not s.settled()
+
+
+def test_climb_hold_is_timed_from_arrival_not_from_the_climb_start():
+    """A slow climb must not eat the post-climb hold (2026-09-28 regression)."""
+    s = gated_stub()
+    run_climb_hold(s, 3., altitude=.20)          # still climbing for 3 s
+    arrival = s.clock
+    run_climb_hold(s, 10., altitude=.30)
+    started = next(t for t, state, _ in s.transitions if state == "LATERAL_MOVE")
+    assert started - arrival >= 4. - 1e-6
+
+
+def run_climb_hold_xy(s, seconds, dx=0., speed=0.):
+    """Hold at height with a horizontal offset/speed from the hold point (2, -1)."""
+    s.pos.z, s.pos.vz = -.30, 0.
+    s.pos.x, s.pos.y, s.pos.vx, s.pos.vy = 2. + dx, -1., speed, 0.
+    for _ in range(int(seconds/.05)):
+        s.clock += .05
+        s.local_received = s.clock
+        s.handle_flight_state()
+        if s.state != "CLIMB_HOLD":
+            break
+
+
+def test_first_leg_waits_until_the_lean_is_trimmed_out():
+    """The drone doesn't rest level, so the in-air tilt is learned in the hold:
+    leg 0 waits until PX4 holds the point within 3 cm, not the looser 10 cm."""
+    s = gated_stub()
+    run_climb_hold_xy(s, 8., dx=.05)             # 5 cm off: inside settle_position, outside 3 cm
+    assert s.state == "CLIMB_HOLD"
+    run_climb_hold_xy(s, 1.5, dx=.02)            # within 3 cm for the 1 s dwell
+    assert s.state == "LATERAL_MOVE"
+
+
+def test_first_leg_waits_while_still_drifting_horizontally():
+    s = gated_stub()
+    run_climb_hold_xy(s, 8., speed=.05)          # on the point but drifting 5 cm/s
+    assert s.state == "CLIMB_HOLD"
+    run_climb_hold_xy(s, 1.5, speed=.01)
+    assert s.state == "LATERAL_MOVE"
+
+
+def test_inter_leg_holds_keep_the_looser_position_and_speed_gates():
+    s = gated_stub()
+    s.state = "LATERAL_HOLD"
+    s.pos.z, s.pos.vz = -.30, 0.
+    s.pos.x, s.pos.vx = 2.06, .05                # 6 cm off, 5 cm/s: fine between legs
+    assert s.settled()
+    s.state = "CLIMB_HOLD"
+    assert not s.settled()

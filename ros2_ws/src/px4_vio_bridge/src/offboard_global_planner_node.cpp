@@ -137,6 +137,10 @@ public:
     }
     corner_blending_ = declare_parameter<bool>("corner_blending", false);
     junction_deviation_ = declare_parameter<double>("junction_deviation", 0.05);
+    // EXPERIMENTAL: round each bend (by at most junction_deviation, and only
+    // where the arc is no closer to an obstacle than the corner it replaces)
+    // so the strict command keeps moving instead of stopping at every vertex.
+    corner_fillets_ = declare_parameter<bool>("corner_fillets", false);
     const auto corner_blending = corner_blending_;
     const auto junction_deviation = junction_deviation_;
     const auto projection_tolerance =
@@ -183,7 +187,7 @@ public:
     route_limiter_ = std::make_unique<PathCommandLimiter>(
       limiter_->max_speed(), limiter_->max_acceleration(), projection_tolerance,
       corner_tolerance, entry_tolerance, connector_tolerance, suffix_tolerance,
-      corner_blending, junction_deviation, true);
+      corner_blending, junction_deviation, true, corner_fillets_);
 
     displacement_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
       follower_displacement_topic_, 10,
@@ -256,6 +260,13 @@ public:
       get_logger(),
       "BATTERY AUTHORITY: PX4 arming checks and battery failsafes; "
       "companion battery topics are telemetry only");
+    if (corner_fillets_) {
+      RCLCPP_WARN(
+        get_logger(),
+        "EXPERIMENTAL CORNER FILLETS: bends rounded by up to %.3fm where the arc keeps "
+        "the corner's clearance; along-path acceleration %.2fm/s^2",
+        junction_deviation_, 0.6 * limiter_->max_acceleration());
+    }
     if (!yaw_track_) {
       RCLCPP_WARN(get_logger(), "yaw tracking disabled; holding latched takeoff yaw");
     } else if (yaw_align_error_ > 0.0) {
@@ -923,10 +934,12 @@ private:
     config["command_acceleration"] = limiter_->max_acceleration();
     config["corner_blending"] = corner_blending_;
     config["strict_vector_limits"] = true;
+    config["corner_fillets"] = corner_fillets_;
     config["path_target_retreat"] = "brake_on_validated_segment";
     config["localization_pairing"] = "exact_source_stamp";
     config["path_stamp"] = "localization_source_stamp";
-    config["sharp_corner_policy"] = "decelerate_to_zero_on_polyline";
+    config["sharp_corner_policy"] = corner_fillets_ ?
+      "clearance_checked_fillet_else_stop" : "decelerate_to_zero_on_polyline";
     config["junction_deviation"] = junction_deviation_;
     config["path_corner_tolerance"] = path_corner_tolerance_;
     config["hover_height"] = hover_height_;
@@ -1293,6 +1306,55 @@ private:
       ChordRole::IntermediateCarrot);
   }
 
+  /// Whether a rounded corner may replace the planner's sharp one.
+  ///
+  /// The arc cuts inside the corner, which is usually toward the obstacle the
+  /// path bends around, so it must be no closer to an occupied cell than the
+  /// corner it replaces, and no closer than the hard clearance unless the
+  /// corner itself already was. Unknown space anywhere on it rejects the arc.
+  /// Rejection is safe: the bend simply keeps its strict stop.
+  bool fillet_permitted(
+    const std::vector<Point2> & replacement, const std::vector<Point2> & original) const
+  {
+    if (!grid_ || !follower_required_clearance_ || !follower_occupied_threshold_) {
+      return false;
+    }
+    const auto probe = clearance_probe();
+    // This runs on the control tick for every new path, so an arc is probed in
+    // chords of `stride` of its fine vertices (5 degrees) rather than one scan
+    // per half-degree step. Whatever the arc bulges past a chord is subtracted
+    // from that chord's clearance, so the answer stays conservative.
+    const auto minimum = [&](const std::vector<Point2> & points, std::size_t stride)
+      -> std::optional<double> {
+        double lowest = std::numeric_limits<double>::infinity();
+        for (std::size_t first = 0; first + 1 < points.size(); first += stride) {
+          const std::size_t last = std::min(first + stride, points.size() - 1);
+          const auto clearance = probe(points[first], points[last]);
+          if (!clearance) {
+            return std::nullopt;
+          }
+          double bulge = 0.0;
+          const Point2 chord{
+            points[last].first - points[first].first, points[last].second - points[first].second};
+          const double chord_length = std::hypot(chord.first, chord.second);
+          for (std::size_t inner = first + 1; inner < last && chord_length > 0.0; ++inner) {
+            bulge = std::max(
+              bulge, std::abs(
+                (points[inner].first - points[first].first) * chord.second -
+                (points[inner].second - points[first].second) * chord.first) / chord_length);
+          }
+          lowest = std::min(lowest, *clearance - bulge);
+        }
+        return lowest;
+      };
+    const auto corner = minimum(original, 1);
+    const auto arc = minimum(replacement, 10);
+    if (!corner || !arc) {
+      return false;
+    }
+    return *arc + 1.0e-9 >= std::min(*corner, *follower_required_clearance_);
+  }
+
   /// Carry the route command's map-frame state into the current correction.
   ///
   /// The follower keeps its route in canonical VIO coordinates and re-renders
@@ -1350,6 +1412,10 @@ private:
     const auto clearance_check = [this](const Point2 & start, const Point2 & end) {
         return command_chord_permitted(start, end);
       };
+    const auto fillet_check = [this](
+      const std::vector<Point2> & replacement, const std::vector<Point2> & original) {
+        return fillet_permitted(replacement, original);
+      };
 
     // Replanning mid-slew is what generates unjoinable paths: translation is
     // paused, the vehicle drifts as it pivots, and each republished route comes
@@ -1368,7 +1434,9 @@ private:
         for (const auto & point : path_points_) {
           current_path.push_back(reexpress_point(point, *path_frame_, *correction_));
         }
-        if (route_limiter_->set_path(current_path, *map_pose_, clearance_check)) {
+        if (route_limiter_->set_path(
+            current_path, *map_pose_, clearance_check, fillet_check))
+        {
           ++path_installation_id_;
           accepted_path_input_id_ = path_input_id_;
         }
@@ -1582,6 +1650,7 @@ private:
   double route_command_grace_{};
   bool replan_during_yaw_align_{};
   bool corner_blending_{};
+  bool corner_fillets_{};
   double junction_deviation_{}, path_corner_tolerance_{};
   double geofence_radius_{}, geofence_tolerance_{};
   double transit_horizontal_error_{}, pre_route_max_horizontal_error_{};

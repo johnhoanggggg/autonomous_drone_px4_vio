@@ -79,6 +79,12 @@ struct PathInstallation
   PathFingerprint fingerprint;
   std::vector<double> bends;       ///< arc length of each vertex that is a stop
   std::vector<double> bend_turns;  ///< turn away from straight, parallel to bends
+  /// Corner-fillet mode only: vertices shallow enough to be crossed at speed
+  /// (the rounded arcs and any near-straight planner kink). Sorted by arc
+  /// length; parallel arrays. Empty in every other mode.
+  std::vector<double> soft;          ///< arc length of each crossable vertex
+  std::vector<double> soft_turns;    ///< turn away from straight at that vertex
+  std::vector<double> soft_radii;    ///< local radius; infinity for an isolated kink
 };
 
 /// Advance the final command on a polyline or its bounded rejoin band.
@@ -104,6 +110,13 @@ public:
   /// is permitted; it is the caller's occupancy test.
   using ClearanceCheck = std::function<bool (const Point2 &, const Point2 &)>;
 
+  /// `fillet_check(replacement, original)` decides whether a rounded corner may
+  /// replace the sharp one: `original` is the tangent point, the vertex and the
+  /// other tangent point; `replacement` is the arc polyline between the same
+  /// tangent points. It is the caller's occupancy test.
+  using FilletCheck = std::function<bool (
+        const std::vector<Point2> & replacement, const std::vector<Point2> & original)>;
+
   PathCommandLimiter(
     double max_speed = 0.10,
     double max_acceleration = 0.30,
@@ -117,7 +130,14 @@ public:
     /// When true, every published velocity is the exact command-point secant
     /// and its full vector change is acceleration bounded. Polyline corners
     /// become stops; future fillets must be clearance checked before use.
-    bool strict_vector_limits = false);
+    bool strict_vector_limits = false,
+    /// EXPERIMENTAL, strict mode only. Each bend of an installed path is
+    /// replaced by a circular arc that cuts the corner by at most
+    /// `junction_deviation`, provided set_path()'s fillet check accepts it, so
+    /// the command keeps moving instead of stopping at the vertex. Every
+    /// strict invariant still holds on the arc; the along-path acceleration is
+    /// lowered to leave room for the turn. Bends that are not rounded still stop.
+    bool corner_fillets = false);
 
   void clear();
   [[nodiscard]] Snapshot snapshot() const;
@@ -143,10 +163,13 @@ public:
 
   /// Install a path, carrying the command onto it without a jump.
   /// Throws std::invalid_argument when the replacement cannot be joined.
+  /// With corner fillets on, a bend is rounded only when `fillet_check` is
+  /// given and accepts the arc; without it every bend stays a stop.
   bool set_path(
     const std::vector<Point2> & points,
     const Point2 & reference,
-    const ClearanceCheck & clearance_check = nullptr);
+    const ClearanceCheck & clearance_check = nullptr,
+    const FilletCheck & fillet_check = nullptr);
 
   /// Throws std::runtime_error with no path, std::invalid_argument on a
   /// rejected command.
@@ -196,10 +219,20 @@ public:
   [[nodiscard]] bool joining() const {return join_target_.has_value();}
   [[nodiscard]] double max_speed() const {return max_speed_;}
   [[nodiscard]] double max_acceleration() const {return max_acceleration_;}
+  [[nodiscard]] bool corner_fillets() const {return corner_fillets_;}
 
 private:
   static std::shared_ptr<const PathInstallation> build_installation(
-    std::shared_ptr<const Polyline> path, PathFingerprint fingerprint);
+    std::shared_ptr<const Polyline> path, PathFingerprint fingerprint, bool corner_fillets);
+  /// The along-path acceleration budget: all of it, or with corner fillets
+  /// the share that leaves room for the turn inside the vector limit.
+  [[nodiscard]] double tangential_acceleration() const;
+  /// Fastest speed now that can still slow to every crossable vertex ahead.
+  [[nodiscard]] double soft_vertex_speed_limit(double dt) const;
+  /// strict_progress() for filleted paths, where the secant is not affine
+  /// across the crossable vertices of an arc.
+  [[nodiscard]] double fillet_progress(
+    double target_progress, double dt, const Point2 & old_position) const;
   [[nodiscard]] std::optional<double> shared_suffix_offset(const Polyline & new_path) const;
   void install(std::shared_ptr<const PathInstallation> installation, double progress);
   Point2 update_join(
@@ -249,6 +282,7 @@ private:
   /// corners stop in this mode; rounded, clearance-checked geometry can be
   /// added later without weakening this invariant.
   bool strict_vector_limits_;
+  bool corner_fillets_;
 
   std::shared_ptr<const PathInstallation> installation_;
   double progress_{0.0};

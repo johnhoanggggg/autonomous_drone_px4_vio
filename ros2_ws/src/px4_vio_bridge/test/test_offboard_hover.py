@@ -269,3 +269,45 @@ def test_feedforward_reverses_gently_on_overshoot() -> None:
 
     assert 0.0 < vz <= 0.25               # NED positive = descending
     assert vz == pytest.approx(0.10)
+
+
+def latched_stub(z_now):
+    stub = make_climb_stub(z_now=z_now)
+    stub.climb_ff_latch = True
+    stub.climb_ff_done_target = None
+    stub.z_cmd = 0.30
+    return stub
+
+
+def test_climb_feedforward_latches_off_at_the_target() -> None:
+    """2026-09-28: left running, the feedforward acted as a second altitude P loop
+    (0.25 m/s per 0.05 m) and pumped a ~1 Hz bob. Once reached, it must stay 0."""
+    stub = latched_stub(z_now=0.295)            # within 1 cm, ramp finished
+    assert OffboardHover.ramp_z(stub, 0.30)[1] == 0.0
+    for z in (0.27, 0.33, 0.26):                  # later height noise/bob: no feedforward
+        stub.pos = SimpleNamespace(z=-z)
+        assert OffboardHover.ramp_z(stub, 0.30)[1] == 0.0
+
+
+def test_climb_feedforward_still_drives_until_the_vehicle_arrives() -> None:
+    stub = latched_stub(z_now=0.27)              # ramp done, vehicle 3 cm short
+    assert OffboardHover.ramp_z(stub, 0.30)[1] < 0.0
+    assert stub.climb_ff_done_target is None
+
+
+def test_new_altitude_target_rearms_the_climb_feedforward() -> None:
+    stub = latched_stub(z_now=0.30)
+    OffboardHover.ramp_z(stub, 0.30)
+    assert stub.climb_ff_done_target == 0.30
+    stub.pos = SimpleNamespace(z=-0.30)
+    for _ in range(3):
+        _, vz = OffboardHover.ramp_z(stub, 0.60)
+    assert vz < 0.0 and stub.climb_ff_done_target is None
+
+
+def test_latch_off_keeps_the_old_tracking_feedforward() -> None:
+    stub = latched_stub(z_now=0.295)
+    stub.climb_ff_latch = False
+    OffboardHover.ramp_z(stub, 0.30)
+    stub.pos = SimpleNamespace(z=-0.27)
+    assert OffboardHover.ramp_z(stub, 0.30)[1] < 0.0

@@ -1218,3 +1218,261 @@ TEST(PathCommandLimiter, ReexpressRejectsANonFiniteCorrection)
     std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0, 0.0};
   EXPECT_THROW(limiter.reexpress(kBeforeClosure, broken), std::invalid_argument);
 }
+
+// --- corner fillets (experimental) -----------------------------------------
+
+namespace
+{
+PathCommandLimiter fillet_limiter()
+{
+  return PathCommandLimiter(
+    0.20, 0.30, 0.10, 0.05, 0.30, 0.20, 0.01, true, 0.05, true, true);
+}
+
+const PathCommandLimiter::FilletCheck kAcceptFillet =
+  [](const std::vector<Point2> &, const std::vector<Point2> &) {return true;};
+const PathCommandLimiter::FilletCheck kRejectFillet =
+  [](const std::vector<Point2> &, const std::vector<Point2> &) {return false;};
+
+struct FilletRun
+{
+  bool stopped_at_a_vertex{false};
+  bool reached_end{false};
+  double slowest_before_end{1.0e9};
+  double worst_step{0.0};        ///< largest |dv| / (a * dt)
+  double worst_secant_error{0.0};
+  double farthest_from_corner{0.0};
+};
+
+// Fly a path to its end with the vehicle exactly on the command, checking the
+// strict invariants on every tick.
+FilletRun fly_filleted(
+  PathCommandLimiter & limiter, const std::vector<Point2> & path, bool jitter)
+{
+  FilletRun run;
+  const Polyline sharp(path);
+  Point2 previous_velocity = limiter.velocity();
+  Point2 previous_position = *limiter.position();
+  for (int tick = 0; tick < 2000; ++tick) {
+    // The adapter's dt is fixed; allow the modest jitter the arc speed is sized
+    // for (a tick up to 1.5x the next).
+    const double dt = jitter ? 0.04 + 0.005 * ((37 * tick + 11) % 5) : 0.05;
+    limiter.update(path.back(), dt, true, limiter.position());
+    const auto velocity = limiter.velocity();
+    run.worst_step = std::max(
+      run.worst_step,
+      std::hypot(velocity.first - previous_velocity.first,
+        velocity.second - previous_velocity.second) / (0.30 * dt));
+    run.worst_secant_error = std::max(
+      {run.worst_secant_error,
+        std::abs((limiter.position()->first - previous_position.first) / dt - velocity.first),
+        std::abs((limiter.position()->second - previous_position.second) / dt - velocity.second)});
+    run.farthest_from_corner = std::max(
+      run.farthest_from_corner, sharp.project(*limiter.position()).cross_track);
+    if (limiter.waiting_vertex()) {
+      run.stopped_at_a_vertex = true;
+    }
+    const double progress = limiter.snapshot().progress;
+    const double speed = std::hypot(velocity.first, velocity.second);
+    // Once off the starting ramp and before the end brake.
+    if (progress > 0.15 && progress < limiter.path()->length() - 0.15) {
+      run.slowest_before_end = std::min(run.slowest_before_end, speed);
+    }
+    previous_velocity = velocity;
+    previous_position = *limiter.position();
+    if (progress >= limiter.path()->length() - 1.0e-8 && speed <= 1.0e-8) {
+      run.reached_end = true;
+      break;
+    }
+  }
+  return run;
+}
+}  // namespace
+
+TEST(PathCommandLimiter, CornerFilletsRequireStrictMode)
+{
+  EXPECT_THROW(
+    PathCommandLimiter(0.20, 0.30, 0.10, 0.05, 0.30, 0.20, 0.01, true, 0.05, false, true),
+    std::invalid_argument);
+}
+
+TEST(PathCommandLimiter, FilletCarriesSpeedThroughBendsInsideEveryStrictBound)
+{
+  // A right angle has to slow (the arc radius is 0.12 m); a 30 degree bend
+  // with room for its arc does not slow at all.
+  struct Case
+  {
+    std::vector<Point2> path;
+    double minimum_speed;
+  };
+  for (const auto & [path, minimum_speed] : {
+      Case{{{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}}, 0.12},
+      Case{{{0.0, 0.0}, {1.0, 0.0}, {1.0 + 0.866, 0.5}}, 0.19},
+      Case{{{0.0, 0.0}, {0.6, 0.0}, {0.9, -0.4}, {1.5, -0.4}, {1.5, 0.3}}, 0.10}})
+  {
+    for (const bool jitter : {false, true}) {
+      auto limiter = fillet_limiter();
+      ASSERT_TRUE(limiter.set_path(path, {0.0, 0.0}, nullptr, kAcceptFillet));
+      EXPECT_TRUE(limiter.installation()->bends.empty());
+      FilletRun run;
+      ASSERT_NO_THROW(run = fly_filleted(limiter, path, jitter));
+      EXPECT_FALSE(run.stopped_at_a_vertex);
+      EXPECT_TRUE(run.reached_end);
+      EXPECT_LE(run.worst_step, 1.0 + 1.0e-6);
+      EXPECT_LE(run.worst_secant_error, 1.0e-8);
+      // The command never leaves the planner's corner by more than the
+      // junction deviation.
+      EXPECT_LE(run.farthest_from_corner, 0.05 + 1.0e-6);
+      if (!jitter) {
+        EXPECT_GE(run.slowest_before_end, minimum_speed);
+      }
+    }
+  }
+}
+
+TEST(PathCommandLimiter, RejectedOrMissingFilletCheckKeepsTheStrictStop)
+{
+  const std::vector<Point2> path{{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}};
+  for (const auto & check : {kRejectFillet, PathCommandLimiter::FilletCheck{}}) {
+    auto limiter = fillet_limiter();
+    ASSERT_TRUE(limiter.set_path(path, {0.0, 0.0}, nullptr, check));
+    ASSERT_EQ(limiter.installation()->bends.size(), 1u);
+    EXPECT_EQ(limiter.path()->points().size(), 3u);
+    for (int tick = 0; tick < 400; ++tick) {
+      ASSERT_NO_THROW(limiter.update(path.back(), 0.05, true, Point2{0.0, 0.0}));
+    }
+    // The vehicle reference never reaches the vertex, so the command waits there.
+    ASSERT_TRUE(limiter.waiting_vertex().has_value());
+    EXPECT_NEAR(limiter.position()->first, 1.0, 1e-9);
+    EXPECT_NEAR(limiter.position()->second, 0.0, 1e-9);
+  }
+}
+
+TEST(PathCommandLimiter, FilletCheckSeesTheArcAndTheCornerItReplaces)
+{
+  std::vector<Point2> seen_arc;
+  std::vector<Point2> seen_corner;
+  const PathCommandLimiter::FilletCheck record =
+    [&](const std::vector<Point2> & arc, const std::vector<Point2> & corner) {
+      seen_arc = arc;
+      seen_corner = corner;
+      return true;
+    };
+  auto limiter = fillet_limiter();
+  ASSERT_TRUE(limiter.set_path({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}}, {0.0, 0.0}, nullptr, record));
+  ASSERT_EQ(seen_corner.size(), 3u);
+  EXPECT_NEAR(seen_corner[1].first, 1.0, 1e-12);
+  EXPECT_NEAR(seen_corner[1].second, 0.0, 1e-12);
+  // The arc starts and ends on the legs, at the corner's tangent points.
+  ASSERT_GE(seen_arc.size(), 3u);
+  EXPECT_NEAR(seen_arc.front().first, seen_corner.front().first, 1e-12);
+  EXPECT_NEAR(seen_arc.back().second, seen_corner.back().second, 1e-12);
+  // Its midpoint is the junction deviation inside the vertex.
+  const auto middle = seen_arc[seen_arc.size() / 2];
+  EXPECT_NEAR(std::hypot(middle.first - 1.0, middle.second), 0.05, 2e-3);
+}
+
+TEST(PathCommandLimiter, FilletShrinksWhenTheFullArcIsRejected)
+{
+  // Only an arc within 3 cm of the vertex is acceptable: the first 5 cm trial
+  // is rejected and the 2.5 cm one is installed rather than keeping the stop.
+  const PathCommandLimiter::FilletCheck near_vertex =
+    [](const std::vector<Point2> & arc, const std::vector<Point2> & corner) {
+      const auto middle = arc[arc.size() / 2];
+      return std::hypot(middle.first - corner[1].first, middle.second - corner[1].second) < 0.03;
+    };
+  auto limiter = fillet_limiter();
+  ASSERT_TRUE(limiter.set_path(
+      {{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}}, {0.0, 0.0}, nullptr, near_vertex));
+  EXPECT_TRUE(limiter.installation()->bends.empty());
+  const auto & points = limiter.path()->points();
+  ASSERT_GT(points.size(), 3u);
+  // The installed arc's midpoint is the halved deviation inside the vertex.
+  const auto middle = points[points.size() / 2];
+  EXPECT_NEAR(std::hypot(middle.first - 1.0, middle.second), 0.025, 2e-3);
+}
+
+TEST(PathCommandLimiter, FilletLeavesAHairpinAsAStop)
+{
+  auto limiter = fillet_limiter();
+  ASSERT_TRUE(limiter.set_path(
+      {{0.0, 0.0}, {1.0, 0.0}, {0.0, 0.05}}, {0.0, 0.0}, nullptr, kAcceptFillet));
+  EXPECT_EQ(limiter.installation()->bends.size(), 1u);
+}
+
+TEST(PathCommandLimiter, FilletBrakesOnTheArcAndResumesWithinTheBound)
+{
+  const std::vector<Point2> path{{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}};
+  auto limiter = fillet_limiter();
+  ASSERT_TRUE(limiter.set_path(path, {0.0, 0.0}, nullptr, kAcceptFillet));
+  Point2 previous_velocity{0.0, 0.0};
+  Point2 previous_position = *limiter.position();
+  bool paused_on_arc = false;
+  for (int tick = 0; tick < 1500; ++tick) {
+    const auto position = *limiter.position();
+    // Pause translation (yaw alignment) and then cap it (ride-out) while the
+    // command is on the arc.
+    const bool on_arc = position.first > 0.9 && position.second < 0.1 && position.second > 0.0;
+    const bool advance = !(on_arc && tick % 60 < 25);
+    const std::optional<double> cap = on_arc && tick % 60 >= 40 ?
+      std::optional<double>{0.06} : std::nullopt;
+    paused_on_arc = paused_on_arc || !advance;
+    ASSERT_NO_THROW(limiter.update(path.back(), 0.05, advance, limiter.position(), cap));
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.30 * 0.05 + 1.0e-8);
+    EXPECT_NEAR((limiter.position()->first - previous_position.first) / 0.05,
+      velocity.first, 1.0e-8);
+    EXPECT_NEAR((limiter.position()->second - previous_position.second) / 0.05,
+      velocity.second, 1.0e-8);
+    previous_velocity = velocity;
+    previous_position = *limiter.position();
+    if (limiter.snapshot().progress >= limiter.path()->length() - 1.0e-8 &&
+      std::hypot(velocity.first, velocity.second) <= 1.0e-8)
+    {
+      break;
+    }
+  }
+  EXPECT_TRUE(paused_on_arc);
+  EXPECT_GE(limiter.snapshot().progress, limiter.path()->length() - 1.0e-8);
+}
+
+TEST(PathCommandLimiter, FilletReplacementsAndReexpressKeepTheArc)
+{
+  std::vector<Point2> path{{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}};
+  auto limiter = fillet_limiter();
+  ASSERT_TRUE(limiter.set_path(path, {0.0, 0.0}, nullptr, kAcceptFillet));
+  const auto soft_before = limiter.installation()->soft.size();
+  ASSERT_GT(soft_before, 10u);
+  // The same planner points again are recognised even though the installed
+  // geometry is rounded.
+  EXPECT_FALSE(limiter.set_path(path, {0.0, 0.0}, nullptr, kAcceptFillet));
+
+  Point2 previous_velocity{0.0, 0.0};
+  for (int tick = 0; tick < 1500; ++tick) {
+    if (tick == 60 || tick == 110) {
+      const double shift = tick == 60 ? 0.003 : -0.002;
+      path = {{0.0, shift}, {1.0, shift}, {1.0, 1.0 + shift}};
+      ASSERT_TRUE(limiter.set_path(path, *limiter.position(), nullptr, kAcceptFillet));
+    }
+    if (tick == 90) {
+      limiter.reexpress(kBeforeClosure, kAfterClosure);
+      EXPECT_EQ(limiter.installation()->soft.size(), soft_before);
+      EXPECT_TRUE(limiter.installation()->bends.empty());
+      limiter.reexpress(kAfterClosure, kBeforeClosure);
+      previous_velocity = limiter.velocity();
+    }
+    ASSERT_NO_THROW(limiter.update(path.back(), 0.05, true, limiter.position()));
+    const auto velocity = limiter.velocity();
+    EXPECT_LE(std::hypot(velocity.first - previous_velocity.first,
+      velocity.second - previous_velocity.second), 0.30 * 0.05 + 1.0e-8);
+    previous_velocity = velocity;
+    EXPECT_FALSE(limiter.waiting_vertex().has_value());
+    if (limiter.snapshot().progress >= limiter.path()->length() - 1.0e-8 &&
+      std::hypot(velocity.first, velocity.second) <= 1.0e-8)
+    {
+      break;
+    }
+  }
+  EXPECT_GE(limiter.snapshot().progress, limiter.path()->length() - 1.0e-8);
+}

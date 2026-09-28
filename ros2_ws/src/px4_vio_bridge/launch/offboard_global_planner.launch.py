@@ -268,6 +268,11 @@ def generate_launch_description():
         # Carry speed through bends instead of stopping at each one.
         DeclareLaunchArgument("corner_blending", default_value="true"),
         DeclareLaunchArgument("junction_deviation", default_value="0.05"),
+        # EXPERIMENTAL (C++ adapter only). Strict mode stops the command at
+        # every path bend even with corner_blending on. This rounds each bend
+        # by at most junction_deviation where the arc keeps the corner's
+        # clearance, so the command keeps moving; unrounded bends still stop.
+        DeclareLaunchArgument("corner_fillets", default_value="false"),
         DeclareLaunchArgument("climb_release", default_value="0.05"),
         DeclareLaunchArgument("route_command_grace", default_value="2.0"),
         DeclareLaunchArgument("replan_during_yaw_align", default_value="false"),
@@ -364,6 +369,7 @@ def generate_launch_description():
         "path_corner_tolerance": typed("path_corner_tolerance", float),
         "corner_blending": typed("corner_blending", bool),
         "junction_deviation": typed("junction_deviation", float),
+        "corner_fillets": typed("corner_fillets", bool),
         "climb_release": typed("climb_release", float),
         "route_command_grace": typed("route_command_grace", float),
         "replan_during_yaw_align": typed("replan_during_yaw_align", bool),

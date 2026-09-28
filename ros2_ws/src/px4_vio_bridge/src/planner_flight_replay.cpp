@@ -82,7 +82,8 @@ int main()
     config.at("suffix_tolerance").get<double>(),
     config.at("corner_blending").get<bool>(),
     config.at("junction_deviation").get<double>(),
-    config.value("strict_vector_limits", false));
+    config.value("strict_vector_limits", false),
+    config.value("corner_fillets", false));
   HorizontalCommandLimiter horizontal_limiter(
     config.at("max_speed").get<double>(),
     config.at("max_acceleration").get<double>());
@@ -97,6 +98,11 @@ int main()
   const bool clearance = scenario.value("clearance", true);
   const PathCommandLimiter::ClearanceCheck clearance_check =
     [clearance](const Point2 &, const Point2 &) {return clearance;};
+  const bool fillet_clearance = scenario.value("fillet_clearance", true);
+  const PathCommandLimiter::FilletCheck fillet_check =
+    [fillet_clearance](const std::vector<Point2> &, const std::vector<Point2> &) {
+      return fillet_clearance;
+    };
 
   json results = json::array();
   for (const auto & step : scenario.at("steps")) {
@@ -107,7 +113,8 @@ int main()
     try {
       if (op == "set_path") {
         result["changed"] = path_limiter.set_path(
-          points_of(step.at("points")), point_of(step.at("reference")), clearance_check);
+          points_of(step.at("points")), point_of(step.at("reference")), clearance_check,
+          fillet_check);
       } else if (op == "preview_direction") {
         const auto direction = path_limiter.preview_direction(
           point_of(step.at("desired")), step.at("dt").get<double>(),

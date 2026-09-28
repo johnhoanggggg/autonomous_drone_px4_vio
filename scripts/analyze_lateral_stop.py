@@ -26,7 +26,12 @@ def extract(bag):
         raise ValueError("no lateral_stop debug messages")
     yaw = debug[0]["yaw0"]
     x0, y0 = debug[0]["origin"]
-    c, s = math.cos(yaw), math.sin(yaw)
+    # 'right' is the displacement along the TEST axis and 'forward' the cross
+    # axis. For axis=forward runs the test axis is the nose, so rotate the
+    # frame by +90 deg: 'right' then measures along the heading.
+    axis = debug[0].get("config", {}).get("axis", "lateral")
+    frame_yaw = yaw - math.pi / 2 if axis == "forward" else yaw
+    c, s = math.cos(frame_yaw), math.sin(frame_yaw)
     local = []
     for t, m in data[names[1]]:
         local.append(dict(time=(t-t0)/1e9, boot=m.timestamp/1e6,

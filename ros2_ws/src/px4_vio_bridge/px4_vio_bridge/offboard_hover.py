@@ -44,6 +44,11 @@ from std_msgs.msg import Int32
 from px4_vio_bridge.process_singleton import ProcessSingleton
 
 
+# Vehicle within this of the altitude target (with the ramp finished) ends the
+# climb feedforward when climb_ff_latch is on.
+CLIMB_FF_LATCH_TOL = 0.01
+
+
 def wrap_pi(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
@@ -70,6 +75,11 @@ class OffboardHover(Node):
         self.declare_parameter("climb_leash", 0.12)       # m the ramp may lead the vehicle (<=0 disables)
         self.declare_parameter("climb_release", 0.05)     # m band where the vz feedforward tapers out
         self.declare_parameter("climb_feedforward", True) # publish velocity[2] matching the ramp (NaN when off)
+        # Stop the vz feedforward once the vehicle has reached the target (within
+        # CLIMB_FF_LATCH_TOL) instead of tracking the altitude error all flight.
+        # 2026-09-28 (4S): left running, 0.25 m/s per 0.05 m acted as a second
+        # altitude P loop (gain ~5) on noisy VIO height and pumped a ~1 Hz bob.
+        self.declare_parameter("climb_ff_latch", True)
         self.declare_parameter("rate_hz", 50.0)
         self.declare_parameter("stream_time", 1.0)        # setpoint pre-stream before engage
         self.declare_parameter("engage_timeout", 5.0)     # arm+offboard must confirm within
@@ -127,6 +137,8 @@ class OffboardHover(Node):
         self.climb_leash = float(self.get_parameter("climb_leash").value)
         self.climb_release = float(self.get_parameter("climb_release").value)
         self.climb_feedforward = bool(self.get_parameter("climb_feedforward").value)
+        self.climb_ff_latch = bool(self.get_parameter("climb_ff_latch").value)
+        self.climb_ff_done_target = None  # target whose climb feedforward has finished
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         self.stream_time = float(self.get_parameter("stream_time").value)
         self.engage_timeout = float(self.get_parameter("engage_timeout").value)
@@ -539,6 +551,13 @@ class OffboardHover(Node):
                              z_now - self.climb_leash)
         if not self.climb_feedforward:
             return self.z_cmd, math.nan
+        latch = getattr(self, "climb_ff_latch", False)
+        done = getattr(self, "climb_ff_done_target", None)
+        if latch and done is not None:
+            if abs(done - target_up) <= 1e-6:
+                # Climb finished: PX4's own altitude loop holds from here.
+                return self.z_cmd, 0.0
+            self.climb_ff_done_target = None  # a new target re-arms the feedforward
         # Release on the VEHICLE's remaining distance, not the ramp's. ULog
         # 03_53_16 (2026-08-28): the ramp reached the target at t=4 s while the
         # vehicle was still 0.09 m low -- inside climb_leash, so the leash never
@@ -546,6 +565,10 @@ class OffboardHover(Node):
         # to exactly the slow position-P crawl this exists to avoid: 18 s of it.
         z_ref = -float(self.pos.z) if self.pos is not None else self.z_cmd
         remaining = target_up - z_ref
+        if (latch and abs(self.z_cmd - target_up) <= 1e-9 and
+                abs(remaining) <= CLIMB_FF_LATCH_TOL):
+            self.climb_ff_done_target = target_up
+            return self.z_cmd, 0.0
         # Taper inside the release band rather than switching off, so there is
         # no discontinuity and measurement noise near the target cannot chatter
         # the feedforward between +/- full rate.

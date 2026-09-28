@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 
 namespace px4_vio_bridge
@@ -11,6 +12,141 @@ namespace
 {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kEpsilon = 1.0e-9;
+
+// --- corner fillets (experimental) ------------------------------------------
+//
+// Strict mode stops the command at every polyline vertex, because carrying
+// speed through a sharp vertex steps the velocity vector. On the 2026-09-28
+// global flights the planner's paths had 1-2 such bends per metre (median turn
+// 27-42 degrees), and the resulting brake/accelerate cycles drove the
+// acceleration feedforward to its +-0.30 m/s^2 clip 15-32% of the time.
+//
+// A fillet replaces a bend with a circular arc drawn as a fine polyline. Each
+// arc vertex turns by at most kArcStep, so crossing one at cruise changes the
+// velocity secant by v * kArcStep = 0.0017 m/s at 0.20 m/s -- a small fraction
+// of the 0.30 m/s^2 * dt budget even at 50 Hz.
+constexpr double kArcStep = 0.5 * kPi / 180.0;
+/// A vertex at or below this turn is crossed at speed, not stopped at.
+constexpr double kSoftTurn = kArcStep + 1.0e-6;
+/// Near-reversals keep their stop: a rounded hairpin is a U-turn at a crawl.
+constexpr double kMaxFilletTurn = 150.0 * kPi / 180.0;
+/// Below this radius the arc speed would be a crawl; keep the stop instead.
+constexpr double kMinFilletRadius = 0.01;
+/// Shares of the vector acceleration limit. On an arc the velocity turns at
+/// v^2/R plus up to v*step/dt for the vertex a tick may straddle; speed
+/// changes use the along-path share. sqrt(0.6^2 + 0.6^2) = 0.85 leaves room
+/// for the difference between the polyline secant and the ideal arc.
+constexpr double kNormalShare = 0.6;
+constexpr double kTangentShare = 0.6;
+/// The turn between consecutive secants on an arc is v * (dt_prev + dt) / (2R),
+/// so a tick shorter than the one before needs more of this tick's budget. The
+/// flight adapter's dt is fixed; the arc speed allows for a previous tick up
+/// to this much longer.
+constexpr double kDtRatioAllowance = 1.5;
+
+Point2 unit(const Point2 & vector)
+{
+  const double norm = std::hypot(vector.first, vector.second);
+  return {vector.first / norm, vector.second / norm};
+}
+
+/// Round every roundable bend of `points`; see PathCommandLimiter::FilletCheck.
+std::vector<Point2> fillet_corners(
+  const std::vector<Point2> & raw, double deviation,
+  const PathCommandLimiter::FilletCheck & fillet_check)
+{
+  // Work on the de-duplicated vertices, exactly as Polyline stores them.
+  const auto points = Polyline(raw).points();
+  const std::size_t count = points.size();
+  if (count < 3) {
+    return points;
+  }
+  std::vector<double> turns(count, 0.0);
+  std::vector<bool> candidate(count, false);
+  for (std::size_t index = 1; index + 1 < count; ++index) {
+    const Point2 in{
+      points[index].first - points[index - 1].first,
+      points[index].second - points[index - 1].second};
+    const Point2 out{
+      points[index + 1].first - points[index].first,
+      points[index + 1].second - points[index].second};
+    turns[index] = std::atan2(
+      std::abs(in.first * out.second - in.second * out.first),
+      in.first * out.first + in.second * out.second);
+    candidate[index] = turns[index] > kSoftTurn && turns[index] < kMaxFilletTurn;
+  }
+
+  std::vector<Point2> result{points.front()};
+  for (std::size_t index = 1; index + 1 < count; ++index) {
+    const Point2 & vertex = points[index];
+    if (!candidate[index]) {
+      result.push_back(vertex);
+      continue;
+    }
+    const Point2 in_leg{
+      vertex.first - points[index - 1].first, vertex.second - points[index - 1].second};
+    const Point2 out_leg{
+      points[index + 1].first - vertex.first, points[index + 1].second - vertex.second};
+    const Point2 in_dir = unit(in_leg);
+    const Point2 out_dir = unit(out_leg);
+    // A leg shared with another rounded bend is split between them; a leg that
+    // ends at the path end or at a kept vertex can be used almost entirely.
+    const double in_share = candidate[index - 1] ? 0.5 : 0.95;
+    const double out_share = candidate[index + 1] ? 0.5 : 0.95;
+    const double max_tangent = std::min(
+      in_share * std::hypot(in_leg.first, in_leg.second),
+      out_share * std::hypot(out_leg.first, out_leg.second));
+    const double half = 0.5 * turns[index];
+    const double side =
+      in_dir.first * out_dir.second - in_dir.second * out_dir.first > 0.0 ? 1.0 : -1.0;
+
+    bool rounded = false;
+    // Halving the deviation is a smaller arc that stays nearer the planner's
+    // corner, for when the full one cuts too close to an obstacle.
+    for (double trial = deviation; trial >= 0.25 * deviation - kEpsilon; trial *= 0.5) {
+      // Junction-deviation geometry: an arc tangent to both legs whose midpoint
+      // is `trial` from the vertex.
+      double radius = trial * std::cos(half) / (1.0 - std::cos(half));
+      double tangent = radius * std::tan(half);
+      if (tangent > max_tangent) {
+        tangent = max_tangent;
+        radius = tangent / std::tan(half);
+      }
+      if (radius < kMinFilletRadius) {
+        break;
+      }
+      const Point2 start{
+        vertex.first - in_dir.first * tangent, vertex.second - in_dir.second * tangent};
+      const Point2 end{
+        vertex.first + out_dir.first * tangent, vertex.second + out_dir.second * tangent};
+      const Point2 normal{-side * in_dir.second, side * in_dir.first};
+      const Point2 center{
+        start.first + normal.first * radius, start.second + normal.second * radius};
+      const double start_angle =
+        std::atan2(start.second - center.second, start.first - center.first);
+      const int steps = std::max(1, static_cast<int>(std::ceil(turns[index] / kArcStep)));
+      std::vector<Point2> arc;
+      arc.reserve(static_cast<std::size_t>(steps) + 1);
+      arc.push_back(start);
+      for (int step = 1; step < steps; ++step) {
+        const double angle = start_angle + side * turns[index] * step / steps;
+        arc.push_back({center.first + radius * std::cos(angle),
+            center.second + radius * std::sin(angle)});
+      }
+      arc.push_back(end);
+      if (fillet_check && fillet_check(arc, {start, vertex, end})) {
+        result.insert(result.end(), arc.begin(), arc.end());
+        rounded = true;
+        break;
+      }
+    }
+    if (!rounded) {
+      result.push_back(vertex);
+    }
+  }
+  result.push_back(points.back());
+  return result;
+}
 }  // namespace
 
 std::optional<double> yaw_translation_speed_cap(
@@ -211,7 +347,7 @@ PathCommandLimiter::PathCommandLimiter(
   double max_speed, double max_acceleration, double max_projection_error,
   double corner_tolerance, double max_entry_error, double max_connector_error,
   double suffix_tolerance, bool corner_blending, double junction_deviation,
-  bool strict_vector_limits)
+  bool strict_vector_limits, bool corner_fillets)
 : max_speed_(max_speed),
   max_acceleration_(max_acceleration),
   max_projection_error_(max_projection_error),
@@ -221,7 +357,8 @@ PathCommandLimiter::PathCommandLimiter(
   suffix_tolerance_(suffix_tolerance),
   corner_blending_(corner_blending),
   junction_deviation_(junction_deviation),
-  strict_vector_limits_(strict_vector_limits)
+  strict_vector_limits_(strict_vector_limits),
+  corner_fillets_(corner_fillets)
 {
   for (const double value : {max_speed, max_acceleration, max_projection_error,
       corner_tolerance, max_entry_error, max_connector_error, suffix_tolerance,
@@ -234,6 +371,9 @@ PathCommandLimiter::PathCommandLimiter(
   if (max_connector_error < max_projection_error) {
     throw std::invalid_argument(
             "connector tolerance must be at least the projection tolerance");
+  }
+  if (corner_fillets && !strict_vector_limits) {
+    throw std::invalid_argument("corner fillets require strict vector limits");
   }
 }
 
@@ -269,7 +409,7 @@ void PathCommandLimiter::reexpress(const Correction4 & from, const Correction4 &
     // transform, so progress_ carries over untouched.
     auto fingerprint = path_fingerprint(points);
     installation_ = build_installation(
-      std::make_shared<const Polyline>(points), std::move(fingerprint));
+      std::make_shared<const Polyline>(points), std::move(fingerprint), corner_fillets_);
   }
   if (position_) {
     position_ = reexpress_point(*position_, from, to);
@@ -300,7 +440,7 @@ void PathCommandLimiter::restore(const Snapshot & state)
 }
 
 std::shared_ptr<const PathInstallation> PathCommandLimiter::build_installation(
-  std::shared_ptr<const Polyline> path, PathFingerprint fingerprint)
+  std::shared_ptr<const Polyline> path, PathFingerprint fingerprint, bool corner_fillets)
 {
   auto installation = std::make_shared<PathInstallation>();
   installation->path = std::move(path);
@@ -318,11 +458,133 @@ std::shared_ptr<const PathInstallation> PathCommandLimiter::build_installation(
     const double cross = first.first * second.second - first.second * second.first;
     const double dot = first.first * second.first + first.second * second.second;
     if (std::abs(cross) > kEpsilon || dot <= 0.0) {
+      const double turn = std::atan2(std::abs(cross), dot);
+      if (corner_fillets && dot > 0.0 && turn <= kSoftTurn) {
+        // Crossable at speed. The local radius is that of the circle through
+        // the vertex and its shorter leg: exact on a fillet arc, effectively
+        // infinite for a single kink between long legs.
+        const double shorter = std::min(
+          std::hypot(first.first, first.second), std::hypot(second.first, second.second));
+        const double chord_turn = 2.0 * std::sin(0.5 * turn);
+        installation->soft.push_back(cumulative[index]);
+        installation->soft_turns.push_back(turn);
+        installation->soft_radii.push_back(
+          chord_turn > kEpsilon ? shorter / chord_turn :
+          std::numeric_limits<double>::infinity());
+        continue;
+      }
       installation->bends.push_back(cumulative[index]);
-      installation->bend_turns.push_back(std::atan2(std::abs(cross), dot));
+      installation->bend_turns.push_back(turn);
     }
   }
   return installation;
+}
+
+double PathCommandLimiter::tangential_acceleration() const
+{
+  return corner_fillets_ ? kTangentShare * max_acceleration_ : max_acceleration_;
+}
+
+double PathCommandLimiter::soft_vertex_speed_limit(double dt) const
+{
+  if (!corner_fillets_ || installation_->soft.empty()) {
+    return max_speed_;
+  }
+  // Per tick the velocity secant turns by v^2 dt / R on an arc (times the
+  // dt-ratio allowance), plus up to v * turn for the vertex a tick may
+  // straddle. Keep their sum inside the normal share:
+  //   c * v^2 / R + v * turn / dt <= kNormalShare * a.
+  const double normal = kNormalShare * max_acceleration_;
+  const double along = tangential_acceleration();
+  const auto & soft = installation_->soft;
+  // A vertex crossed during the previous tick still shapes this tick's secant.
+  const double behind = max_speed_ * dt + kEpsilon;
+  const double horizon = max_speed_ * max_speed_ / (2.0 * along) + 2.0 * max_speed_ * dt;
+  auto index = static_cast<std::size_t>(
+    std::lower_bound(soft.begin(), soft.end(), progress_ - behind) - soft.begin());
+  double limit = max_speed_;
+  for (; index < soft.size(); ++index) {
+    const double vertex_distance = soft[index] - progress_;
+    if (vertex_distance > horizon) {
+      break;
+    }
+    const double turn = installation_->soft_turns[index];
+    const double radius = installation_->soft_radii[index];
+    const double rate = turn / dt;
+    double vertex_speed = max_speed_;
+    if (std::isinf(radius)) {
+      if (turn > kEpsilon) {
+        vertex_speed = normal / rate;
+      }
+    } else {
+      const double c = 0.5 * (1.0 + kDtRatioAllowance);
+      vertex_speed = 0.5 * radius / c *
+        (-rate + std::sqrt(rate * rate + 4.0 * c * normal / radius));
+    }
+    limit = std::min(
+      limit,
+      std::sqrt(vertex_speed * vertex_speed + 2.0 * along * std::max(0.0, vertex_distance)));
+  }
+  return limit;
+}
+
+double PathCommandLimiter::fillet_progress(
+  double target_progress, double dt, const Point2 & old_position) const
+{
+  // The same contract as strict_progress(): the reachable progress nearest the
+  // request, never past the next stop. Across an arc's vertices the secant is
+  // not affine in arc length, so search the reachable set numerically. The
+  // secant speed can only lie within [|v| - a dt, |v| + a dt], which bounds the
+  // interval that can possibly be reachable.
+  const double start = progress_;
+  const double length = installation_->path->length();
+  double stop = length;
+  for (const double vertex : installation_->bends) {
+    if (vertex > start + kEpsilon) {
+      stop = vertex;
+      break;
+    }
+  }
+  const double maximum_delta = max_acceleration_ * dt;
+  const double speed = std::hypot(velocity_.first, velocity_.second);
+  const double upper = std::min(stop, start + (speed + maximum_delta) * dt + 1.0e-9);
+  const double target = std::clamp(target_progress, start, upper);
+  const auto reachable = [&](double progress) {
+      const auto point = installation_->path->point_at(progress);
+      const Point2 secant{
+        (point.first - old_position.first) / dt, (point.second - old_position.second) / dt};
+      return std::hypot(secant.first - velocity_.first, secant.second - velocity_.second) <=
+             maximum_delta + 1.0e-10;
+    };
+  if (reachable(target)) {
+    return target;
+  }
+  constexpr int kSamples = 64;
+  std::optional<double> best;
+  for (int sample = 0; sample <= kSamples; ++sample) {
+    const double progress = start + (upper - start) * sample / kSamples;
+    if (reachable(progress) &&
+      (!best || std::abs(progress - target) < std::abs(*best - target)))
+    {
+      best = progress;
+    }
+  }
+  if (!best) {
+    throw std::invalid_argument("strict vector limit cannot reach the filleted path");
+  }
+  // Close the gap to the request: bisect between the reachable sample and the
+  // request, keeping the reachable end.
+  double good = *best;
+  double bad = target;
+  for (int iteration = 0; iteration < 40 && std::abs(bad - good) > 1.0e-12; ++iteration) {
+    const double middle = 0.5 * (good + bad);
+    if (reachable(middle)) {
+      good = middle;
+    } else {
+      bad = middle;
+    }
+  }
+  return good;
 }
 
 std::optional<double> PathCommandLimiter::shared_suffix_offset(
@@ -356,13 +618,18 @@ std::optional<double> PathCommandLimiter::shared_suffix_offset(
 bool PathCommandLimiter::set_path(
   const std::vector<Point2> & points,
   const Point2 & reference,
-  const ClearanceCheck & clearance_check)
+  const ClearanceCheck & clearance_check,
+  const FilletCheck & fillet_check)
 {
+  // The fingerprint is always of the planner's own points, so an unchanged
+  // republish is still recognised when the installed geometry is rounded.
   auto fingerprint = path_fingerprint(points);
   if (installation_ && fingerprint == installation_->fingerprint) {
     return false;
   }
-  auto new_path = std::make_shared<const Polyline>(points);
+  auto new_path = std::make_shared<const Polyline>(
+    corner_fillets_ && fillet_check ?
+    fillet_corners(points, junction_deviation_, fillet_check) : points);
 
   Point2 anchor{};
   Projection projection{};
@@ -395,7 +662,9 @@ bool PathCommandLimiter::set_path(
       if (waiting_vertex_ && *waiting_vertex_ + *offset >= -kEpsilon) {
         waiting = *waiting_vertex_ + *offset;
       }
-      install(build_installation(new_path, std::move(fingerprint)), progress_ + *offset);
+      install(
+        build_installation(new_path, std::move(fingerprint), corner_fillets_),
+        progress_ + *offset);
       position_ = new_path->point_at(progress_);
       waiting_vertex_ = waiting;
       return true;
@@ -420,7 +689,7 @@ bool PathCommandLimiter::set_path(
     }
   }
 
-  install(build_installation(new_path, std::move(fingerprint)), projection.along);
+  install(build_installation(new_path, std::move(fingerprint), corner_fillets_), projection.along);
   // Keep the exact previously-published point. If the path is offset, rejoin it
   // through the bounded band; snapping directly to projection.point would
   // bypass the speed limit.
@@ -483,8 +752,9 @@ double PathCommandLimiter::along_path_speed(
 {
   // The same speed machinery the on-path advance uses, factored out so a join
   // is braked by corners and by the path end exactly as ordinary motion is.
+  const double acceleration = tangential_acceleration();
   if (!advance) {
-    speed_ = std::max(0.0, speed_ - max_acceleration_ * dt);
+    speed_ = std::max(0.0, speed_ - acceleration * dt);
     return speed_;
   }
   const double target_progress = next_motion_target(
@@ -496,16 +766,17 @@ double PathCommandLimiter::along_path_speed(
   }
   const double braking_speed = std::max(
     0.0,
-    -max_acceleration_ * dt +
+    -acceleration * dt +
     std::sqrt(
-      (max_acceleration_ * dt) * (max_acceleration_ * dt) +
-      2.0 * max_acceleration_ * remaining));
+      (acceleration * dt) * (acceleration * dt) +
+      2.0 * acceleration * remaining));
   double desired_speed = std::min({ceiling, remaining / dt, braking_speed});
   if (corner_blending_) {
     desired_speed = std::min(desired_speed, corner_speed_limit());
   }
+  desired_speed = std::min(desired_speed, soft_vertex_speed_limit(dt));
   const double delta = std::clamp(
-    desired_speed - speed_, -max_acceleration_ * dt, max_acceleration_ * dt);
+    desired_speed - speed_, -acceleration * dt, acceleration * dt);
   // The cap is a desired rate. Clamping the state to a newly lowered cap
   // would undo the acceleration bound in delta.
   speed_ = std::clamp(speed_ + delta, 0.0, max_speed_);
@@ -555,6 +826,9 @@ Point2 PathCommandLimiter::segment_tangent(double along) const
 double PathCommandLimiter::strict_progress(
   double target_progress, double dt, const Point2 & old_position) const
 {
+  if (corner_fillets_) {
+    return fillet_progress(target_progress, dt, old_position);
+  }
   const double start = progress_;
   const double target = std::clamp(
     target_progress, start, installation_->path->length());
@@ -915,14 +1189,17 @@ Point2 PathCommandLimiter::update(
     waiting_vertex_.reset();
   }
 
+  const double acceleration = tangential_acceleration();
   if (!advance) {
     // A yaw-alignment pause brakes forward along the route; it cannot produce a
     // shortcut or reverse through a corner.
-    double next_speed = std::max(0.0, speed_ - max_acceleration_ * dt);
+    double next_speed = std::max(0.0, speed_ - acceleration * dt);
     const double step = next_speed * dt;
     double next_vertex = installation_->path->length();
-    for (std::size_t index = 1; index < installation_->path->cumulative().size(); ++index) {
-      const double vertex = installation_->path->cumulative()[index];
+    // A filleted arc is crossable while braking; only a remaining stop is not.
+    const auto & vertices = corner_fillets_ ?
+      installation_->bends : installation_->path->cumulative();
+    for (const double vertex : vertices) {
       if (vertex > progress_ + kEpsilon) {
         next_vertex = vertex;
         break;
@@ -961,16 +1238,17 @@ Point2 PathCommandLimiter::update(
       // prevents overshooting a corner at finite dt.
       const double braking_speed = std::max(
         0.0,
-        -max_acceleration_ * dt +
+        -acceleration * dt +
         std::sqrt(
-          (max_acceleration_ * dt) * (max_acceleration_ * dt) +
-          2.0 * max_acceleration_ * remaining));
+          (acceleration * dt) * (acceleration * dt) +
+          2.0 * acceleration * remaining));
       double desired_speed = std::min({ceiling, remaining / dt, braking_speed});
       if (corner_blending_) {
         desired_speed = std::min(desired_speed, corner_speed_limit());
       }
+      desired_speed = std::min(desired_speed, soft_vertex_speed_limit(dt));
       const double delta = std::clamp(
-        desired_speed - speed_, -max_acceleration_ * dt, max_acceleration_ * dt);
+        desired_speed - speed_, -acceleration * dt, acceleration * dt);
       // A follower ride-out requests 0.06 m/s from a 0.20 m/s cruise.
       // Reach that rate through the acceleration-limited delta, rather than
       // stepping the velocity and then clipping only its acceleration FF.
