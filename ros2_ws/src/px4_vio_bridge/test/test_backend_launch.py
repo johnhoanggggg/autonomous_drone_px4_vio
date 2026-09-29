@@ -148,6 +148,9 @@ def test_ros_navigation_monitor_uses_one_map_producer_and_atomic_body_pose():
     assert context.launch_configurations['start_backend'] == 'false'
     assert context.launch_configurations['current_goal_min_height_above_start'] == '0.30'
     assert 'current_goal_min_height_above_start' in args
+    # The route floor sits 5 cm above the flight adapter's 0.15 m min_height.
+    assert context.launch_configurations['min_route_height_above_start'] == '0.20'
+    assert 'min_route_height_above_start' in args
     assert not any('offboard' in str(a) for a in ld.entities)
 
 
@@ -169,7 +172,9 @@ def test_ros_perception_tuning_reaches_backend_and_mapper():
     for argument in ('range_min:=0.80', 'grid_depth_decimation:=2',
                      'grid_noise_min_neighbors:=6', 'mapping_rate_hz:=0.5',
                      'odometry_topic_queue_size:=2',
-                     'odometry_sync_queue_size:=2'):
+                     'odometry_sync_queue_size:=2',
+                     # IMU aiding is off unless launched with imu_aiding:=true.
+                     'use_imu:=false', 'filter_imu:=false'):
         assert argument in command
     camera_argument = next(argument for argument in command
                            if argument.startswith('camera_config:='))
@@ -295,6 +300,11 @@ def test_unknown_aware_flight_launch_uses_raw_vio_and_verified_prefix_policy():
     assert flight['command_speed'] == 0.15
     assert flight['rate_hz'] == 10.0
     assert flight['path_timeout'] == 3.5
+    # Hold the line is off unless explicitly launched with it.
+    assert flight['hold_line_skip'] == 0.0 and flight['cross_track_gain'] == 0.0
+    assert flight['hold_line_max_offset'] == 0.10 and flight['cross_track_correction_max'] == 0.08
+    assert flight['path_carrot'] is False
+    assert flight['corner_speed_min'] == 0.03 and flight['max_carrot_lead'] == 0.35
     assert flight['px4_timeout'] == 0.50
     assert flight['vehicle_control_mode_timeout'] == 0.75
     assert flight['follower_rejoin_grace'] == 1.5
@@ -328,3 +338,25 @@ def test_3d_flight_detects_existing_bag_recorders(tmp_path):
     (tmp_path/'self').mkdir()
     assert module.existing_bag_recorders(tmp_path) == [
         (100, '/usr/bin/python3 /opt/ros/jazzy/bin/ros2 bag record --all')]
+
+
+
+def test_madgwick_reads_the_frame_corrected_imu():
+    from launch.utilities import perform_substitutions
+    from launch_ros.actions import LoadComposableNodes
+    context = LaunchContext()
+    base = load('ros_rtabmap_oak_v3.launch.py')
+    for action in base.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    madgwick = next(a for a in base.entities if isinstance(a, LoadComposableNodes) and any(
+        perform_substitutions(context, node.node_plugin) == 'ImuFilterMadgwickRos'
+        for node in a._LoadComposableNodes__composable_node_descriptions))
+    nodes = {perform_substitutions(context, node.node_plugin): node
+             for node in madgwick._LoadComposableNodes__composable_node_descriptions}
+    remaps = {perform_substitutions(context, source): perform_substitutions(context, target)
+              for source, target in nodes['ImuFilterMadgwickRos'].remappings}
+    # The driver's oak_imu_frame TF is 180 deg off the raw samples.
+    assert remaps['imu/data_raw'] == '/rtabmap/imu_frame_fixed'
+    assert 'px4_vio_bridge::OakImuFrameFix' in nodes
+    assert not madgwick.condition.evaluate(context)  # opt-in via filter_imu only

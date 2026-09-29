@@ -800,7 +800,7 @@ PlanResult3D plan_path_3d(
   PlanResult3D result;
   if (config.lethal_radius <= 0.0 || config.inflation_radius < config.lethal_radius ||
     !(config.recovery_connector_radius >= 0.0) || !(config.simplify_margin >= 0.0) ||
-    config.recovery_connector_radius > config.lethal_radius)
+    config.recovery_connector_radius > config.lethal_radius || std::isnan(config.min_center_z))
   {
     result.reason = "INVALID_CONFIG";
     return result;
@@ -808,13 +808,33 @@ PlanResult3D plan_path_3d(
   return PreparedPlanner3D(raw, config).plan(start, requested_goal);
 }
 
+namespace
+{
+// A hard floor, not an obstacle: marking cells below it occupied would also
+// inflate a cost gradient that pushes every route up by inflation_radius.
+CostVoxelGrid apply_center_floor(CostVoxelGrid grid, double min_center_z)
+{
+  if (!std::isfinite(min_center_z)) {return grid;}
+  for (int z = 0; z < static_cast<int>(grid.depth()); ++z) {
+    if (grid.voxel_center({0, 0, z}).z >= min_center_z) {break;}
+    for (int y = 0; y < static_cast<int>(grid.height()); ++y) {
+      for (int x = 0; x < static_cast<int>(grid.width()); ++x) {
+        grid.set({x, y, z}, VOXEL_LETHAL_COST);
+      }
+    }
+  }
+  return grid;
+}
+}  // namespace
+
 PreparedPlanner3D::PreparedPlanner3D(
   VoxelGrid raw, const Planner3DConfig & config, const VoxelGrid * observed_unknowns)
 : raw_(std::move(raw)), config_(config),
-  inflated_(observed_unknowns ? inflate_exploration_voxels(
+  inflated_(apply_center_floor(observed_unknowns ? inflate_exploration_voxels(
       raw_, *observed_unknowns, config.lethal_radius, config.inflation_radius,
       config.cost_scaling) : inflate_voxels(
-      raw_, config.lethal_radius, config.inflation_radius, config.cost_scaling))
+      raw_, config.lethal_radius, config.inflation_radius, config.cost_scaling),
+      config.min_center_z))
 {}
 
 std::vector<Point3> verified_prefix_3d(
@@ -911,7 +931,10 @@ PlanResult3D PreparedPlanner3D::plan(const Point3 & start, const Point3 & reques
   // of flood-filling the entire connected planning volume merely to prove it
   // reachable; on the initial 6x6x2 m crop that distinction is load-bearing.
   const auto requested_voxel = raw.world_to_voxel(requested_goal);
-  if (requested_voxel && inflated.traversable(*requested_voxel)) {
+  // The exact goal is appended to the path itself, so it must clear the floor
+  // too, not merely lie in a voxel whose centre does.
+  const bool requested_above_floor = requested_goal.z >= config.min_center_z;
+  if (requested_voxel && requested_above_floor && inflated.traversable(*requested_voxel)) {
     result.search = astar_3d(
       inflated, *recovered, *requested_voxel, config.heuristic_weight,
       config.cost_weight, config.timeout_ms);
@@ -921,7 +944,7 @@ PlanResult3D PreparedPlanner3D::plan(const Point3 & start, const Point3 & reques
     }
   }
   if (!result.goal && config.project_blocked_goal &&
-    (!requested_voxel || !inflated.traversable(*requested_voxel)))
+    (!requested_voxel || !requested_above_floor || !inflated.traversable(*requested_voxel)))
   {
     // An occupied goal envelope needs an approach point, not a time-limited
     // flood fill that advances only partway across a large unknown volume.
@@ -953,6 +976,7 @@ PlanResult3D PreparedPlanner3D::plan(const Point3 & start, const Point3 & reques
     result.goal = closest_reachable_goal_3d(
       raw, inflated, *recovered, requested_goal, config.timeout_ms);
     if (!result.goal) {result.reason = "NO_REACHABLE_GOAL"; return result;}
+    if (!requested_above_floor) {result.goal->exact = false;}
     result.search = astar_3d(
       inflated, *recovered, result.goal->voxel, config.heuristic_weight,
       config.cost_weight, config.timeout_ms);

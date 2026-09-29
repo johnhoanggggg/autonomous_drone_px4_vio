@@ -40,6 +40,11 @@ def generate_launch_description():
     share = FindPackageShare("px4_vio_bridge")
     defaults = {
         "start_backend": "false", "foxglove": "false", "record_bag": "false",
+        # IMU aiding for the VIO odometry (Madgwick orientation from the
+        # frame-corrected OAK IMU). 2026-09-29 replay of one carry: starts level
+        # (0.13 vs 2.09 deg), fewer short dropouts (23 vs 34% lost), same latency,
+        # ~20% more CPU. Off until an A/B flight pair says otherwise.
+        "imu_aiding": "false",
         "use_sim_time": "false", "min_z": "0.20", "max_z": "2.00",
         "test_start_clear_radius": "0.0",
         "test_start_clear_follow_disarmed": "true",
@@ -48,6 +53,9 @@ def generate_launch_description():
         # When current-height mode is selected for flight, a waypoint clicked
         # before takeoff targets the 30 cm hover plane instead of the floor.
         "current_goal_min_height_above_start": "0.30",
+        # Same floor as the flight adapter (min_height 0.15, map frame above the
+        # takeoff ground) plus 5 cm, so no route vertex sits on its limit.
+        "min_route_height_above_start": "0.20",
         "mapping_rate_hz": "1.0", "range_min": "0.30", "range_max": "4.0",
         "grid_depth_decimation": "8",
         "grid_noise_radius": "0.15", "grid_noise_min_neighbors": "4",
@@ -73,7 +81,8 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("start_backend")), output="screen",
         cmd=[PathJoinSubstitution([FindPackagePrefix("px4_vio_bridge"), "lib",
                                   "px4_vio_bridge", "ros_rtabmap_backend"]),
-             "foxglove:=false", "use_imu:=false", "odometry_rate_hz:=0.0",
+             "foxglove:=false", ["use_imu:=", LaunchConfiguration("imu_aiding")],
+             ["filter_imu:=", LaunchConfiguration("imu_aiding")], "odometry_rate_hz:=0.0",
              "odom_reset_countdown:=0", "keep_latest_frame:=true",
              "odometry_topic_queue_size:=2", "odometry_sync_queue_size:=2",
              "odom_key_frame_thr:=0.3", "odom_vis_keyframe_thr:=150",
@@ -101,7 +110,8 @@ def generate_launch_description():
                 "foxglove", "record_bag", "use_sim_time", "min_z", "max_z",
                 "planning_radius_xy", "robot_radius", "safety_margin", "voxel_size",
                 "max_marker_voxels", "process_monitor", "goal_height_mode", "exploration_route",
-                "current_goal_min_height_above_start", "map_preparation_period",
+                "current_goal_min_height_above_start", "min_route_height_above_start",
+                "map_preparation_period",
                 "planning_pose_drift_tolerance", "start_recovery_connector_radius",
                 "route_margin")},
             "octomap_producer": "false", "simulate": "false",

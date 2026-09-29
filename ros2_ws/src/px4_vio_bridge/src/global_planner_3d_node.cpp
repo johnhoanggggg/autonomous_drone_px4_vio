@@ -172,6 +172,14 @@ public:
     current_goal_min_height_above_start_ =
       declare_parameter<double>("current_goal_min_height_above_start", 0.0);
     exploration_route_ = declare_parameter<bool>("exploration_route", false);
+    // Route-centre floor above the takeoff pose, in the map frame. The 3D flight
+    // adapter rejects any route vertex below its own min_height measured the
+    // same way, so this must sit above that with margin. -inf disables it.
+    min_route_height_above_start_ = declare_parameter<double>(
+      "min_route_height_above_start", -std::numeric_limits<double>::infinity());
+    if (std::isnan(min_route_height_above_start_)) {
+      throw std::invalid_argument("min_route_height_above_start must not be NaN");
+    }
     if (goal_height_mode_ != "clicked" && goal_height_mode_ != "current") {
       throw std::invalid_argument("goal_height_mode must be clicked or current");
     }
@@ -318,6 +326,7 @@ private:
     std::int64_t map_generation{-1};
     std::int64_t map_stamp_ns{-1};
     bool exploration_route{};
+    double min_center_z{-std::numeric_limits<double>::infinity()};
     std::optional<PreparedPlanner3D> planner;
   };
 
@@ -339,7 +348,8 @@ private:
     const bool cache_hit = cache->planner &&
       cache->map_generation == request.map_generation &&
       cache->map_stamp_ns == request.map_stamp_ns &&
-      cache->exploration_route == request.exploration_route;
+      cache->exploration_route == request.exploration_route &&
+      cache->min_center_z == request.config.min_center_z;
     const auto prepare_begin = steady_seconds();
     if (!cache_hit) {
       if (request.exploration_route) {
@@ -374,6 +384,7 @@ private:
       cache->map_generation = request.map_generation;
       cache->map_stamp_ns = request.map_stamp_ns;
       cache->exploration_route = request.exploration_route;
+      cache->min_center_z = request.config.min_center_z;
     }
     const auto plan_begin = steady_seconds();
     auto result = cache->planner->plan(request.pose, request.goal);
@@ -840,6 +851,7 @@ private:
     request.pose = reframe_map_point_3d(*pose_, map_from_odom_, raw_grid_map_from_odom_);
     request.goal = *goal_;
     request.config = config_;
+    request.config.min_center_z = route_floor_z();
     request.map_generation = raw_grid_generation_;
     request.map_stamp_ns = raw_grid_map_stamp_ns_;
     request.goal_generation = goal_generation_;
@@ -870,6 +882,12 @@ private:
       planning_radius_xy_;
   }
 
+  double route_floor_z() const
+  {
+    return takeoff_center_ ? takeoff_center_->z + min_route_height_above_start_ :
+      -std::numeric_limits<double>::infinity();
+  }
+
   void add_geofence_status(nlohmann::ordered_json & status) const
   {
     status["geofence"] = {{"min_z", min_z_}, {"max_z", max_z_},
@@ -883,6 +901,10 @@ private:
     if (goal_) {status["requested_goal"] = {goal_->x, goal_->y, goal_->z};}
     status["goal_height_mode"] = goal_height_mode_;
     status["current_goal_min_height_above_start"] = current_goal_min_height_above_start_;
+    if (std::isfinite(route_floor_z())) {
+      status["min_route_height_above_start"] = min_route_height_above_start_;
+      status["route_floor_z"] = route_floor_z();
+    }
     status["goal_height_pending"] = pending_current_goal_.has_value();
     status["exploration_route"] = exploration_route_;
     status["prepared_map_generation"] = raw_grid_generation_;
@@ -1222,6 +1244,7 @@ private:
   std::string goal_topic_;
   std::string goal_height_mode_;
   double current_goal_min_height_above_start_{};
+  double min_route_height_above_start_{};
   std::string frame_id_;
   std::string snapshot_topic_;
   bool accepted_goal_exact_{false}, accepted_goal_terminal_{false};

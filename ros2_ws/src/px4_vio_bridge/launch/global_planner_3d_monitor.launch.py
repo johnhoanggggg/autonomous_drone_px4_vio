@@ -70,6 +70,8 @@ def generate_launch_description():
         DeclareLaunchArgument("goal_topic", default_value="/waypoint/clicked"),
         DeclareLaunchArgument("goal_height_mode", default_value="clicked", choices=["clicked", "current"]),
         DeclareLaunchArgument("current_goal_min_height_above_start", default_value="0.0"),
+        # Route-centre floor above takeoff (map frame); -inf disables it.
+        DeclareLaunchArgument("min_route_height_above_start", default_value="-inf"),
         DeclareLaunchArgument("frame_id", default_value="world"),
         DeclareLaunchArgument("exploration_route", default_value="true"),
         DeclareLaunchArgument("voxel_size", default_value="0.05"),
@@ -124,6 +126,7 @@ def generate_launch_description():
         "goal_height_mode": typed("goal_height_mode", str),
         "current_goal_min_height_above_start": typed(
             "current_goal_min_height_above_start", float),
+        "min_route_height_above_start": typed("min_route_height_above_start", float),
         "exploration_route": typed("exploration_route", bool),
         "frame_id": LaunchConfiguration("frame_id"),
         "voxel_size": typed("voxel_size", float),

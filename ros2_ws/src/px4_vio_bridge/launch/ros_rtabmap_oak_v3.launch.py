@@ -174,6 +174,17 @@ def generate_launch_description():
         target_container="/oak_container",
         condition=IfCondition(LaunchConfiguration("filter_imu")),
         composable_node_descriptions=[ComposableNode(
+            # The driver's oak_imu_frame TF is 180 deg off the BMI270 samples;
+            # without this Madgwick+TF reports the camera upside down.
+            package="px4_vio_bridge",
+            plugin="px4_vio_bridge::OakImuFrameFix",
+            name="oak_imu_frame_fix",
+            parameters=[{"use_sim_time": typed("use_sim_time", bool)}],
+            remappings=[
+                ("imu_in", LaunchConfiguration("imu_topic")),
+                ("imu_out", "/rtabmap/imu_frame_fixed"),
+            ],
+        ), ComposableNode(
             package="imu_filter_madgwick",
             plugin="ImuFilterMadgwickRos",
             name="oak_imu_orientation",
@@ -184,7 +195,7 @@ def generate_launch_description():
                 "world_frame": "enu",
             }],
             remappings=[
-                ("imu/data_raw", LaunchConfiguration("imu_topic")),
+                ("imu/data_raw", "/rtabmap/imu_frame_fixed"),
                 ("imu/data", "/rtabmap/imu_orientation"),
             ],
         )],

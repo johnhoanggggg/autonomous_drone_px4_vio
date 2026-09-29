@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "px4_vio_bridge/route_follower_3d.hpp"
 
@@ -241,4 +243,209 @@ TEST(RouteFollower3D, ReplacementRejectsDifferentRouteOrBlockedRejoin)
     [](const auto &, const auto &) {return true;});
   EXPECT_TRUE(unchanged.valid);
   EXPECT_NEAR(unchanged.lookahead.y, 0.0, 1.0e-12);
+}
+
+namespace
+{
+p::Follower3DConfig hold_line_config()
+{
+  p::Follower3DConfig config;
+  config.stop_at_vertices = true;  // as flown by the 3D adapter
+  config.max_cross_track = 0.15;
+  config.max_vertical_track = 0.15;
+  config.hold_line_skip = 0.35;
+  config.hold_line_max_offset = 0.10;
+  return config;
+}
+const auto always_clear = [](const p::Point3 &, const p::Point3 &) {return true;};
+}  // namespace
+
+TEST(RouteFollower3D, HoldLineKeepsRouteWhenReplanOnlyRestartsAtTheDrone)
+{
+  p::RouteFollower3D follower(hold_line_config());
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  for (int i = 0; i < 20; ++i) {ASSERT_TRUE(follower.update({0.1 * i / 20, 0.0, 0.5}, 0.1, always_clear).valid);}
+  // The drone drifted 8 cm left; the planner's replan starts there and rejoins.
+  const p::Point3 drone{0.25, 0.08, 0.5};
+  const std::vector<p::Point3> replan{drone, {0.30, 0.07, 0.5}, {0.9, 0.0, 0.5}, {3.0, 0.0, 0.5}};
+  int checks = 0;
+  ASSERT_TRUE(follower.hold_equivalent_path(replan, drone, 0.10,
+    [&checks](const auto &, const auto &) {++checks; return true;}));
+  EXPECT_GE(checks, 1);  // the held route was re-validated
+  const auto held = follower.update(drone, 0.1, always_clear);
+  ASSERT_TRUE(held.valid) << held.reason;
+  // Command and route stay on the original line, not on the drifted start.
+  EXPECT_NEAR(held.carrot.y, 0.0, 1e-9);
+  EXPECT_NEAR(held.projection.point.y, 0.0, 1e-9);
+}
+
+TEST(RouteFollower3D, HoldLineAdoptsTheReplanWhenFarOffDifferentOrBlocked)
+{
+  p::RouteFollower3D follower(hold_line_config());
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  // Drone beyond hold_line_max_offset: take the replan.
+  EXPECT_FALSE(follower.hold_equivalent_path(
+    {{0.3, 0.14, 0.5}, {0.9, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.3, 0.14, 0.5}, 0.10, always_clear));
+  // A genuinely different route (around something new): take it.
+  EXPECT_FALSE(follower.hold_equivalent_path(
+    {{0.3, 0.02, 0.5}, {1.0, 0.4, 0.5}, {3.0, 0.0, 0.5}}, {0.3, 0.02, 0.5}, 0.10, always_clear));
+  // The held route no longer clears the map: take the replan.
+  EXPECT_FALSE(follower.hold_equivalent_path(
+    {{0.3, 0.02, 0.5}, {3.0, 0.0, 0.5}}, {0.3, 0.02, 0.5}, 0.10,
+    [](const auto &, const auto &) {return false;}));
+  // Disabled by default.
+  p::RouteFollower3D plain;
+  ASSERT_TRUE(plain.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  EXPECT_FALSE(plain.hold_equivalent_path(
+    {{0.3, 0.02, 0.5}, {3.0, 0.0, 0.5}}, {0.3, 0.02, 0.5}, 0.10, always_clear));
+}
+
+TEST(RouteFollower3D, CrossTrackCorrectionPullsBackProportionallyAndCapped)
+{
+  auto config = hold_line_config();
+  config.cross_track_gain = 0.5;
+  config.cross_track_correction_max = 0.04;
+  p::RouteFollower3D follower(config);
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  // 6 cm left and 2 cm high -> 0.5 x (0.06, 0.02) = 3.2 cm toward the line, under the cap.
+  const auto small = follower.update({0.05, 0.06, 0.52}, 0.1, always_clear);
+  ASSERT_TRUE(small.valid) << small.reason;
+  EXPECT_NEAR(small.correction.x, 0.0, 1e-9);  // no along-track component
+  EXPECT_NEAR(small.correction.y, -0.03, 1e-9);
+  EXPECT_NEAR(small.correction.z, -0.01, 1e-9);
+  EXPECT_NEAR(small.displacement.y, small.carrot.y + small.correction.y - 0.06, 1e-9);
+  // 12 cm off -> 6 cm wanted, capped at 4 cm.
+  const auto big = follower.update({0.06, 0.12, 0.5}, 0.1, always_clear);
+  ASSERT_TRUE(big.valid) << big.reason;
+  EXPECT_NEAR(std::hypot(big.correction.y, big.correction.z), 0.04, 1e-9);
+  // A blocked corrected command falls back to the plain carrot.
+  int calls = 0;
+  const auto blocked = follower.update({0.07, 0.06, 0.5}, 0.1, [&calls](const auto &, const auto &) {
+      return ++calls < 3;  // lookahead + carrot chords pass, corrected chord fails
+    });
+  ASSERT_TRUE(blocked.valid) << blocked.reason;
+  EXPECT_NEAR(blocked.correction.y, 0.0, 1e-12);
+}
+
+namespace
+{
+p::Follower3DConfig carrot_config()
+{
+  auto config = hold_line_config();
+  config.path_carrot = true;
+  config.max_horizontal_speed = 0.15;
+  config.max_vertical_speed = 0.10;
+  config.max_cross_track = 0.30;
+  config.max_vertical_track = 0.30;
+  return config;
+}
+// Drone tracks the command one tick late; returns the speed profile.
+std::vector<double> fly(p::RouteFollower3D & follower, p::Point3 pose, int ticks, bool * reached = nullptr)
+{
+  std::vector<double> speeds;
+  for (int i = 0; i < ticks; ++i) {
+    const auto r = follower.update(pose, 0.1, always_clear);
+    EXPECT_TRUE(r.valid) << r.reason;
+    if (!r.valid) {break;}
+    speeds.push_back(std::hypot(std::hypot(r.velocity.x, r.velocity.y), r.velocity.z));
+    if (reached && r.reached) {*reached = true;}
+    pose = r.carrot;
+  }
+  return speeds;
+}
+}  // namespace
+
+TEST(RouteFollower3D, PathCarrotSlowsForCornersWithoutStopping)
+{
+  p::RouteFollower3D follower(carrot_config());
+  // 1 m east, then a 45 degree turn, then 1 m north-east.
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {1.0, 0.0, 0.5}, {1.7071, 0.7071, 0.5}}, {0.0, 0.0, 0.5}));
+  bool reached = false;
+  const auto speeds = fly(follower, {0.0, 0.0, 0.5}, 250, &reached);
+  EXPECT_TRUE(reached);
+  // Cruise at the limit, never stop before the end, and cross the corner no faster than
+  // 0.15 cos 45 (the discrete braking bound undershoots it by up to one tick of braking).
+  const auto peak = *std::max_element(speeds.begin(), speeds.end());
+  EXPECT_NEAR(peak, 0.15, 1e-6);
+  std::size_t first = 0; while (first < speeds.size() && speeds[first] < 0.14) {++first;}
+  std::size_t last = speeds.size() - 1; while (last > 0 && speeds[last] < 0.14) {--last;}
+  ASSERT_LT(first, last);
+  const auto dip = *std::min_element(speeds.begin() + first, speeds.begin() + last);
+  EXPECT_GT(dip, 0.15 * std::cos(M_PI / 4) - 0.3 * 0.1);
+  EXPECT_LE(dip, 0.15 * std::cos(M_PI / 4) + 1e-6);
+  // The same route with vertex stops comes to rest at the corner.
+  auto stops = carrot_config();
+  stops.path_carrot = false;
+  p::RouteFollower3D stopper(stops);
+  ASSERT_TRUE(stopper.set_path({{0.0, 0.0, 0.5}, {1.0, 0.0, 0.5}, {1.7071, 0.7071, 0.5}}, {0.0, 0.0, 0.5}));
+  const auto stop_speeds = fly(stopper, {0.0, 0.0, 0.5}, 250);
+  std::size_t moving = 0; while (moving < stop_speeds.size() && stop_speeds[moving] < 0.05) {++moving;}
+  EXPECT_LT(*std::min_element(stop_speeds.begin() + moving, stop_speeds.begin() + moving + 100), 1e-3);
+}
+
+TEST(RouteFollower3D, PathCarrotRespectsAccelerationAndVerticalLimits)
+{
+  p::RouteFollower3D follower(carrot_config());
+  // 45 degree climb: the vertical limit (0.10) caps the along speed at 0.1414.
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.3}, {1.0, 0.0, 1.3}}, {0.0, 0.0, 0.3}));
+  const auto speeds = fly(follower, {0.0, 0.0, 0.3}, 200);
+  const double along_accel = 0.2 * std::sqrt(2.0);  // vertical 0.2 m/s2 along a 45 degree climb
+  for (std::size_t i = 1; i < speeds.size(); ++i) {
+    EXPECT_LE(std::abs(speeds[i] - speeds[i - 1]) / 0.1, along_accel + 1e-6) << i;
+    EXPECT_LE(speeds[i], 0.10 * std::sqrt(2.0) + 1e-6);
+  }
+  EXPECT_NEAR(*std::max_element(speeds.begin(), speeds.end()), 0.10 * std::sqrt(2.0), 1e-6);
+  EXPECT_NEAR(speeds.back(), 0.0, 1e-3);  // stops at the end
+}
+
+TEST(RouteFollower3D, PathCarrotNeverTrailsAndLimitsItsLead)
+{
+  p::RouteFollower3D follower(carrot_config());
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  // The drone does not move: the command stops within max_carrot_lead ahead.
+  p::FollowResult3D r;
+  for (int i = 0; i < 100; ++i) {r = follower.update({0.0, 0.0, 0.5}, 0.1, always_clear);}
+  ASSERT_TRUE(r.valid) << r.reason;
+  EXPECT_LE(r.carrot.x, 0.35 + 1e-9);
+  EXPECT_GT(r.carrot.x, 0.2);
+  EXPECT_NEAR(std::hypot(r.velocity.x, r.velocity.y), 0.0, 0.02);
+  // The drone is pushed well past the command: it restarts from the drone, not behind it.
+  r = follower.update({1.0, 0.05, 0.5}, 0.1, always_clear);
+  ASSERT_TRUE(r.valid) << r.reason;
+  EXPECT_GE(r.carrot.x, 1.0);
+  EXPECT_NEAR(r.carrot.y, 0.0, 1e-9);  // the command stays on the route
+}
+
+TEST(RouteFollower3D, PathCarrotSeedKeepsSpeedAcrossANewRoute)
+{
+  p::RouteFollower3D follower(carrot_config());
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  follower.seed_velocity({0.15, 0.02, 0.0});
+  const auto r = follower.update({0.0, 0.0, 0.5}, 0.1, always_clear);
+  ASSERT_TRUE(r.valid) << r.reason;
+  EXPECT_NEAR(r.velocity.x, 0.15, 1e-6);  // along-route part kept, no restart from zero
+  EXPECT_NEAR(r.velocity.y, 0.0, 1e-12);
+  // Seeding against the route direction does not command a reverse.
+  p::RouteFollower3D reverse(carrot_config());
+  ASSERT_TRUE(reverse.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  reverse.seed_velocity({-0.15, 0.0, 0.0});
+  const auto back = reverse.update({0.0, 0.0, 0.5}, 0.1, always_clear);
+  ASSERT_TRUE(back.valid);
+  EXPECT_GE(back.velocity.x, 0.0);
+  EXPECT_LE(back.velocity.x, 0.03 + 1e-9);
+}
+
+TEST(RouteFollower3D, PathCarrotHoldLineKeepsTheCommandMoving)
+{
+  p::RouteFollower3D follower(carrot_config());
+  ASSERT_TRUE(follower.set_path({{0.0, 0.0, 0.5}, {3.0, 0.0, 0.5}}, {0.0, 0.0, 0.5}));
+  const auto speeds = fly(follower, {0.0, 0.0, 0.5}, 20);
+  ASSERT_GT(speeds.back(), 0.14);
+  const p::Point3 drone{0.25, 0.06, 0.5};
+  ASSERT_TRUE(follower.hold_equivalent_path(
+    {drone, {0.35, 0.03, 0.5}, {0.9, 0.0, 0.5}, {3.0, 0.0, 0.5}}, drone, 0.10, always_clear));
+  const auto r = follower.update(drone, 0.1, always_clear);
+  ASSERT_TRUE(r.valid) << r.reason;
+  EXPECT_NEAR(r.carrot.y, 0.0, 1e-9);
+  EXPECT_GT(r.velocity.x, 0.13);  // no restart from standstill
 }

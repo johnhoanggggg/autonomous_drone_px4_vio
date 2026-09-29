@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -60,6 +61,10 @@ struct Planner3DConfig
   // simplify_path_3d). 0 keeps the historical lethal-radius shortcuts.
   double simplify_margin{0.0};
   bool project_blocked_goal{false};
+  // Hard floor for route centres (same frame as the grid). Cells whose centre
+  // is below it are lethal, so every A* vertex, and therefore every chord
+  // between vertices, stays at or above it. -inf disables it.
+  double min_center_z{-std::numeric_limits<double>::infinity()};
 };
 
 struct SearchResult3D

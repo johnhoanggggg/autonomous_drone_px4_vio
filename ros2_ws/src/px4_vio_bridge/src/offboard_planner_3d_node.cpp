@@ -76,6 +76,18 @@ public:
     config_.max_vertical_track=declare_parameter<double>("max_vertical_track",.15);
     config_.stop_at_vertices=true;
     config_.arrival_tolerance=declare_parameter<double>("arrival_tolerance",.10);
+    // Hold the line (0 = off): keep the route and command point across replans
+    // that only differ in their drone-anchored first metres, and pull the
+    // command back toward the route in proportion to the drone's offset.
+    config_.hold_line_skip=declare_parameter<double>("hold_line_skip",0.0);
+    config_.hold_line_max_offset=declare_parameter<double>("hold_line_max_offset",.10);
+    config_.cross_track_gain=declare_parameter<double>("cross_track_gain",0.0);
+    config_.cross_track_correction_max=declare_parameter<double>("cross_track_correction_max",.08);
+    // Path carrot (0 = off): move the command point along the route instead of
+    // stopping at every vertex; slow before corners by their angle.
+    config_.path_carrot=declare_parameter<bool>("path_carrot",false);
+    config_.corner_speed_min=declare_parameter<double>("corner_speed_min",.03);
+    config_.max_carrot_lead=declare_parameter<double>("max_carrot_lead",.35);
     info_topic_=declare_parameter<std::string>("vio_info_topic","/rtabmap/vio_odom_info_lite");
     const bool brake_damping=declare_parameter<bool>("brake_damping",false);
     const double damping_gain=declare_parameter<double>("damping_gain",.75);
@@ -107,7 +119,16 @@ public:
       !std::isfinite(config_.heading_lookahead) || config_.heading_lookahead<0 ||
       !std::isfinite(map_pair_wait_) || map_pair_wait_<0 ||
       !std::isfinite(yaw_deadband_) || yaw_deadband_<0 || yaw_deadband_>=yaw_resume_ ||
-      route_equivalence_tolerance_>std::min(config_.max_cross_track,config_.max_vertical_track))
+      route_equivalence_tolerance_>std::min(config_.max_cross_track,config_.max_vertical_track) ||
+      !std::isfinite(config_.hold_line_skip) || config_.hold_line_skip<0 ||
+      !std::isfinite(config_.hold_line_max_offset) || config_.hold_line_max_offset<=0 ||
+      config_.hold_line_max_offset>std::min(config_.max_cross_track,config_.max_vertical_track) ||
+      !std::isfinite(config_.cross_track_gain) || config_.cross_track_gain<0 || config_.cross_track_gain>1.5 ||
+      !std::isfinite(config_.corner_speed_min) || config_.corner_speed_min<=0 ||
+      config_.corner_speed_min>config_.max_horizontal_speed ||
+      !std::isfinite(config_.max_carrot_lead) || config_.max_carrot_lead<0 ||
+      !std::isfinite(config_.cross_track_correction_max) || config_.cross_track_correction_max<0 ||
+      config_.cross_track_correction_max>radius_)
     {throw std::invalid_argument("invalid 3D flight bounds or yaw limits");}
     if (!std::isfinite(damping_velocity_timeout_) || damping_velocity_timeout_<=0) {
       throw std::invalid_argument("damping_velocity_timeout must be finite and positive");
@@ -175,6 +196,11 @@ public:
       {"vehicle_control_mode_timeout",vehicle_control_mode_timeout_},
       {"follower_rejoin_grace",follower_rejoin_grace_},
       {"route_equivalence_tolerance",route_equivalence_tolerance_},
+      {"hold_line_skip",config_.hold_line_skip},{"hold_line_max_offset",config_.hold_line_max_offset},
+      {"cross_track_gain",config_.cross_track_gain},
+      {"cross_track_correction_max",config_.cross_track_correction_max},
+      {"path_carrot",config_.path_carrot},{"corner_speed_min",config_.corner_speed_min},
+      {"max_carrot_lead",config_.max_carrot_lead},
       {"vio_info_topic",info_topic_},{"max_vio_source_age",max_vio_source_age_},
       {"feature_health","configured OdomInfo inliers and lost"},{"min_inliers",min_vio_features_},
       {"position_control",true},{"brake_damping",brake_damper_->enabled()},
@@ -320,7 +346,15 @@ protected:
       const bool exact_path = path_points_.size()==active_points_.size() &&
         std::equal(path_points_.begin(),path_points_.end(),active_points_.begin(),
         [](const Point3&a,const Point3&b){return a.x==b.x && a.y==b.y && a.z==b.z;});
-      bool retained = follower_ && exact_path && follower_goal_==path_goal_;
+      // A held route differs from the latest path, so an "exact" republish on a
+      // new map must still re-validate it through hold_equivalent_path.
+      bool retained = follower_ && exact_path && follower_goal_==path_goal_ && !holding_line_;
+      if (!retained && follower_ && follower_goal_==path_goal_) {
+        retained=follower_->hold_equivalent_path(path_points_,body,
+          route_equivalence_tolerance_,[this](const Point3&a,const Point3&b){return chord(a,b);});
+        if (retained) {++held_replans_;}
+        holding_line_=retained;
+      }
       if (!retained && follower_ && follower_goal_==path_goal_) {
         retained=follower_->replace_equivalent_path(path_points_,body,
           route_equivalence_tolerance_,[this](const Point3&a,const Point3&b){return chord(a,b);});
@@ -328,8 +362,13 @@ protected:
       }
       if (!retained) {
         const auto up=rotate(correction_->orientation,{0,0,1});
+        const auto carried=follower_ ? std::optional<Point3>(follower_->velocity()) : std::nullopt;
         follower_=std::make_unique<RouteFollower3D>(limits_for_map_tilt(config_,up.z));
+        holding_line_=false;
         if (!follower_->set_path(path_points_,body)) {fault("INVALID_ROUTE");return true;}
+        // A replacement route keeps the command's speed instead of restarting
+        // from standstill (the stop-start surge at every adopted replan).
+        if (config_.path_carrot && carried) {follower_->seed_velocity(*carried);}
       }
       active_points_=path_points_;follower_goal_=path_goal_;
       follower_generation_=path_validated_generation_;
@@ -420,6 +459,14 @@ private:
   {
     pose_=p.pose;correction_=p.correction;pose_stamp_=p.stamp;pose_generation_=p.generation;
     pose_map_stamp_=p.map_stamp;pose_received_=p.received;
+    // Heights are judged in the map frame, where the planner puts its floor.
+    // PX4 flies in the VIO odometry frame, which on 09-28 sat 5-10 deg off
+    // gravity, so a PX4 height 2 m from takeoff was off by up to 0.3 m. Track
+    // the map-frame ground until arming (RC or auto), then freeze it. Seen first
+    // while already armed, it is derived from the NED ground at this spot.
+    if (ground_ && pos_ && (!is_armed() || !ground_map_z_)) {
+      ground_map_z_=pose_->position.z-(ground_->z-pos_->z);
+    }
   }
   // Adopt a staged map only with a pose snapshot of the same generation, so
   // map, pose and correction always change together.
@@ -498,10 +545,23 @@ private:
     } catch (...) {}
     return false;
   }
+  // The horizontal geofence stays in PX4 NED (tilt barely changes it); height
+  // is measured in the map frame above the ground latched at arm.
+  bool ned_within_geofence(const Point3 & ned) const
+  {
+    constexpr double any=std::numeric_limits<double>::infinity();
+    return within_flight_bounds(ned,*ground_,geofence_-radius_,-any,any);
+  }
+  bool map_height_within(double map_z,double low,double high) const
+  {
+    if (!ground_map_z_) {return false;}
+    const double height=map_z-*ground_map_z_;
+    return std::isfinite(height) && height>=low && height<=high;
+  }
   bool map_point_in_bounds(const Point3 & p,bool climb) const
   {
     const auto ned=add_3d(local_point(),map_delta_to_ned(subtract_3d(p,point3(pose_->position)),correction_->orientation,yaw_offset_));
-    return within_flight_bounds(ned,*ground_,geofence_-radius_,climb?-.05:min_height_,max_height_);
+    return ned_within_geofence(ned) && map_height_within(p.z,climb?-.05:min_height_,max_height_);
   }
   std::string validate_path_for_current_map()
   {
@@ -537,7 +597,10 @@ private:
       !fresh_stamp(pose_stamp_,ns,max_vio_source_age_)) {return "POSE_STALE";}
     if (pose_generation_!=generation_ || pose_map_stamp_!=map_stamp_ ||
       !same_snapshot_transform(*correction_,map_correction_)) {return "POSE_MAP_MISMATCH";}
-    if (!within_flight_bounds(local_point(),*ground_,geofence_,-.15,max_height_+.15)) {return "GEOFENCE";}
+    if (ground_map_z_ ? !within_flight_bounds(local_point(),*ground_,geofence_,
+        -std::numeric_limits<double>::infinity(),std::numeric_limits<double>::infinity()) ||
+      !map_height_within(pose_->position.z,-.15,max_height_+.15) :
+      !within_flight_bounds(local_point(),*ground_,geofence_,-.15,max_height_+.15)) {return "GEOFENCE";}
     if (info_lost_ || !fresh_stamp(info_stamp_,ns,max_vio_source_age_) || !ev_valid_) {return "VIO_HEALTH";}
     // Inherited checks use monotonic receipts; atomic pose/info also enforce source age.
     if (stale(last_vio_pose_time_,vio_pose_timeout_) || stale(last_vio_feature_time_,vio_feature_timeout_) ||
@@ -563,9 +626,10 @@ private:
     const auto previous=command_.value_or(limiter_->position());const auto limited=limiter_->update(target,dt_);
     // Audit the exact float-valued position published in TrajectorySetpoint.
     const Point3 candidate{static_cast<float>(limited.x),static_cast<float>(limited.y),static_cast<float>(limited.z)};
-    if (!within_flight_bounds(candidate,*ground_,geofence_-radius_,climb?-.05:min_height_,max_height_)) {return "COMMAND_GEOFENCE";}
+    if (!ned_within_geofence(candidate)) {return "COMMAND_GEOFENCE";}
     const auto body=point3(pose_->position);
     const auto mapped=add_3d(body,ned_delta_to_map(subtract_3d(candidate,actual),correction_->orientation,yaw_offset_));
+    if (!map_height_within(mapped.z,climb?-.05:min_height_,max_height_)) {return "COMMAND_GEOFENCE";}
     const auto previous_mapped=add_3d(body,ned_delta_to_map(subtract_3d(previous,actual),correction_->orientation,yaw_offset_));
     if (!chord(body,mapped) || !chord(previous_mapped,mapped)) {return "FINAL_COMMAND_OBSTACLE";}
     command_=candidate;vertical_velocity_.reset();last_map_command_=mapped;previous_map_command_=previous_mapped;
@@ -696,7 +760,9 @@ private:
     escape_lead_=lead;
     const Point3 lead_ned{step_ned.x/std::max(step_h,1.0e-6)*lead,step_ned.y/std::max(step_h,1.0e-6)*lead,0.0};
     const auto target=add_3d(add_3d(actual,step_ned),lead_ned);
-    if (!within_flight_bounds(target,*ground_,geofence_-radius_,min_height_,max_height_)) {return false;}
+    if (!ned_within_geofence(target) || !map_height_within(
+        body.z+ned_delta_to_map(subtract_3d(target,actual),correction_->orientation,yaw_offset_).z,
+        min_height_,max_height_)) {return false;}
     // Restart from the vehicle, not the frozen hold command: the map that
     // grew under it may have made that command unsafe too.
     const auto base=escape_active_ ? *command_ : add_3d(actual,lead_ned);
@@ -768,12 +834,14 @@ private:
     j["follower_rejoin_grace_s"]=follower_rejoin_grace_;
     j["follower_latch_reason"]=follower_latch_reason_;
     j["equivalent_replans_retained"]=equivalent_replans_retained_;
+    j["held_replans"]=held_replans_;
     if (follower_) {
       const auto velocity=follower_->velocity();
       j["follower_velocity_map"]={velocity.x,velocity.y,velocity.z};
     }
     if (vertical_velocity_) {j["vertical_velocity_feedforward"]=*vertical_velocity_;}
     if (ground_) {j["ground_ned"]={ground_->x,ground_->y,ground_->z};}
+    if (ground_map_z_) {j["ground_map_z"]=*ground_map_z_;}
     if (command_) {j["command_ned"]={command_->x,command_->y,command_->z};}
     if (pose_) {j["body_map"]={pose_->position.x,pose_->position.y,pose_->position.z};}
     j["setpoint_timestamp_us"]=last_setpoint_us_;j["command_clearance_checked"]=clearance_checked_;
@@ -801,6 +869,7 @@ private:
   std::unique_ptr<FlightPositionLimiter3D> limiter_;
   std::unique_ptr<RouteFollower3D> follower_;
   std::optional<Point3> ground_,command_,last_map_command_;
+  std::optional<double> ground_map_z_;
   std::optional<double> yaw_target_,vertical_velocity_,local_received_,mode_received_,map_received_,pose_received_,path_received_,hover_ready_since_,fault_since_,goal_since_,follower_latch_since_;
   std::optional<Pose3> pose_,correction_;Pose3 map_correction_;
   std::optional<std::array<unsigned,3>> resets_;std::optional<unsigned> ev_reset_;
@@ -810,6 +879,8 @@ private:
   std::int64_t path_stamp_{},path_generation_{},path_map_stamp_{},path_validated_generation_{},path_validated_map_stamp_{};
   std::int64_t path_goal_{},latest_goal_{},minimum_goal_{},follower_path_stamp_{},follower_generation_{},follower_goal_{};
   std::uint64_t equivalent_replans_retained_{};
+  std::uint64_t held_replans_{};
+  bool holding_line_{};
   std::unique_ptr<BrakeDamping> brake_damper_;
   double fault_escape_step_{},fault_escape_limit_{},fault_escape_speed_{},escape_minimum_improvement_{};
   double fault_escape_brake_lead_time_{},fault_escape_brake_lead_max_{};

@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Run `ros2 bag record` so a flight bag survives the Pi losing power afterwards.
+
+Usage: durable_bag_record [--sync-period S] -- ros2 bag record ... --output DIR ...
+
+The Pi resets ~25-40 s after the last landing of a session (battery swap). Linux
+keeps up to 30 s of writes only in RAM (vm.dirty_expire_centisecs 3000), so the
+bag's metadata.yaml, written when the recorder stops, came back as 0 bytes and
+the bag lost its last seconds. This wrapper forwards SIGINT/SIGTERM to the
+recorder, flushes to the SD card every `--sync-period` seconds while recording,
+flushes again once the recorder has written its metadata, and says whether the
+bag is safe.
+"""
+import argparse
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+
+def output_dir(command):
+    for index, argument in enumerate(command):
+        if argument in ('--output', '-o') and index + 1 < len(command):
+            return Path(command[index + 1])
+        if argument.startswith('--output='):
+            return Path(argument.split('=', 1)[1])
+    return None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument('--sync-period', type=float, default=2.0)
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ['--'] else args.command
+    if not command:
+        parser.error('missing recorder command after --')
+    bag = output_dir(command)
+    # Own session: a terminal Ctrl-C reaches the launch and this wrapper, and the
+    # launch then signals us again. The recorder must see ONE SIGINT so it stops
+    # gracefully and writes metadata; SIGTERM escalation is passed through.
+    child = subprocess.Popen(command, start_new_session=True)
+    interrupted = []
+
+    def forward(signum, _frame):
+        if child.poll() is not None:
+            return
+        if signum in (signal.SIGINT, signal.SIGHUP):
+            # A closed terminal (SIGHUP) must still finalize the bag, not orphan
+            # the recorder in its own session.
+            if interrupted:
+                return
+            interrupted.append(True)
+            signum = signal.SIGINT
+        child.send_signal(signum)
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+
+    next_sync = time.monotonic() + args.sync_period
+    while child.poll() is None:
+        try:
+            child.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        if args.sync_period > 0 and time.monotonic() >= next_sync:
+            os.sync()
+            next_sync = time.monotonic() + args.sync_period
+    os.sync()
+    metadata = bag / 'metadata.yaml' if bag else None
+    if metadata and metadata.is_file() and metadata.stat().st_size > 0:
+        print(f'[durable_bag_record] BAG SAVED to disk: {bag} -- safe to unplug', flush=True)
+    else:
+        print(f'[durable_bag_record] ERROR: bag not finalized ({metadata} missing or empty); '
+              f'recorder exit code {child.returncode}. Reindex with: ros2 bag reindex {bag} -s mcap',
+              file=sys.stderr, flush=True)
+    return child.returncode
+
+
+if __name__ == '__main__':
+    sys.exit(main())

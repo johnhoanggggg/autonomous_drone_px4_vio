@@ -66,6 +66,9 @@ def audit(bag):
             if actual is None or actual != value['command_ned']:
                 errors.append({'error':'status does not match emitted PX4 setpoint','timestamp_us':value['setpoint_timestamp_us'],'actual':actual,'status':value['command_ned'],'state':value['state']});continue
             origin=value['ground_ned'];height=origin[2]-actual[2]
+            # Since 2026-09-28 the adapter judges height in the map frame above
+            # the ground latched at arm (PX4's VIO frame can be tilted).
+            if 'ground_map_z' in value:height=value['command_map'][2]-value['ground_map_z']
             low=cfg['min_height'] if value['flight_state']=='ROUTE' else -.05
             if math.hypot(actual[0]-origin[0],actual[1]-origin[1])>cfg['geofence_radius']-cfg['required_clearance']+1e-6 or not low-1e-6<=height<=cfg['max_height']+1e-6:
                 errors.append({'error':'command exceeds configured flight bounds'});continue

@@ -27,6 +27,8 @@ public:
   [[nodiscard]] double length() const {return cumulative_.back();}
   [[nodiscard]] Projection3D project(const Point3 & point) const;
   [[nodiscard]] Point3 point_at(double along) const;
+  // Arc length at each vertex (same size as points()).
+  [[nodiscard]] const std::vector<double> & cumulative() const {return cumulative_;}
 
 private:
   std::vector<Point3> points_;

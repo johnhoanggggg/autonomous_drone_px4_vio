@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 #include "px4_vio_bridge/grid_planner_3d.hpp"
 
@@ -517,6 +518,55 @@ TEST(GridPlanner3D, VerifiedPrefixCannotSkipAnUnseenStartOrGap)
   EXPECT_EQ(p::verified_prefix_3d(raw, route, 0.35).size(), route.size());
   raw.set({6, 10, 10}, p::VoxelState::Unknown);
   EXPECT_TRUE(p::verified_prefix_3d(raw, route, 0.35).empty());
+}
+
+TEST(GridPlanner3D, RouteFloorForcesTheRouteOverAWallInsteadOfUnderIt)
+{
+  // A wall at x=2 m spans z 0.6-1.6 m, leaving gaps below and above it.
+  p::VoxelGrid raw(40, 20, 20, 0.1, {0.0, 0.0, 0.0}, p::VoxelState::Free);
+  for (int z = 6; z < 16; ++z) {
+    for (int y = 0; y < 20; ++y) {raw.set({20, y, z}, p::VoxelState::Occupied);}
+  }
+  p::Planner3DConfig config;
+  config.lethal_radius = 0.10;
+  config.inflation_radius = 0.20;
+  config.timeout_ms = 1000.0;
+  config.project_blocked_goal = true;
+  const p::Point3 start{0.55, 1.05, 0.45}, goal{3.55, 1.05, 0.45};
+  const auto max_z = [](const std::vector<p::Point3> & path) {
+      double z = -1.0;
+      for (const auto & point : path) {z = std::max(z, point.z);}
+      return z;
+    };
+  const auto low = p::plan_path_3d(raw, start, goal, config);
+  ASSERT_TRUE(low.found()) << low.reason;
+  EXPECT_LT(max_z(low.path), 0.6);
+
+  config.min_center_z = 0.5;
+  const auto floored = p::plan_path_3d(raw, start, goal, config);
+  ASSERT_TRUE(floored.found()) << floored.reason;
+  EXPECT_GT(max_z(floored.path), 1.6);
+  // Only the body itself may be below the floor; every vertex after it, and so
+  // every chord between them, is at or above it.
+  for (std::size_t i = 1; i < floored.path.size(); ++i) {
+    EXPECT_GE(floored.path[i].z, 0.5) << i;
+  }
+  // The requested goal is below the floor, so it is never appended exactly.
+  ASSERT_TRUE(floored.goal);
+  EXPECT_FALSE(floored.goal->exact);
+  EXPECT_NEAR(floored.path.back().x, goal.x, 1e-9);
+  EXPECT_GE(floored.path.back().z, 0.5);
+}
+
+TEST(GridPlanner3D, RouteFloorRejectsNaN)
+{
+  p::VoxelGrid raw(10, 10, 10, 0.1, {0.0, 0.0, 0.0}, p::VoxelState::Free);
+  p::Planner3DConfig config;
+  config.lethal_radius = 0.10;
+  config.inflation_radius = 0.20;
+  config.min_center_z = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(p::plan_path_3d(raw, {0.45, 0.45, 0.45}, {0.65, 0.45, 0.45}, config).reason,
+    "INVALID_CONFIG");
 }
 
 TEST(GridPlanner3D, ProjectsLowGoalToAReachableApproachAboveFloor)

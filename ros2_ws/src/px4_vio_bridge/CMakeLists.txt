@@ -41,6 +41,13 @@ rclcpp_components_register_nodes(oak_tracked_rgbd_component
   "px4_vio_bridge::OakTrackedOdometry"
 )
 
+add_library(oak_imu_frame_fix_component SHARED src/oak_imu_frame_fix_component.cpp)
+target_compile_features(oak_imu_frame_fix_component PUBLIC cxx_std_17)
+ament_target_dependencies(oak_imu_frame_fix_component rclcpp rclcpp_components sensor_msgs)
+rclcpp_components_register_nodes(oak_imu_frame_fix_component
+  "px4_vio_bridge::OakImuFrameFix"
+)
+
 # ROS-free flight geometry: the exact counterpart of grid_planner.py's
 # clearance test, path_follower.py's polyline and planner_flight.py's command
 # limiters. Kept separate from the node so the parity tests can link it alone.
@@ -209,6 +216,7 @@ ament_target_dependencies(cpp_flight_adapter_3d geometry_msgs nav_msgs px4_msgs 
 
 install(TARGETS
   oak_tracked_rgbd_component
+  oak_imu_frame_fix_component
   planner_flight_cpp
   slam_pose_relay_cpp
   cpp_slam_pose_relay
@@ -236,6 +244,7 @@ install(TARGETS
 install(DIRECTORY include/ DESTINATION include)
 
 install(PROGRAMS
+  scripts/durable_bag_record
   scripts/foxglove_image_throttle
   scripts/ros_rtabmap_backend
   scripts/basalt_odometry_test
@@ -325,6 +334,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_parity_realtime_replay test/test_parity_realtime_replay.py)
   ament_add_pytest_test(test_loop_closure_metrics test/test_loop_closure_metrics.py)
   ament_add_pytest_test(test_oak_tracked_odometry test/test_oak_tracked_odometry.py TIMEOUT 60)
+  ament_add_pytest_test(test_oak_imu_frame_fix test/test_oak_imu_frame_fix.py TIMEOUT 60)
+  ament_add_pytest_test(test_durable_bag_record test/test_durable_bag_record.py TIMEOUT 120)
 endif()
 
 ament_package()

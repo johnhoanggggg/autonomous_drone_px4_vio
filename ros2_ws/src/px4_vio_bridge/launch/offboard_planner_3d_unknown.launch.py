@@ -18,6 +18,13 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from px4_vio_bridge.log_paths import timestamped_bag
+from launch.substitutions import PathJoinSubstitution
+from launch_ros.substitutions import FindPackagePrefix
+
+# Wraps `ros2 bag record` so the bag is flushed to the SD card and finalized
+# even when the Pi loses power shortly after the flight (see the script).
+DURABLE_RECORD = PathJoinSubstitution(
+    [FindPackagePrefix("px4_vio_bridge"), "lib", "px4_vio_bridge", "durable_bag_record"])
 
 FLIGHT_RECORD_TOPICS = (
     '/rosout', '/fmu/in/offboard_control_mode', '/fmu/in/trajectory_setpoint',
@@ -116,10 +123,22 @@ def generate_launch_description():
         # Opt-in hold damping (gain 0.75, 0.10 m/s2 cap): opposes measured drift
         # only while ROUTE holds a frozen command. Default OFF until flown.
         'brake_damping': 'false',
+        # Hold the line (OFF by default until flown): keep the route across
+        # replans that only differ in their drone-anchored first metres, and pull
+        # the command back toward the route. Path carrot: the command moves along
+        # the route and slows for corners instead of stopping at every vertex.
+        # 2026-09-29 planner-in-loop replay (8 flights x 5 disturbance phases):
+        # hold alone does not help; path_carrot:=true hold_line_skip:=0.35
+        # cross_track_gain:=0.3 cross_track_correction_max:=0.05 reached the goal
+        # 39/40 vs 34/40, 13% faster, holds 0.95 -> 0.06 s, time inside 0.30 m
+        # clearance 0.86 -> 0.12 s; lateral tracking unchanged (~20 cm p95).
+        'hold_line_skip': '0.0', 'hold_line_max_offset': '0.10',
+        'cross_track_gain': '0.0', 'cross_track_correction_max': '0.08',
+        'path_carrot': 'false', 'corner_speed_min': '0.03', 'max_carrot_lead': '0.35',
     }
     booleans = {'auto_arm', 'climb_feedforward', 'require_goal_after_hover', 'yaw_follows_heading',
                 'require_px4_preflight_status',
-                'keyboard_kill', 'keyboard_land', 'foxglove_teleop', 'brake_damping'}
+                'keyboard_kill', 'keyboard_land', 'foxglove_teleop', 'brake_damping', 'path_carrot'}
     strings = {'vio_info_topic'}
     excluded = {'start_vio_bridge', 'record_bag', 'bag_output', 'adapter_start_delay',
                 'route_speed'}
@@ -143,7 +162,7 @@ def generate_launch_description():
                                'vio_yaw_offset_deg': ParameterValue(
                                    LaunchConfiguration('vio_yaw_offset_deg'), value_type=float)}])
     recorder = ExecuteProcess(
-        cmd=['ros2', 'bag', 'record', '--storage', 'mcap', '--storage-preset-profile',
+        cmd=[DURABLE_RECORD, '--', 'ros2', 'bag', 'record', '--storage', 'mcap', '--storage-preset-profile',
              'fastwrite', '--disable-keyboard-controls', '--output',
              LaunchConfiguration('bag_output'), '--topics', *FLIGHT_RECORD_TOPICS],
         output='screen', sigterm_timeout='90', sigkill_timeout='90',

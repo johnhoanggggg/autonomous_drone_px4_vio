@@ -19,6 +19,13 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from px4_vio_bridge.log_paths import timestamped_bag
+from launch.substitutions import PathJoinSubstitution
+from launch_ros.substitutions import FindPackagePrefix
+
+# Wraps `ros2 bag record` so the bag is flushed to the SD card and finalized
+# even when the Pi loses power shortly after the flight (see the script).
+DURABLE_RECORD = PathJoinSubstitution(
+    [FindPackagePrefix("px4_vio_bridge"), "lib", "px4_vio_bridge", "durable_bag_record"])
 
 STORAGE_PRESET = "fastwrite"
 
@@ -148,6 +155,8 @@ def generate_launch_description():
     # price is a larger file, which is irrelevant at 35 GB free.
     recorder = ExecuteProcess(
         cmd=[
+            DURABLE_RECORD,
+            "--",
             "ros2",
             "bag",
             "record",
