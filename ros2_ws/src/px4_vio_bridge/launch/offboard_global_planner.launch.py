@@ -76,6 +76,7 @@ FLIGHT_RECORD_TOPICS = (
     "/rtabmap/vio_pose",
     "/rtabmap/body_vio_pose",
     "/vio/yaw_offset/pose",
+    "/vio/level/tilt_deg",
     # Requested goal and A* outputs needed by evaluate_planner_bags.py.
     "/waypoint/clicked",
     "/planner/candidate_path",
@@ -290,8 +291,11 @@ def generate_launch_description():
         DeclareLaunchArgument("route_entry_grace", default_value="3.0"),
         DeclareLaunchArgument("map_pose_topic", default_value="/rtabmap/body_pose"),
         DeclareLaunchArgument("goal_hold_time", default_value="3.0"),
-        DeclareLaunchArgument("max_correction_m", default_value="1.0"),
-        DeclareLaunchArgument("max_correction_yaw_deg", default_value="10.0"),
+        # A large map correction must never end a flight: the offset grows with
+        # session drift (0.8 m before takeoff on 09-30) and loop closures jump it.
+        # 100 m / 180 deg never trips; lower them to restore the gate.
+        DeclareLaunchArgument("max_correction_m", default_value="100.0"),
+        DeclareLaunchArgument("max_correction_yaw_deg", default_value="180.0"),
         # Flight 20260831T033736Z ran below 200 features for 42% of its samples
         # in the doorway approach with nothing raised. Hold rather than commit
         # into a narrow gap when the tracker is starving.
@@ -340,6 +344,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("record_bag", default_value="true"),
         DeclareLaunchArgument("bag_output", default_value=default_bag),
+        # Adds the camera to the flight bag. The depthai backend publishes
+        # 640x400 JPEG at slam_fps (20 Hz), roughly 0.5-1 MB/s on the SD card.
+        # With backend:=ros use /foxglove/camera/image/compressed (5 Hz).
+        DeclareLaunchArgument("record_camera", default_value="false"),
+        DeclareLaunchArgument(
+            "camera_topic", default_value="/rtabmap/image/compressed"
+        ),
     ]
     # One dict, both adapters. The C++ port declares exactly the same
     # parameter names as the Python one, so sharing this is what keeps a
@@ -442,29 +453,46 @@ def generate_launch_description():
             "map_pose_topic": LaunchConfiguration("map_pose_topic"),
         }],
     )
-    recorder = ExecuteProcess(
-        cmd=[
-            DURABLE_RECORD, "--",
-            "ros2", "bag", "record", "--storage", "mcap",
-            "--storage-preset-profile", STORAGE_PRESET,
-            "--disable-keyboard-controls", "--polling-interval", "100",
-            "--topics", *FLIGHT_RECORD_TOPICS,
-            "--output", LaunchConfiguration("bag_output"),
-        ],
-        name="global_planner_flight_recorder",
-        output="screen",
-        # A bag whose metadata.yaml is 0 bytes was SIGKILLed before it could
-        # write the footer -- it needs `ros2 bag reindex <dir> -s mcap` to open
-        # and loses the tail of the flight. Both 20260831T033736Z and
-        # T064828Z ended that way, and the first of those hid four door-frame
-        # impacts that happened three seconds after its last recorded message.
-        # Finalizing competes for cores that RTAB-Map VIO and SLAM already pin,
-        # so the old 20 s was not a generous allowance. Landing takes far longer
-        # than this costs.
-        sigterm_timeout="90",
-        sigkill_timeout="90",
-        condition=IfCondition(LaunchConfiguration("record_bag")),
-    )
+    def flight_recorder(context, *args, **kwargs):
+        # Built at launch time so record_camera can add to the topic list.
+        topics = list(FLIGHT_RECORD_TOPICS)
+        messages = []
+        if LaunchConfiguration("record_camera").perform(context).lower() in _ENABLED:
+            camera_topic = LaunchConfiguration("camera_topic").perform(context)
+            topics.append(camera_topic)
+            messages.append(LogInfo(msg=f"Recording camera feed: {camera_topic}"))
+        recorder = ExecuteProcess(
+            cmd=[
+                DURABLE_RECORD, "--",
+                "ros2", "bag", "record", "--storage", "mcap",
+                "--storage-preset-profile", STORAGE_PRESET,
+                "--disable-keyboard-controls", "--polling-interval", "100",
+                "--topics", *topics,
+                "--output", LaunchConfiguration("bag_output"),
+            ],
+            name="global_planner_flight_recorder",
+            output="screen",
+            # A bag whose metadata.yaml is 0 bytes was SIGKILLed before it could
+            # write the footer -- it needs `ros2 bag reindex <dir> -s mcap` to
+            # open and loses the tail of the flight. Both 20260831T033736Z and
+            # T064828Z ended that way, and the first of those hid four
+            # door-frame impacts that happened three seconds after its last
+            # recorded message. Finalizing competes for cores that RTAB-Map VIO
+            # and SLAM already pin, so the old 20 s was not a generous
+            # allowance. Landing takes far longer than this costs.
+            sigterm_timeout="90",
+            sigkill_timeout="90",
+        )
+        stop_if_recorder_exits = RegisterEventHandler(
+            OnProcessExit(
+                target_action=recorder,
+                on_exit=[EmitEvent(event=Shutdown(
+                    reason="flight recorder exited; stopping flight launch"
+                ))],
+            ),
+        )
+        return messages + [recorder, stop_if_recorder_exits]
+
     # Started with the recorder rather than with the flight node, so the CPU /
     # memory trace covers the whole recorded window and a late setpoint can be
     # checked against Pi load on the same time base.
@@ -494,24 +522,17 @@ def generate_launch_description():
         ),
         condition=IfCondition(LaunchConfiguration("cpp_mode")),
     )
-    stop_if_recorder_exits = RegisterEventHandler(
-        OnProcessExit(
-            target_action=recorder,
-            on_exit=[EmitEvent(event=Shutdown(
-                reason="flight recorder exited; stopping flight launch"
-            ))],
-        ),
-        condition=IfCondition(LaunchConfiguration("record_bag")),
-    )
     return LaunchDescription(arguments + [
         LogInfo(msg="GLOBAL PLANNER FLIGHT: auto_arm defaults false; K=kill, L=land"),
         LogInfo(msg=["Flight bag output: ", LaunchConfiguration("bag_output")]),
         OpaqueFunction(function=announce_cpp_flight),
         OpaqueFunction(function=write_run_marker),
-        recorder,
+        OpaqueFunction(
+            function=flight_recorder,
+            condition=IfCondition(LaunchConfiguration("record_bag")),
+        ),
         perf_monitor,
         stop_after_node,
         stop_after_cpp,
-        stop_if_recorder_exits,
         start,
     ])

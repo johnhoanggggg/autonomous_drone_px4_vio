@@ -78,6 +78,9 @@ def generate_launch_description():
             # Preserve the established flight path, even if an outer scope
             # supplies backend:=ros. ROS mode is selected on the base launch.
             "backend": "depthai",
+            # The 3D adapter judges heights in the map frame; keep its EV
+            # unleveled until leveling has been flown there.
+            "level_ev": "false",
             "start_xrce_agent": LaunchConfiguration("start_xrce_agent"),
             "foxglove": LaunchConfiguration("foxglove"),
             "foxglove_port": LaunchConfiguration("foxglove_port"),

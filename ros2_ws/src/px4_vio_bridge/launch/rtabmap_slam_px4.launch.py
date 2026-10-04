@@ -19,6 +19,7 @@ def generate_launch_description():
     output_odometry_topic = LaunchConfiguration("output_odometry_topic")
     frame_transform = LaunchConfiguration("frame_transform")
     vio_yaw_offset_deg = LaunchConfiguration("vio_yaw_offset_deg")
+    level_ev = LaunchConfiguration("level_ev")
     camera_position_frd_x = LaunchConfiguration("camera_position_frd_x")
     camera_position_frd_y = LaunchConfiguration("camera_position_frd_y")
     camera_position_frd_z = LaunchConfiguration("camera_position_frd_z")
@@ -79,6 +80,10 @@ def generate_launch_description():
                 "frame_transform", default_value="enu_flu_to_ned_frd"
             ),
             DeclareLaunchArgument("vio_yaw_offset_deg", default_value="0.0"),
+            # Level the VIO odom frame with PX4's gravity before EV fusion. The
+            # odom frame drifts 2-11 deg off gravity, and PX4 holding EV height
+            # then climbs distance x tan(tilt) (1.2 m over 10 m on 09-30).
+            DeclareLaunchArgument("level_ev", default_value="true"),
             # Planner-facing poses are shifted from the OAK camera origin to
             # the airframe/Pixhawk origin. These must match EKF2_EV_POS_X/Y/Z,
             # but the PX4 VehicleOdometry branch below remains unshifted: EKF2
@@ -285,6 +290,7 @@ def generate_launch_description():
                                 "output_odometry_topic": output_odometry_topic,
                                 "frame_transform": frame_transform,
                                 "vio_yaw_offset_deg": vio_yaw_offset_deg,
+                                "level_with_px4_attitude": ParameterValue(level_ev, value_type=bool),
                             }
                         ],
                     ),

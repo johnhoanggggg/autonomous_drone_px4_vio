@@ -4,7 +4,8 @@ from typing import Iterable, Optional, Tuple
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
-from px4_msgs.msg import VehicleOdometry
+from std_msgs.msg import Float32
+from px4_msgs.msg import VehicleAttitude, VehicleOdometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -129,6 +130,103 @@ def apply_enu_yaw_offset(
     return rotated_position, rotated_orientation
 
 
+def transpose(m: Matrix3) -> Matrix3:
+    return tuple(tuple(m[col][row] for col in range(3)) for row in range(3))  # type: ignore[return-value]
+
+
+def gravity_down_in_odom_enu(
+    orientation_enu_flu: Quaternion, attitude_ned_frd: Quaternion
+) -> Vector3:
+    """True gravity-down direction expressed in the VIO odometry frame.
+
+    PX4's attitude (EKF2_EV_CTRL does not fuse EV attitude) knows where down is
+    in the body; the VIO orientation carries that body direction into the odom
+    frame.  A level odom frame gives (0, 0, -1).  The camera is taken to be
+    square to the body, the same assumption camera_to_body_pose makes.
+    """
+    down_frd = transform_vector(transpose(quaternion_to_matrix(attitude_ned_frd)), (0.0, 0.0, 1.0))
+    down_flu = transform_vector(FRD_TO_FLU, down_frd)
+    return transform_vector(quaternion_to_matrix(orientation_enu_flu), down_flu)
+
+
+def leveling_matrix(down_enu: Vector3) -> Matrix3:
+    """Smallest rotation taking `down_enu` onto (0, 0, -1); it never adds yaw."""
+    norm = math.sqrt(sum(value * value for value in down_enu))
+    if norm <= 0.0:
+        return yaw_matrix(0.0)
+    dx, dy, dz = (value / norm for value in down_enu)
+    # axis = d x (0, 0, -1) = (-dy, dx, 0); cos(angle) = -dz (Rodrigues).
+    ax, ay = -dy, dx
+    s = math.hypot(ax, ay)
+    if s <= 1.0e-12:
+        return yaw_matrix(0.0)
+    ax, ay = ax / s, ay / s
+    c = -dz
+    v = 1.0 - c
+    return (
+        (c + ax * ax * v, ax * ay * v, ay * s),
+        (ax * ay * v, c + ay * ay * v, -ax * s),
+        (-ay * s, ax * s, c),
+    )
+
+
+class EvLeveler:
+    """Remove the VIO odometry frame's tilt from the pose PX4 flies on.
+
+    Without IMU gravity, RTAB-Map odometry starts square to the camera and
+    wanders 2-11 deg off gravity (09-30 flights).  PX4 holds EV height, so it
+    climbed distance x tan(tilt): 1.2 m over a 10 m route.  Each new VIO step is
+    rotated by the current (low-passed) leveling and accumulated, so a changing
+    tilt estimate never moves positions already flown, and the output starts
+    equal to the raw VIO pose so enabling it causes no jump.
+    """
+
+    def __init__(self, time_constant_s: float = 5.0, max_tilt_deg: float = 25.0) -> None:
+        self.time_constant_s = time_constant_s
+        self.max_tilt_cos = math.cos(math.radians(max_tilt_deg))
+        self.reset()
+
+    def reset(self) -> None:
+        self.down: Optional[Vector3] = None
+        self.down_time_s: Optional[float] = None
+        self.last_raw: Optional[Vector3] = None
+        self.leveled: Optional[Vector3] = None
+
+    def update_down(self, down_enu: Vector3, now_s: float) -> bool:
+        """Low-pass a gravity sample into the estimate; False if it is rejected."""
+        norm = math.sqrt(sum(value * value for value in down_enu))
+        if norm <= 0.0 or not all(math.isfinite(value) for value in down_enu):
+            return False
+        sample = tuple(value / norm for value in down_enu)
+        if -sample[2] < self.max_tilt_cos:
+            return False
+        if self.down is None or self.down_time_s is None:
+            self.down = sample  # type: ignore[assignment]
+        else:
+            dt = max(0.0, now_s - self.down_time_s)
+            alpha = min(1.0, dt / self.time_constant_s) if self.time_constant_s > 0.0 else 1.0
+            blended = tuple(d + (x - d) * alpha for d, x in zip(self.down, sample))
+            n = math.sqrt(sum(value * value for value in blended))
+            self.down = tuple(value / n for value in blended)  # type: ignore[assignment]
+        self.down_time_s = now_s
+        return True
+
+    def tilt_deg(self) -> float:
+        if self.down is None:
+            return math.nan
+        return math.degrees(math.acos(max(-1.0, min(1.0, -self.down[2]))))
+
+    def apply(self, position: Vector3, orientation: Quaternion) -> Tuple[Vector3, Quaternion]:
+        level = leveling_matrix(self.down) if self.down is not None else yaw_matrix(0.0)
+        if self.leveled is None or self.last_raw is None:
+            self.leveled = position
+        else:
+            step = transform_vector(level, tuple(p - q for p, q in zip(position, self.last_raw)))  # type: ignore[arg-type]
+            self.leveled = tuple(p + d for p, d in zip(self.leveled, step))  # type: ignore[assignment]
+        self.last_raw = position
+        return self.leveled, matrix_to_quaternion(matmul(level, quaternion_to_matrix(orientation)))
+
+
 def covariance_triplet(value: float) -> Iterable[float]:
     return (float(value), float(value), float(value))
 
@@ -206,6 +304,13 @@ class VioToPx4Odometry(Node):
         self.declare_parameter("reset_position_epsilon", 1.0e-6)
         self.declare_parameter("reset_orientation_epsilon", 1.0e-3)
         self.declare_parameter("max_raw_odometry_age", 0.5)
+        # Rotate VIO steps onto PX4's gravity before PX4 sees them (EvLeveler).
+        self.declare_parameter("level_with_px4_attitude", False)
+        self.declare_parameter("attitude_topic", "/fmu/out/vehicle_attitude")
+        self.declare_parameter("level_time_constant", 5.0)
+        self.declare_parameter("level_max_tilt_deg", 25.0)
+        self.declare_parameter("level_attitude_max_age", 0.3)
+        self.declare_parameter("level_tilt_topic", "/vio/level/tilt_deg")
 
         input_topic = self.get_parameter("input_pose_topic").value
         odometry_topic = self.get_parameter("input_odometry_topic").value
@@ -249,7 +354,30 @@ class VioToPx4Odometry(Node):
         self.reset_counter = 0
         self.reset_pose_active = False
 
-        self.get_logger().info(f"Bridging {odometry_topic or input_topic} -> {output_topic}")
+        self.leveler: Optional[EvLeveler] = None
+        self.attitude: Optional[Quaternion] = None
+        self.attitude_time_ns: Optional[int] = None
+        if bool(self.get_parameter("level_with_px4_attitude").value):
+            if self.get_parameter("frame_transform").value != "enu_flu_to_ned_frd":
+                raise ValueError("level_with_px4_attitude needs frame_transform enu_flu_to_ned_frd")
+            self.leveler = EvLeveler(
+                float(self.get_parameter("level_time_constant").value),
+                float(self.get_parameter("level_max_tilt_deg").value))
+            self.attitude_max_age_ns = int(
+                float(self.get_parameter("level_attitude_max_age").value) * 1_000_000_000)
+            self.attitude_sub = self.create_subscription(
+                VehicleAttitude, str(self.get_parameter("attitude_topic").value),
+                self.attitude_callback, qos)
+            self.tilt_pub = self.create_publisher(
+                Float32, str(self.get_parameter("level_tilt_topic").value), 10)
+
+        self.get_logger().info(
+            f"Bridging {odometry_topic or input_topic} -> {output_topic}"
+            + (" (leveled with PX4 attitude)" if self.leveler else ""))
+
+    def attitude_callback(self, attitude: VehicleAttitude) -> None:
+        self.attitude = tuple(float(value) for value in attitude.q)  # type: ignore[assignment]
+        self.attitude_time_ns = self.get_clock().now().nanoseconds
 
     def odometry_callback(self, odometry: Odometry) -> None:
         reason = raw_odometry_rejection_reason(
@@ -300,6 +428,9 @@ class VioToPx4Odometry(Node):
             if rejection_reason == "RTABMap reset sentinel" and not self.reset_pose_active:
                 self.reset_counter = (self.reset_counter + 1) % 256
                 self.reset_pose_active = True
+                if self.leveler is not None:
+                    # A restarted VIO has a new frame and a new tilt.
+                    self.leveler.reset()
             if self.rejected_count == 1 or self.rejected_count % 100 == 0:
                 self.get_logger().warning(
                     f"Rejected VIO pose #{self.rejected_count}: {rejection_reason}"
@@ -312,6 +443,8 @@ class VioToPx4Odometry(Node):
             orientation_enu_flu,
             float(self.get_parameter("vio_yaw_offset_deg").value),
         )
+        if self.leveler is not None:
+            position_enu, orientation_enu_flu = self.level(position_enu, orientation_enu_flu)
         self.publish_debug_pose(pose, position_enu, orientation_enu_flu)
 
         transform_mode = self.get_parameter("frame_transform").value
@@ -354,6 +487,21 @@ class VioToPx4Odometry(Node):
                 "Published visual odometry "
                 f"#{self.sent_count}: p_ned=({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})"
             )
+
+    def level(self, position_enu: Vector3, orientation_enu_flu: Quaternion) -> Tuple[Vector3, Quaternion]:
+        now_ns = self.get_clock().now().nanoseconds
+        # A stale or missing attitude freezes the current estimate; it never
+        # stops EV from flowing.
+        if (self.attitude is not None and self.attitude_time_ns is not None
+                and now_ns - self.attitude_time_ns <= self.attitude_max_age_ns):
+            down = gravity_down_in_odom_enu(orientation_enu_flu, self.attitude)
+            self.leveler.update_down(down, now_ns * 1.0e-9)
+        leveled = self.leveler.apply(position_enu, orientation_enu_flu)
+        tilt = self.leveler.tilt_deg()
+        self.tilt_pub.publish(Float32(data=float(tilt)))
+        if self.sent_count % 100 == 0:
+            self.get_logger().info(f"VIO frame tilt {tilt:.1f} deg from PX4 gravity")
+        return leveled
 
     def publish_debug_pose(
         self, source_pose: PoseStamped, position_enu: Vector3, orientation_enu_flu: Quaternion

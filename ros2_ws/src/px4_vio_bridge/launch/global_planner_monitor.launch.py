@@ -212,8 +212,11 @@ def generate_launch_description():
         DeclareLaunchArgument("cross_track_filter_time_constant", default_value="0.30"),
         DeclareLaunchArgument("vio_timeout", default_value="0.5"),
         DeclareLaunchArgument("correction_timeout", default_value="1.0"),
-        DeclareLaunchArgument("max_correction_m", default_value="1.0"),
-        DeclareLaunchArgument("max_correction_yaw_deg", default_value="10.0"),
+        # A large map correction must never end a flight: the offset grows with
+        # session drift (0.8 m before takeoff on 09-30) and loop closures jump it.
+        # 100 m / 180 deg never trips; lower them to restore the gate.
+        DeclareLaunchArgument("max_correction_m", default_value="100.0"),
+        DeclareLaunchArgument("max_correction_yaw_deg", default_value="180.0"),
         DeclareLaunchArgument("switch_improvement", default_value="0.10"),
         # Must stay a full correction jump below max_cross_track, or a loop
         # closure faults instead of replanning. Measured material corrections
