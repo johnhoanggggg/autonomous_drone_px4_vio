@@ -20,6 +20,8 @@ def generate_launch_description():
     slam_publish_ros_rgbd = LaunchConfiguration("slam_publish_ros_rgbd")
     slam_enable_slam = LaunchConfiguration("slam_enable_slam")
     slam_database_path = LaunchConfiguration("slam_database_path")
+    slam_save_on_arm = LaunchConfiguration("slam_save_on_arm")
+    slam_load_database = LaunchConfiguration("slam_load_database")
     slam_ros_rgbd_publish_hz = LaunchConfiguration("slam_ros_rgbd_publish_hz")
     slam_num_features = LaunchConfiguration("slam_num_features")
     slam_path_publish_stride = LaunchConfiguration("slam_path_publish_stride")
@@ -48,6 +50,8 @@ def generate_launch_description():
             DeclareLaunchArgument("slam_publish_ros_rgbd", default_value="false"),
             DeclareLaunchArgument("slam_enable_slam", default_value="true"),
             DeclareLaunchArgument("slam_database_path", default_value=""),
+            DeclareLaunchArgument("slam_save_on_arm", default_value="false"),
+            DeclareLaunchArgument("slam_load_database", default_value=""),
             DeclareLaunchArgument("slam_ros_rgbd_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_num_features", default_value="400"),
             DeclareLaunchArgument("slam_path_publish_stride", default_value="10"),
@@ -79,6 +83,8 @@ def generate_launch_description():
                     "--publish-ros-rgbd", slam_publish_ros_rgbd,
                     "--enable-slam", slam_enable_slam,
                     "--slam-database-path", slam_database_path,
+                    "--slam-save-on-arm", slam_save_on_arm,
+                    "--slam-load-database", slam_load_database,
                     "--ros-rgbd-publish-hz", slam_ros_rgbd_publish_hz,
                     "--num-features", slam_num_features,
                     "--path-publish-stride", slam_path_publish_stride,

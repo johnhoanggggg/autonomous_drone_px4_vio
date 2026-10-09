@@ -12,6 +12,8 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, IfEl
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare, FindPackagePrefix
 from launch_ros.parameter_descriptions import ParameterValue
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 def generate_launch_description():
@@ -41,6 +43,14 @@ def generate_launch_description():
     slam_publish_ros_rgbd = LaunchConfiguration("slam_publish_ros_rgbd")
     slam_enable_slam = LaunchConfiguration("slam_enable_slam")
     slam_database_path = LaunchConfiguration("slam_database_path")
+    save_map = LaunchConfiguration("save_map")
+    load_map = LaunchConfiguration("load_map")
+    # One new database per launch: RTAB-Map loads any .db already at its path.
+    default_map = str(Path.home() / "maps" / (
+        "slam_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".db"))
+    session_database = PythonExpression([
+        "'", slam_database_path, "' or ('", default_map, "' if ('", save_map,
+        "'.lower() in ('true', '1', 'yes', 'on') or '", load_map, "') else '')"])
     slam_ros_rgbd_publish_hz = LaunchConfiguration("slam_ros_rgbd_publish_hz")
     slam_publish_clouds = LaunchConfiguration("slam_publish_clouds")
     slam_publish_grid = LaunchConfiguration("slam_publish_grid")
@@ -119,6 +129,16 @@ def generate_launch_description():
             # Set a path to make the DepthAI mapper's loop closures
             # countable with rtabmap-info; empty keeps it in memory.
             DeclareLaunchArgument("slam_database_path", default_value=""),
+            # Save the SLAM map (RTAB-Map database + the planner grid beside it)
+            # when PX4 arms and disarms, and on shutdown. Each save takes ~0.5-0.8 s
+            # and restarts RTAB-Map's session, which links back on a loop
+            # closure -- usually the next node, but one of three bench saves
+            # never did. /rtabmap/map_save reports map_intact for every save.
+            DeclareLaunchArgument("save_map", default_value="true"),
+            # Opt-in reuse: path to a saved ~/maps/slam_*.db. It is copied, never
+            # modified. The old map's grid joins /rtabmap/grid only once RTAB-Map
+            # links this session to it (/rtabmap/map_reuse: linked).
+            DeclareLaunchArgument("load_map", default_value=""),
             DeclareLaunchArgument("slam_ros_rgbd_publish_hz", default_value="3.0"),
             DeclareLaunchArgument("slam_publish_clouds", default_value="false"),
             DeclareLaunchArgument("slam_publish_grid", default_value="true"),
@@ -225,7 +245,9 @@ def generate_launch_description():
                                     "slam_depth_publish_hz": slam_depth_publish_hz,
                                     "slam_publish_ros_rgbd": slam_publish_ros_rgbd,
                                     "slam_enable_slam": slam_enable_slam,
-                                    "slam_database_path": slam_database_path,
+                                    "slam_database_path": session_database,
+                                    "slam_save_on_arm": save_map,
+                                    "slam_load_database": load_map,
                                     "slam_ros_rgbd_publish_hz": slam_ros_rgbd_publish_hz,
                                     "slam_publish_clouds": slam_publish_clouds,
                                     "slam_publish_grid": slam_publish_grid,

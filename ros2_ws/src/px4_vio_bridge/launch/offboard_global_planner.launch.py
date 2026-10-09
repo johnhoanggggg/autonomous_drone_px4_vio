@@ -68,6 +68,9 @@ FLIGHT_RECORD_TOPICS = (
     # SLAM/VIO health, map and effective configuration.
     "/rtabmap/config",
     "/rtabmap/grid",
+    # Arm/disarm map saves and their relink check; map reuse link state.
+    "/rtabmap/map_save",
+    "/rtabmap/map_reuse",
     "/rtabmap/odom_correction",
     "/rtabmap/pose",
     "/rtabmap/body_pose",
@@ -282,6 +285,9 @@ def generate_launch_description():
         # clearance, so the command keeps moving; unrounded bends still stop.
         DeclareLaunchArgument("corner_fillets", default_value="false"),
         DeclareLaunchArgument("climb_release", default_value="0.05"),
+        # Ends the climb feedforward at the target. Off, its taper keeps acting
+        # as extra altitude gain at hover: 0.8 Hz bob on 20261004T060900Z.
+        DeclareLaunchArgument("climb_ff_latch", default_value="true"),
         DeclareLaunchArgument("route_command_grace", default_value="2.0"),
         DeclareLaunchArgument("replan_during_yaw_align", default_value="false"),
         DeclareLaunchArgument("geofence_radius", default_value="3.0"),
@@ -389,6 +395,7 @@ def generate_launch_description():
         "junction_deviation": typed("junction_deviation", float),
         "corner_fillets": typed("corner_fillets", bool),
         "climb_release": typed("climb_release", float),
+        "climb_ff_latch": typed("climb_ff_latch", bool),
         "route_command_grace": typed("route_command_grace", float),
         "replan_during_yaw_align": typed("replan_during_yaw_align", bool),
         "geofence_radius": typed("geofence_radius", float),

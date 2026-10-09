@@ -106,6 +106,7 @@ protected:
   double climb_leash_{};
   double climb_release_{};
   bool climb_feedforward_{};
+  bool climb_ff_latch_{};
   double rate_hz_{};
   double stream_time_{};
   double engage_timeout_{};
@@ -143,6 +144,7 @@ protected:
   std::optional<double> x0_, y0_, yaw0_;
   std::optional<double> yaw_cmd_;
   std::optional<double> z_cmd_;
+  std::optional<double> climb_ff_done_target_;
 
   State state_{State::WaitPos};
   double t_{0.0};

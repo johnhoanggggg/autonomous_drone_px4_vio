@@ -946,6 +946,7 @@ private:
     config["climb_rate"] = commanded_climb_rate_;
     config["climb_leash"] = climb_leash_;
     config["climb_release"] = climb_release_;
+    config["climb_ff_latch"] = climb_ff_latch_;
     config["climb_timeout"] = climb_timeout_;
     config["geofence_radius"] = geofence_radius_;
     config["planner_fault_land_time"] = planner_fault_land_time_;

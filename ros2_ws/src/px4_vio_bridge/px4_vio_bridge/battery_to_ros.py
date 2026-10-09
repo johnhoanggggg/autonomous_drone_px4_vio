@@ -155,9 +155,13 @@ class BatteryToRos(Node):
         self.status_pub.publish(String(data=text))
 
         # Escalation is worth a line in the flight log; steady state is not.
+        # One call site per severity: rclpy raises if a single call site logs
+        # at two different severities (LOW warn, then CRITICAL error).
         if level != self.last_level and level > 0:
-            log = self.get_logger().error if level >= 2 else self.get_logger().warn
-            log(f"BATTERY {text}")
+            if level >= 2:
+                self.get_logger().error(f"BATTERY {text}")
+            else:
+                self.get_logger().warn(f"BATTERY {text}")
         self.last_level = level
         self.get_logger().info(f"battery {text}", throttle_duration_sec=self.log_throttle_s)
 

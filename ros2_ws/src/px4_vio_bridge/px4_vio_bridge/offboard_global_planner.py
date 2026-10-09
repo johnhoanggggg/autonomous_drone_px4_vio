@@ -41,6 +41,9 @@ from px4_vio_bridge.planner_flight import (
 
 
 class OffboardGlobalPlanner(OffboardHover):
+    # Battery authority is PX4 (see the BATTERY AUTHORITY log line).
+    BATTERY_LAND_DEFAULT = False
+
     def __init__(self):
         super().__init__("offboard_global_planner")
 

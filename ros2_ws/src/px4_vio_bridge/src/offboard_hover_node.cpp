@@ -1,5 +1,7 @@
 #include "offboard_hover_node.hpp"
 
+#include "px4_vio_bridge/climb_feedforward.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -76,6 +78,9 @@ OffboardHover::OffboardHover(const std::string & node_name)
   climb_leash_ = declare_parameter<double>("climb_leash", 0.12);
   climb_release_ = declare_parameter<double>("climb_release", 0.05);
   climb_feedforward_ = declare_parameter<bool>("climb_feedforward", true);
+  // End the climb feedforward once the vehicle reaches the target, as the
+  // Python node does. Without it the taper acts as extra altitude gain at hover.
+  climb_ff_latch_ = declare_parameter<bool>("climb_ff_latch", true);
   rate_hz_ = declare_parameter<double>("rate_hz", 50.0);
   stream_time_ = declare_parameter<double>("stream_time", 1.0);
   engage_timeout_ = declare_parameter<double>("engage_timeout", 5.0);
@@ -488,47 +493,19 @@ void OffboardHover::publish_setpoint(double z_up, std::optional<double> yaw)
 
 std::pair<double, double> OffboardHover::ramp_z(double target_up)
 {
-  // See offboard_hover.ramp_z: PX4's takeoff ramp hands the position controller
-  // a collective ~0.08 below hover, so a hard z step climbs on the integrator
-  // alone (20.4 s for 0.30 m, ULog 209). The feedforward puts the full
-  // commanded rate into the velocity loop; the ramp keeps the position setpoint
-  // honest while that happens.
-  const double nan = std::numeric_limits<double>::quiet_NaN();
-  if (commanded_climb_rate_ <= 0.0) {
-    z_cmd_ = target_up;
-    return {target_up, nan};
+  // See px4_vio_bridge/climb_feedforward.hpp (and offboard_hover.ramp_z).
+  px4_vio_bridge::ClimbRampState state{z_cmd_, climb_ff_done_target_};
+  std::optional<double> z_now;
+  if (pos_) {
+    z_now = -static_cast<double>(pos_->z);
   }
-  if (!z_cmd_) {
-    z_cmd_ = target_up;
-  }
-  // Advance toward the target, clamped to the remaining distance so the ramp
-  // lands exactly on it and never overshoots.
-  const double step = commanded_climb_rate_ * dt_;
-  *z_cmd_ += std::clamp(target_up - *z_cmd_, -step, step);
-  // The leash is applied on every path, including the first call.
-  if (climb_leash_ > 0.0 && pos_) {
-    const double z_now = -static_cast<double>(pos_->z);
-    z_cmd_ = std::clamp(*z_cmd_, z_now - climb_leash_, z_now + climb_leash_);
-  }
-  if (!climb_feedforward_) {
-    return {*z_cmd_, nan};
-  }
-  // Release on the VEHICLE's remaining distance, not the ramp's: the ramp can
-  // reach the target while the vehicle is still low but inside the leash.
-  const double z_ref = pos_ ? -static_cast<double>(pos_->z) : *z_cmd_;
-  const double remaining = target_up - z_ref;
-  // Taper inside the release band rather than switching off, so there is no
-  // discontinuity and noise near the target cannot chatter the feedforward.
-  const double span = std::max(climb_release_, 1.0e-6);
-  const double rate =
-    commanded_climb_rate_ * std::min(1.0, std::abs(remaining) / span);
-  if (rate < 1.0e-3) {
-    return {*z_cmd_, 0.0};
-  }
-  // Deliberately the commanded rate, not d(z_cmd)/dt: while the leash holds the
-  // setpoint back the vehicle is failing to keep up, which is exactly when the
-  // velocity loop needs a real error to wind against. NED, so climbing is -vz.
-  return {*z_cmd_, -std::copysign(rate, remaining)};
+  const auto result = px4_vio_bridge::climb_ramp_step(
+    {commanded_climb_rate_, climb_leash_, climb_release_, climb_feedforward_,
+      climb_ff_latch_, dt_},
+    state, target_up, z_now);
+  z_cmd_ = state.z_cmd;
+  climb_ff_done_target_ = state.ff_done_target;
+  return result;
 }
 
 std::pair<double, double> OffboardHover::ramp_yaw(double target)

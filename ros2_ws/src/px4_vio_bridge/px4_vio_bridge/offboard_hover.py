@@ -15,8 +15,15 @@ Safety:
 - When run in an interactive terminal, L requests AUTO.LAND and K immediately
   sends PX4's forced-disarm command repeatedly. K stops the motors; it does NOT
   attempt to land.
+- Up/Down arrow keys raise/lower the hover height by height_step during
+  CLIMB_HOLD, clamped to [min_hover_height, max_hover_height]. The change goes
+  through the same climb ramp as takeoff. Plain offboard_hover only: subclasses
+  that replace handle_flight_state never apply the keypresses.
 - While armed, stale RTAB-Map VIO poses, stale feature-count data, or a sustained
   low tracked-feature count request AUTO.LAND.
+- While armed, a sustained low battery (loaded cell voltage, PX4 remaining, or
+  any PX4 battery warning) or stale battery telemetry requests AUTO.LAND. PX4's
+  own COM_LOW_BAT_ACT is 0 (warn only) on this airframe and will not land.
 - On shutdown while armed it commands AUTO.LAND rather than disarming in air.
 """
 import math
@@ -30,6 +37,7 @@ import tty
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from px4_msgs.msg import (
+    BatteryStatus,
     OffboardControlMode,
     SensorCombined,
     TrajectorySetpoint,
@@ -63,6 +71,9 @@ def yaw_from_quaternion(q):
 
 
 class OffboardHover(Node):
+    # Subclasses whose battery authority is PX4 alone opt out of the default.
+    BATTERY_LAND_DEFAULT = True
+
     def __init__(self, node_name="offboard_hover"):
         super().__init__(node_name)
         self._flight_authority = ProcessSingleton("flight_authority", lock_directory="/tmp")
@@ -95,6 +106,10 @@ class OffboardHover(Node):
         self.declare_parameter("auto_arm", False)         # MUST be true to actually fly
         self.declare_parameter("keyboard_kill", True)     # K force-disarms (interactive TTY only)
         self.declare_parameter("keyboard_land", True)     # L requests AUTO.LAND (interactive TTY only)
+        self.declare_parameter("keyboard_height", True)   # Up/Down arrows nudge hover_height (CLIMB_HOLD only)
+        self.declare_parameter("height_step", 0.02)       # m per arrow press
+        self.declare_parameter("min_hover_height", 0.20)  # m, arrow-key floor
+        self.declare_parameter("max_hover_height", 1.50)  # m, arrow-key ceiling
         # Foxglove's built-in Teleop panel publishes Twist. This is deliberately
         # opt-in and decoded as discrete safety commands, never as vehicle
         # velocity: linear.z=-1 requests LAND and linear.z=-2 requests KILL.
@@ -123,9 +138,29 @@ class OffboardHover(Node):
         # writes bit-exact 0.0; real poses are always noisy, so (0,0,0) is a
         # sufficient signature on its own.
         self.declare_parameter("vio_reset_persist", 0.2)         # s at origin before it counts as a reset
+        # Low-battery LAND. PX4 COM_LOW_BAT_ACT=0 only warns, so without this a
+        # long hold flies the pack flat. Any one condition held for
+        # battery_land_time lands. Cell volts are measured UNDER hover load:
+        # 3.50 V loaded is ~3.65 V resting at R=0.0082 ohm/cell and ~17 A (269 W hover).
+        self.declare_parameter("battery_land", self.BATTERY_LAND_DEFAULT)
+        self.declare_parameter("battery_topic", "/fmu/out/battery_status_v1")
+        self.declare_parameter("battery_land_cell_volts", 3.50)
+        self.declare_parameter("battery_land_percent", 20.0)     # PX4 `remaining`, 0..100
+        self.declare_parameter("battery_land_on_px4_warning", True)  # WARNING_LOW or worse
+        self.declare_parameter("battery_land_time", 3.0)         # s below threshold before LAND
+        self.declare_parameter("battery_timeout", 5.0)           # PX4 publishes at ~1 Hz
+        self.declare_parameter("battery_log_period", 15.0)       # armed battery log line, s
 
         self.hover_height = float(self.get_parameter("hover_height").value)
         self.hold_time = float(self.get_parameter("hold_time").value)
+        self.keyboard_height = bool(self.get_parameter("keyboard_height").value)
+        self.height_step = abs(float(self.get_parameter("height_step").value))
+        # Never clamp the configured start height: widen the band to include it.
+        self.min_hover_height = min(float(self.get_parameter("min_hover_height").value),
+                                    self.hover_height)
+        self.max_hover_height = max(float(self.get_parameter("max_hover_height").value),
+                                    self.hover_height)
+        self.pending_height_steps = 0  # arrow presses not yet applied (+ up)
         # Configured yaw-setpoint slew rate. Immutable after init: the measured
         # gyro rate lives in self.measured_yaw_rate and must NEVER be written
         # here (a past collision fed the gyro back into ramp_yaw -> runaway yaw).
@@ -182,6 +217,18 @@ class OffboardHover(Node):
         )
         self.tracking_arm_grace = float(self.get_parameter("tracking_arm_grace").value)
         self.vio_reset_persist = float(self.get_parameter("vio_reset_persist").value)
+        self.battery_land = bool(self.get_parameter("battery_land").value)
+        self.battery_topic = str(self.get_parameter("battery_topic").value)
+        self.battery_land_cell_volts = float(
+            self.get_parameter("battery_land_cell_volts").value
+        )
+        self.battery_land_percent = float(self.get_parameter("battery_land_percent").value)
+        self.battery_land_on_px4_warning = bool(
+            self.get_parameter("battery_land_on_px4_warning").value
+        )
+        self.battery_land_time = float(self.get_parameter("battery_land_time").value)
+        self.battery_timeout = float(self.get_parameter("battery_timeout").value)
+        self.battery_log_period = float(self.get_parameter("battery_log_period").value)
 
         pub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -230,6 +277,9 @@ class OffboardHover(Node):
             self.on_sensor_combined,
             pub_qos,
         )
+        self.create_subscription(
+            BatteryStatus, self.battery_topic, self.on_battery, sub_qos
+        )
         if self.foxglove_teleop:
             self.create_subscription(
                 Twist,
@@ -269,6 +319,12 @@ class OffboardHover(Node):
         self.excessive_yaw_rate_since = None
         self.horizontal_error = None
         self.horizontal_error_since = None
+        self.battery = None             # latest connected BatteryStatus
+        self.last_battery_time = None
+        self.battery_low_since = None
+        self.battery_low_detail = None
+        self.battery_at_arm = None      # first BatteryStatus seen armed, for the summary
+        self.last_battery_log_t = None
 
         self.dt = 1.0 / self.rate_hz
         self.timer = self.create_timer(self.dt, self.tick)
@@ -286,8 +342,8 @@ class OffboardHover(Node):
             self._flight_authority.close()
 
     def setup_keyboard_controls(self):
-        if not self.keyboard_kill and not self.keyboard_land:
-            self.get_logger().warn("keyboard kill and land controls disabled by parameters")
+        if not self.keyboard_kill and not self.keyboard_land and not self.keyboard_height:
+            self.get_logger().warn("keyboard kill, land and height controls disabled by parameters")
             return
         try:
             if sys.stdin.isatty():
@@ -315,6 +371,11 @@ class OffboardHover(Node):
         self.get_logger().warn(
             "KEYBOARD CONTROLS: press L for AUTO.LAND; press K to FORCE-DISARM immediately"
         )
+        if self.keyboard_height:
+            self.get_logger().warn(
+                f"KEYBOARD HEIGHT: Up/Down arrows change hover height by {self.height_step:.2f} m "
+                f"(range {self.min_hover_height:.2f}-{self.max_hover_height:.2f} m, while hovering)"
+            )
 
     def restore_terminal(self):
         if self.stdin_fd is not None and self.stdin_termios is not None:
@@ -337,15 +398,45 @@ class OffboardHover(Node):
         try:
             readable, _, _ = select.select([self.stdin_fd], [], [], 0.0)
             if readable:
-                keys = os.read(self.stdin_fd, 64).lower()
+                raw = os.read(self.stdin_fd, 64)
+                keys = raw.lower()
                 # K takes precedence if both keys are present in one read.
                 if self.keyboard_kill and b"k" in keys:
                     self.trigger_kill()
                 elif self.keyboard_land and b"l" in keys:
                     self.trigger_landing("LAND KEY PRESSED")
+                elif self.keyboard_height and self.state == "CLIMB_HOLD":
+                    self.pending_height_steps += self.decode_height_keys(raw)
         except OSError as exc:
             self.get_logger().error(f"keyboard control read failed: {exc}")
             self.restore_terminal()
+
+    @staticmethod
+    def decode_height_keys(raw):
+        """Net Up minus Down arrow presses in one terminal read.
+
+        Covers both the normal (ESC [ A) and application-cursor (ESC O A)
+        encodings. Holding a key auto-repeats, so a read can carry several.
+        """
+        up = raw.count(b"\x1b[A") + raw.count(b"\x1bOA")
+        down = raw.count(b"\x1b[B") + raw.count(b"\x1bOB")
+        return up - down
+
+    def apply_height_keys(self):
+        """Move hover_height by the queued arrow presses, clamped to the band."""
+        steps = self.pending_height_steps
+        self.pending_height_steps = 0
+        if steps == 0:
+            return
+        old = self.hover_height
+        new = old + steps * self.height_step
+        new = max(self.min_hover_height, min(self.max_hover_height, new))
+        if abs(new - old) < 1e-9:
+            self.get_logger().warn(
+                f"hover height already at {'max' if steps > 0 else 'min'} {old:.2f} m")
+            return
+        self.hover_height = round(new, 3)
+        self.get_logger().warn(f"HEIGHT KEY: hover height {old:.2f} -> {self.hover_height:.2f} m")
 
     @staticmethod
     def decode_foxglove_teleop(msg):
@@ -468,6 +559,93 @@ class OffboardHover(Node):
                 self.excessive_yaw_rate_since = now
         else:
             self.excessive_yaw_rate_since = None
+
+    def on_battery(self, msg):
+        if not msg.connected:
+            return
+        now = self.monotonic_time()
+        self.battery = msg
+        self.last_battery_time = now
+        detail = self.battery_low_condition(msg)
+        if detail is None:
+            self.battery_low_since = None
+        elif self.battery_low_since is None:
+            self.battery_low_since = now
+        self.battery_low_detail = detail
+
+    def battery_low_condition(self, msg):
+        """Which land threshold this sample is under, or None."""
+        cells = int(msg.cell_count)
+        if msg.voltage_v > 0.0 and cells > 0:
+            cell_v = msg.voltage_v / cells
+            if cell_v < self.battery_land_cell_volts:
+                return f"cell voltage {cell_v:.2f}V < {self.battery_land_cell_volts:.2f}V"
+        # PX4 reports remaining=-1 when it has no estimate.
+        if 0.0 <= msg.remaining and msg.remaining * 100.0 < self.battery_land_percent:
+            return f"remaining {msg.remaining * 100.0:.0f}% < {self.battery_land_percent:.0f}%"
+        if (self.battery_land_on_px4_warning
+                and msg.warning >= BatteryStatus.WARNING_LOW):
+            return f"PX4 battery warning {int(msg.warning)}"
+        return None
+
+    def battery_land_reason(self):
+        """LAND reason from battery state, only while armed."""
+        if not self.battery_land or not self.is_armed:
+            return None
+        now = self.monotonic_time()
+        if self.last_battery_time is None or now - self.last_battery_time > self.battery_timeout:
+            return f"battery telemetry stale for >{self.battery_timeout:.1f}s"
+        if (self.battery_low_since is not None
+                and now - self.battery_low_since >= self.battery_land_time):
+            return (
+                f"LOW BATTERY: {self.battery_low_detail} for {self.battery_land_time:.1f}s "
+                f"({self.battery_text(self.battery)})"
+            )
+        return None
+
+    @staticmethod
+    def battery_text(msg):
+        if msg is None:
+            return "no battery data"
+        parts = [f"{msg.voltage_v:.2f}V"]
+        if int(msg.cell_count) > 0:
+            parts.append(f"({msg.voltage_v / int(msg.cell_count):.2f}V/cell)")
+        if msg.current_a >= 0.0:
+            parts.append(f"{msg.current_a:.1f}A")
+        if msg.remaining >= 0.0:
+            parts.append(f"{msg.remaining * 100.0:.0f}%")
+        return " ".join(parts)
+
+    def battery_summary(self):
+        """One line comparing the pack at arm with now, for the flight log."""
+        start, end = self.battery_at_arm, self.battery
+        if start is None or end is None:
+            return None
+        text = (
+            f"BATTERY SUMMARY armed {self.armed_t:.0f}s: "
+            f"{self.battery_text(start)} -> {self.battery_text(end)}"
+        )
+        if start.discharged_mah >= 0.0 and end.discharged_mah >= 0.0:
+            text += f", {end.discharged_mah - start.discharged_mah:.0f} mAh used"
+        return text
+
+    def log_battery(self):
+        """Periodic armed battery line so the log alone is a discharge record."""
+        if not self.is_armed or self.battery is None:
+            return
+        if self.battery_at_arm is None:
+            self.battery_at_arm = self.battery
+        now = self.monotonic_time()
+        if (self.last_battery_log_t is not None
+                and now - self.last_battery_log_t < self.battery_log_period):
+            return
+        self.last_battery_log_t = now
+        used = ""
+        if self.battery.discharged_mah >= 0.0 and self.battery_at_arm.discharged_mah >= 0.0:
+            used = f" {self.battery.discharged_mah - self.battery_at_arm.discharged_mah:.0f}mAh"
+        self.get_logger().info(
+            f"battery armed={self.armed_t:.0f}s {self.battery_text(self.battery)}{used}"
+        )
 
     @property
     def is_armed(self):
@@ -736,6 +914,7 @@ class OffboardHover(Node):
         if self.state != "CLIMB_HOLD":
             return False
 
+        self.apply_height_keys()
         self.publish_setpoint(self.hover_height)
         if self.auto_arm and not self.pos_valid():
             self.get_logger().error("lost local position in flight -> LAND")
@@ -780,6 +959,11 @@ class OffboardHover(Node):
                     throttle_duration_sec=1.0,
                 )
 
+        battery_low = self.battery_land_reason()
+        if battery_low is not None and self.state not in ("LAND", "KILL", "DONE"):
+            self.trigger_landing(battery_low)
+        self.log_battery()
+
         # global armed watchdog
         if self.is_armed and self.armed_t > self.max_flight_time and self.state not in ("LAND", "DONE"):
             self.get_logger().error("max_flight_time exceeded -> LAND")
@@ -812,6 +996,20 @@ class OffboardHover(Node):
                 self.set_state("ABORT")
                 return
             if self.t >= self.stream_time:
+                if self.battery_land and self.auto_arm:
+                    if self.battery is None:
+                        self.get_logger().error(
+                            f"no battery telemetry on {self.battery_topic} -> ABORT "
+                            "(battery_land:=false flies without the low-battery LAND)")
+                        self.set_state("ABORT")
+                        return
+                    if self.battery_low_detail is not None:
+                        self.get_logger().error(
+                            f"battery already below land threshold: {self.battery_low_detail} "
+                            f"({self.battery_text(self.battery)}) -> ABORT")
+                        self.set_state("ABORT")
+                        return
+                    self.get_logger().warn(f"battery at arm: {self.battery_text(self.battery)}")
                 self.request_offboard()
                 if self.auto_arm:
                     self.arm()
@@ -845,6 +1043,9 @@ class OffboardHover(Node):
             if self.t < 0.2:
                 self.request_land()
             if not self.is_armed and self.t > 1.0:
+                summary = self.battery_summary()
+                if summary is not None:
+                    self.get_logger().warn(summary)
                 self.get_logger().warn("disarmed on ground -> DONE")
                 self.set_state("DONE")
             elif self.t > 20.0:
@@ -877,6 +1078,11 @@ class OffboardHover(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = OffboardHover()
+    if node.hold_time + node.climb_timeout > node.max_flight_time:
+        node.get_logger().warn(
+            f"max_flight_time={node.max_flight_time:.0f}s will LAND before "
+            f"hold_time={node.hold_time:.0f}s completes; raise max_flight_time for a long hold"
+        )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

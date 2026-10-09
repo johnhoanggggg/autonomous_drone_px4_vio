@@ -311,3 +311,150 @@ def test_latch_off_keeps_the_old_tracking_feedforward() -> None:
     OffboardHover.ramp_z(stub, 0.30)
     stub.pos = SimpleNamespace(z=-0.27)
     assert OffboardHover.ramp_z(stub, 0.30)[1] < 0.0
+
+
+def battery_msg(volts=16.0, cells=4, remaining=0.80, warning=0, connected=True,
+                current=25.0, discharged=100.0):
+    return SimpleNamespace(
+        connected=connected, voltage_v=volts, cell_count=cells, remaining=remaining,
+        warning=warning, current_a=current, discharged_mah=discharged,
+    )
+
+
+def make_battery_stub(now=100.0, armed=True):
+    """Low-battery LAND: PX4 COM_LOW_BAT_ACT=0 only warns, so a long hold would
+    otherwise fly the pack flat (2026-10-05 battery-test setup)."""
+    stub = SimpleNamespace(
+        battery_land=True,
+        battery_land_cell_volts=3.50,
+        battery_land_percent=20.0,
+        battery_land_on_px4_warning=True,
+        battery_land_time=3.0,
+        battery_timeout=5.0,
+        battery=None,
+        last_battery_time=None,
+        battery_low_since=None,
+        battery_low_detail=None,
+        is_armed=armed,
+        clock=now,
+    )
+    stub.monotonic_time = lambda: stub.clock
+    stub.battery_low_condition = lambda msg: OffboardHover.battery_low_condition(stub, msg)
+    stub.battery_text = OffboardHover.battery_text
+    return stub
+
+
+def feed(stub, msg, at):
+    stub.clock = at
+    OffboardHover.on_battery(stub, msg)
+
+
+def test_healthy_battery_never_lands() -> None:
+    stub = make_battery_stub()
+    for t in range(10):
+        feed(stub, battery_msg(), 100.0 + t)
+    assert OffboardHover.battery_land_reason(stub) is None
+
+
+def test_low_cell_voltage_lands_only_after_persistence() -> None:
+    stub = make_battery_stub()
+    feed(stub, battery_msg(volts=13.9), 100.0)        # 3.475 V/cell
+    feed(stub, battery_msg(volts=13.9), 102.0)
+    assert OffboardHover.battery_land_reason(stub) is None
+    feed(stub, battery_msg(volts=13.9), 103.0)
+    reason = OffboardHover.battery_land_reason(stub)
+    assert reason is not None and "cell voltage 3.48V" in reason
+
+
+def test_transient_sag_resets_the_timer() -> None:
+    stub = make_battery_stub()
+    feed(stub, battery_msg(volts=13.9), 100.0)
+    feed(stub, battery_msg(volts=14.8), 101.0)        # recovered
+    feed(stub, battery_msg(volts=13.9), 102.0)
+    feed(stub, battery_msg(volts=13.9), 104.0)
+    assert OffboardHover.battery_land_reason(stub) is None
+
+
+def test_low_remaining_and_px4_warning_land() -> None:
+    stub = make_battery_stub()
+    feed(stub, battery_msg(remaining=0.19), 100.0)
+    feed(stub, battery_msg(remaining=0.19), 103.0)
+    assert "remaining 19%" in OffboardHover.battery_land_reason(stub)
+
+    stub = make_battery_stub()
+    feed(stub, battery_msg(warning=1), 100.0)
+    feed(stub, battery_msg(warning=1), 103.0)
+    assert "PX4 battery warning 1" in OffboardHover.battery_land_reason(stub)
+
+
+def test_invalid_remaining_and_cell_count_are_ignored() -> None:
+    stub = make_battery_stub()
+    feed(stub, battery_msg(remaining=-1.0, cells=0, volts=10.0), 100.0)
+    feed(stub, battery_msg(remaining=-1.0, cells=0, volts=10.0), 104.0)
+    assert OffboardHover.battery_land_reason(stub) is None
+
+
+def test_stale_battery_telemetry_lands_while_armed() -> None:
+    stub = make_battery_stub()
+    feed(stub, battery_msg(), 100.0)
+    stub.clock = 105.5
+    assert "stale" in OffboardHover.battery_land_reason(stub)
+
+
+def test_battery_land_inactive_when_disarmed_or_disabled() -> None:
+    stub = make_battery_stub(armed=False)
+    feed(stub, battery_msg(volts=13.0), 100.0)
+    stub.clock = 200.0
+    assert OffboardHover.battery_land_reason(stub) is None
+
+    stub = make_battery_stub()
+    stub.battery_land = False
+    assert OffboardHover.battery_land_reason(stub) is None
+
+
+def test_disconnected_battery_message_is_dropped() -> None:
+    stub = make_battery_stub()
+    feed(stub, battery_msg(connected=False, volts=13.0), 100.0)
+    assert stub.battery is None and stub.last_battery_time is None
+
+
+def test_height_keys_decode_both_cursor_encodings() -> None:
+    assert OffboardHover.decode_height_keys(b"\x1b[A") == 1
+    assert OffboardHover.decode_height_keys(b"\x1bOB") == -1
+    assert OffboardHover.decode_height_keys(b"\x1b[A\x1b[A\x1b[B") == 1
+    assert OffboardHover.decode_height_keys(b"kl") == 0
+
+
+def make_height_stub(height=0.8, steps=0):
+    logs = []
+    stub = SimpleNamespace(
+        hover_height=height,
+        height_step=0.10,
+        min_hover_height=0.20,
+        max_hover_height=1.50,
+        pending_height_steps=steps,
+        get_logger=lambda: SimpleNamespace(warn=logs.append),
+    )
+    return stub, logs
+
+
+def test_height_keys_step_and_clamp() -> None:
+    stub, _ = make_height_stub(steps=2)
+    OffboardHover.apply_height_keys(stub)
+    assert math.isclose(stub.hover_height, 1.0)
+    assert stub.pending_height_steps == 0
+
+    stub.pending_height_steps = 50
+    OffboardHover.apply_height_keys(stub)
+    assert math.isclose(stub.hover_height, 1.50)
+
+    stub.pending_height_steps = -50
+    OffboardHover.apply_height_keys(stub)
+    assert math.isclose(stub.hover_height, 0.20)
+
+
+def test_no_pending_height_keys_leave_height_untouched() -> None:
+    stub, logs = make_height_stub()
+    OffboardHover.apply_height_keys(stub)
+    assert stub.hover_height == 0.8
+    assert logs == []

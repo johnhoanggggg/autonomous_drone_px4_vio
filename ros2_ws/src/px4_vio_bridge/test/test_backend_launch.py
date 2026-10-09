@@ -3,7 +3,7 @@ import importlib.util
 from pathlib import Path
 import pytest
 from launch import LaunchContext
-from launch.actions import DeclareLaunchArgument, TimerAction, GroupAction, IncludeLaunchDescription, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, TimerAction, GroupAction, IncludeLaunchDescription, ExecuteProcess, OpaqueFunction
 from launch_ros.actions import Node
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -315,14 +315,29 @@ def test_unknown_aware_flight_launch_uses_raw_vio_and_verified_prefix_policy():
     assert bridge['frame_transform'] == 'enu_flu_to_ned_frd'
     assert bridge['vio_yaw_offset_deg'] == flight['vio_yaw_offset_deg']
     assert bridge['max_raw_odometry_age'] == flight['max_vio_source_age']
-    recorder = next(a for a in ld.entities if type(a) is ExecuteProcess)
-    command = [perform_substitutions(context, part) for part in recorder.cmd]
+    # The recorder is built at launch time so record_camera can extend its topics.
+    record = next(a for a in ld.entities if isinstance(a, OpaqueFunction) and a.condition)
+
+    def recorder_command():
+        recorder = next(a for a in record.execute(context) if type(a) is ExecuteProcess)
+        return [perform_substitutions(context, part) for part in recorder.cmd]
+
+    command = recorder_command()
     for topic in ['/planner3d/flight/status', '/planner3d/flight/config', '/rtabmap/octomap',
                   '/rtabmap/octomap_metadata', '/planner3d/pose_snapshot',
                   '/fmu/in/trajectory_setpoint', '/perf/processes', '/rtabmap/vio_odom_info_lite']:
         assert topic in command
     assert '/rtabmap/vio_odom_info' not in command
     assert '/rtabmap/mapData' not in command
+    assert context.launch_configurations['record_camera'] == 'false'
+    assert not any('image' in part for part in command)
+    context.launch_configurations['record_camera'] = 'true'
+    assert '/oak/left/image_rect/compressed' in recorder_command()
+    context.launch_configurations['camera_topic'] = '/rtabmap/image/compressed'
+    command = recorder_command()
+    assert '/rtabmap/image/compressed' in command
+    assert '/oak/left/image_rect/compressed' not in command
+    assert 'record_camera' not in flight and 'camera_topic' not in flight
 
 
 def test_3d_flight_detects_existing_bag_recorders(tmp_path):

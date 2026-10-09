@@ -34,6 +34,7 @@ FLIGHT_RECORD_TOPICS = (
     '/fmu/out/vehicle_land_detected', '/fmu/out/failsafe_flags',
     '/fmu/out/battery_status_v1', '/fmu/out/sensor_combined',
     '/rtabmap/vio_odometry', '/rtabmap/vio_pose', '/rtabmap/vio_odom_info_lite',
+    '/rtabmap/map_save', '/rtabmap/map_reuse',
     # OctoMap plus paired metadata is the independent command-audit evidence.
     # MapData is a high-volume planner-replay input and is intentionally left
     # to an explicit diagnostic recording, not the time-critical flight bag.
@@ -80,9 +81,32 @@ def validate_flight_start(context):
     return []
 
 
+def flight_recorder(context):
+    # Built at launch time so record_camera can add to the topic list.
+    topics = list(FLIGHT_RECORD_TOPICS)
+    messages = []
+    if LaunchConfiguration('record_camera').perform(context).lower() in ('true', '1', 'yes'):
+        camera_topic = LaunchConfiguration('camera_topic').perform(context)
+        topics.append(camera_topic)
+        messages.append(LogInfo(msg=f'Recording camera feed: {camera_topic}'))
+    recorder = ExecuteProcess(
+        cmd=[DURABLE_RECORD, '--', 'ros2', 'bag', 'record', '--storage', 'mcap', '--storage-preset-profile',
+             'fastwrite', '--disable-keyboard-controls', '--output',
+             LaunchConfiguration('bag_output'), '--topics', *topics],
+        output='screen', sigterm_timeout='90', sigkill_timeout='90')
+    stop_recorder = RegisterEventHandler(OnProcessExit(target_action=recorder,
+        on_exit=[EmitEvent(event=Shutdown(reason='3D flight recorder stopped'))]))
+    return messages + [stop_recorder, recorder]
+
+
 def generate_launch_description():
     defaults = {
         'auto_arm': 'false', 'start_vio_bridge': 'true', 'record_bag': 'true',
+        # Adds the camera to the flight bag. The ROS backend publishes the
+        # rectified left mono image at 10 Hz; the /compressed transport JPEG-
+        # encodes it in the driver only while something subscribes (~20 KB per
+        # frame, ~0.2 MB/s). With the depthai backend use /rtabmap/image/compressed.
+        'record_camera': 'false', 'camera_topic': '/oak/left/image_rect/compressed',
         # The ROS 3D backend starts cold on the Pi. Give the VIO bridge time to
         # establish PX4 external-vision fusion before the adapter starts its
         # own 10-second local-position watchdog. This mirrors the proven 2D
@@ -141,7 +165,7 @@ def generate_launch_description():
                 'keyboard_kill', 'keyboard_land', 'foxglove_teleop', 'brake_damping', 'path_carrot'}
     strings = {'vio_info_topic'}
     excluded = {'start_vio_bridge', 'record_bag', 'bag_output', 'adapter_start_delay',
-                'route_speed'}
+                'route_speed', 'record_camera', 'camera_topic'}
     params = {k: ParameterValue(LaunchConfiguration(k), value_type=(
         bool if k in booleans else str if k in strings else int if k == 'min_vio_features' else float))
         for k in defaults if k not in excluded}
@@ -161,20 +185,11 @@ def generate_launch_description():
                                    LaunchConfiguration('max_vio_source_age'), value_type=float),
                                'vio_yaw_offset_deg': ParameterValue(
                                    LaunchConfiguration('vio_yaw_offset_deg'), value_type=float)}])
-    recorder = ExecuteProcess(
-        cmd=[DURABLE_RECORD, '--', 'ros2', 'bag', 'record', '--storage', 'mcap', '--storage-preset-profile',
-             'fastwrite', '--disable-keyboard-controls', '--output',
-             LaunchConfiguration('bag_output'), '--topics', *FLIGHT_RECORD_TOPICS],
-        output='screen', sigterm_timeout='90', sigkill_timeout='90',
-        condition=IfCondition(LaunchConfiguration('record_bag')))
     stop_adapter = RegisterEventHandler(OnProcessExit(target_action=adapter,
         on_exit=[EmitEvent(event=Shutdown(reason='3D flight adapter stopped'))]))
     stop_bridge = RegisterEventHandler(OnProcessExit(target_action=bridge,
         on_exit=[EmitEvent(event=Shutdown(reason='VIO bridge stopped'))]),
         condition=IfCondition(LaunchConfiguration('start_vio_bridge')))
-    stop_recorder = RegisterEventHandler(OnProcessExit(target_action=recorder,
-        on_exit=[EmitEvent(event=Shutdown(reason='3D flight recorder stopped'))]),
-        condition=IfCondition(LaunchConfiguration('record_bag')))
     delayed_adapter = TimerAction(
         period=LaunchConfiguration('adapter_start_delay'), actions=[adapter])
     return LaunchDescription([
@@ -186,5 +201,7 @@ def generate_launch_description():
             ' m/s; auto-arm defaults false; K=kill, L=land.',
         ]),
         OpaqueFunction(function=validate_flight_start),
-        stop_adapter, stop_bridge, stop_recorder, recorder, bridge, delayed_adapter,
+        OpaqueFunction(function=flight_recorder,
+                       condition=IfCondition(LaunchConfiguration('record_bag'))),
+        stop_adapter, stop_bridge, bridge, delayed_adapter,
     ])

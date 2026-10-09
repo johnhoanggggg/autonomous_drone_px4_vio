@@ -3,6 +3,7 @@ import argparse
 from collections import deque
 from datetime import timedelta
 import io
+import os
 import json
 import time
 import threading
@@ -20,6 +21,16 @@ from std_msgs.msg import Int32, String
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from px4_vio_bridge.rtabmap_grid import make_occupancy_grid
+from px4_vio_bridge.slam_map_store import (
+    ArmingEdges, MapSaveTrigger, correction_delta, correction_is_identity,
+    load_grid_sidecar, merge_prior_grid, prepare_database, prior_alignment,
+    save_grid_sidecar)
+from px4_vio_bridge.vio_reset import VioResetPolicy, is_lost_pose
+
+# The prior grid is merged only after this many live wall cells inside it agree.
+PRIOR_MIN_WALL_CELLS = 30
+PRIOR_MIN_AGREEMENT = 0.6
+PRIOR_REJECT_AFTER = 5
 
 
 def parse_bool(value):
@@ -49,8 +60,15 @@ parser.add_argument('--slam-database-path', default='',
                          'With a path set, rtabmap-info reports GlobalClosure '
                          'and LocalSpaceClosure link counts, which is how the '
                          'DepthAI and ROS mappers are compared on equal terms. '
-                         'Delete the file first; an existing one is not loaded '
-                         'but a stale file is easy to misread.')
+                         'The file must not exist: RTAB-Map loads an existing '
+                         'database whatever setLoadDatabaseOnStart says, so '
+                         'reuse goes through --slam-load-database instead.')
+parser.add_argument('--slam-save-on-arm', type=parse_bool, default=False,
+                    help='Also save the database when PX4 arms and disarms '
+                         '(needs --slam-database-path).')
+parser.add_argument('--slam-load-database', default='',
+                    help='Opt-in map reuse: copy this saved database to '
+                         '--slam-database-path and continue mapping from it.')
 parser.add_argument('--enable-slam', type=parse_bool, default=True,
                     help='Run the DepthAI RTABMapSLAM host node. Set false to publish '
                          'raw VIO pose and RGB-D only and let a ROS rtabmap_slam own '
@@ -107,6 +125,14 @@ parser.add_argument('--basalt-config-path', default='',
 parser.add_argument('--num-features', type=int, default=400,
                     help='RTAB-Map VIO FeatureTracker target feature count. 400 is validated '
                          'on this OAK-D Lite; higher values have not initialized reliably.')
+parser.add_argument('--vio-auto-reset', type=parse_bool, default=True,
+                    help='rtabmap backend: reset a lost RTABMapVIO while PX4 is disarmed. '
+                         'It never re-initialises by itself, so a loss at start-up or while '
+                         'handling the drone otherwise lasts the whole run.')
+parser.add_argument('--vio-reset-lost-s', type=float, default=0.5,
+                    help='Continuous loss before a disarmed reset.')
+parser.add_argument('--vio-reset-cooldown-s', type=float, default=2.0,
+                    help='Minimum time between resets, letting the fresh VIO initialise.')
 parser.add_argument('--path-publish-stride', type=int, default=10)
 parser.add_argument('--path-size', type=int, default=1000)
 parser.add_argument('--publish-clouds', type=parse_bool, default=False,
@@ -155,6 +181,11 @@ if not args.enable_slam:
         print('--enable-slam false: no map is produced unless a ROS rtabmap_slam '
               'consumes /rtabmap3d/input/*; consider --publish-ros-rgbd true')
 
+if (args.slam_save_on_arm or args.slam_load_database) and not args.slam_database_path:
+    parser.error('--slam-save-on-arm and --slam-load-database need --slam-database-path')
+if (args.slam_save_on_arm or args.slam_load_database) and not args.enable_slam:
+    parser.error('--slam-save-on-arm and --slam-load-database need --enable-slam true')
+
 if dai.__version__ == '3.7.1':
     parser.error(
         'DepthAI 3.7.1 is blocked on this OAK-D Lite: it repeatedly crashes '
@@ -192,6 +223,97 @@ class PoseTimestampNode(dai.node.ThreadedHostNode):
             transform.setTimestampDevice(
                 frame.getTimestampDevice(dai.CameraExposureOffset.MIDDLE))
             self.outputTransform.send(transform)
+
+
+# Runs on the OAK: relays stereo depth into RTABMapVIO unless the host holds it.
+# On the device, depth reaches the VIO with no extra delay; relaying it through a
+# host node instead added ~460 ms of capture-to-pose latency on the bench.
+VIO_DEPTH_GATE_SCRIPT = """
+hold = False
+while True:
+    ctrl = node.inputs['ctrl'].tryGet()
+    if ctrl is not None:
+        hold = ctrl.getData()[0] == 1
+    depth = node.inputs['depth'].get()
+    if not hold:
+        node.outputs['out'].send(depth)
+"""
+
+
+class VioResetController(dai.node.ThreadedHostNode):
+    """Reset RTABMapVIO, disarmed, once it is lost.
+
+    RTABMapVIO::reset() clears the odometry with no lock while its own thread
+    may be inside process(). Holding depth in the on-device gate stops new
+    sync groups, so once no transform has come out for `quiet_s` the VIO
+    thread is idle in its input wait and the reset cannot race it.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.inputVio = self.createInput()
+        # Never back-pressure the VIO's transform output.
+        self.inputVio.setBlocking(False)
+        self.inputVio.setMaxSize(8)
+        self.odom = None
+        self.gate = None
+        self.policy = None
+        self.on_reset = None
+        self.quiet_s = 0.15
+        self.max_hold_s = 1.0
+
+    def configure(self, odom, gate_queue, policy, on_reset):
+        self.odom = odom
+        self.gate = gate_queue
+        self.policy = policy
+        self.on_reset = on_reset
+
+    def _hold(self, hold):
+        msg = dai.Buffer()
+        msg.setData([1 if hold else 0])
+        self.gate.send(msg)
+
+    def _observe(self, transforms):
+        now = time.monotonic()
+        for transform in transforms:
+            t = transform.getTranslation()
+            q = transform.getQuaternion()
+            self.policy.observe(is_lost_pose((t.x, t.y, t.z), (q.qw, q.qx, q.qy, q.qz)), now)
+
+    def _reset(self):
+        lost_for = self.policy.lost_for(time.monotonic())
+        self._hold(True)
+        try:
+            start = time.monotonic()
+            last_output = start
+            while time.monotonic() - last_output < self.quiet_s:
+                if time.monotonic() - start > self.max_hold_s:
+                    # The VIO kept producing output; try again on a later frame.
+                    return
+                pending = self.inputVio.tryGetAll()
+                if pending:
+                    self._observe(pending)
+                    last_output = time.monotonic()
+                time.sleep(0.01)
+            # A pose that arrived while holding may show the VIO recovered.
+            now = time.monotonic()
+            if not self.policy.should_reset(now):
+                return
+            self.odom.reset(None)  # identity: the bridge and SLAM treat it as a new origin
+            self.policy.mark_reset(now)
+        finally:
+            self._hold(False)
+        if self.on_reset is not None:
+            self.on_reset(self.policy.resets, lost_for)
+
+    def run(self):
+        while self.mainLoop():
+            transform = self.inputVio.get()
+            if transform is None:
+                continue
+            self._observe([transform])
+            if self.policy.should_reset(time.monotonic()):
+                self._reset()
 
 
 class Ros2Node(dai.node.ThreadedHostNode):
@@ -297,6 +419,21 @@ class Ros2Node(dai.node.ThreadedHostNode):
         self.raw_pose_history = deque(maxlen=120)
         self.person_depth_history = deque(maxlen=30)
         self.odom_correction = np.eye(4, dtype=np.float64)
+        self.correction_count = 0
+        # Map reuse (--slam-load-database). The prior grid is merged under the
+        # live grid only once RTAB-Map has linked this session to the loaded
+        # map; before that the two are in unrelated frames.
+        self.prior_grid = None
+        self.prior_verified = False
+        self.prior_disagreements = 0
+        self.map_linked = True
+        self.last_grid_msg = None
+        self.grid_count = 0
+        self.reuse_status_pub = self.ros_node.create_publisher(
+            String, '/rtabmap/map_reuse',
+            QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       history=HistoryPolicy.KEEP_LAST, depth=1))
         self.rgb_to_left = np.eye(4, dtype=np.float64)
         self.left_to_rgb = np.eye(4, dtype=np.float64)
         self.left_optical_to_body = np.array(
@@ -686,6 +823,11 @@ class Ros2Node(dai.node.ThreadedHostNode):
                 # into the active TF tree by accident.
                 if self._has_unit_quaternion(odomCorrectionData):
                     self.odom_correction = self._transform_matrix(odomCorrectionData)
+                    self.correction_count += 1
+                    if not self.map_linked and not correction_is_identity(
+                            self.odom_correction):
+                        self.map_linked = True
+                        self._publish_reuse_status('linked')
                     self.odom_correction_pub.publish(
                         self._make_pose(odomCorrectionData, now))
                 else:
@@ -702,6 +844,17 @@ class Ros2Node(dai.node.ThreadedHostNode):
                         resolution=self.grid_resolution,
                         stamp=now,
                     )
+                    if self.prior_grid is not None and self.map_linked:
+                        self._check_prior(grid)
+                    if self.prior_grid is not None and self.prior_verified:
+                        try:
+                            grid = merge_prior_grid(self.prior_grid, grid)
+                        except ValueError as exc:
+                            self.ros_node.get_logger().error(
+                                f'prior grid dropped: {exc}')
+                            self.prior_grid = None
+                    self.last_grid_msg = grid
+                    self.grid_count += 1
                     self.grid_pub.publish(grid)
                 except (TypeError, ValueError) as exc:
                     self.ros_node.get_logger().error(
@@ -806,6 +959,42 @@ class Ros2Node(dai.node.ThreadedHostNode):
 
             if personGroup is not None:
                 self._publish_person_group(personGroup, now)
+
+    def configure_reuse(self, prior_grid, source):
+        self.prior_grid = prior_grid
+        self.map_linked = False
+        self.reuse_source = source
+        self._publish_reuse_status('waiting_for_link')
+
+    def _check_prior(self, live):
+        if self.prior_verified:
+            return
+        score, cells = prior_alignment(self.prior_grid, live)
+        if cells < PRIOR_MIN_WALL_CELLS:
+            return
+        if score >= PRIOR_MIN_AGREEMENT:
+            self.prior_verified = True
+            self._publish_reuse_status('prior_merged', agreement=round(score, 3),
+                                       wall_cells=cells)
+            return
+        self.prior_disagreements += 1
+        if self.prior_disagreements >= PRIOR_REJECT_AFTER:
+            self._publish_reuse_status('prior_rejected', agreement=round(score, 3),
+                                       wall_cells=cells)
+            self.prior_grid = None
+
+    def _publish_reuse_status(self, state, **extra):
+        status = {'state': state, 'source': self.reuse_source,
+                  'prior_grid': self.prior_grid['path'] if self.prior_grid else None}
+        status.update(extra)
+        if state == 'linked':
+            shift_m, yaw_deg = correction_delta(np.eye(4), self.odom_correction)
+            status.update(correction_m=round(shift_m, 3),
+                          correction_yaw_deg=round(yaw_deg, 2))
+        self.reuse_status_pub.publish(String(data=json.dumps(status, sort_keys=True)))
+        log = (self.ros_node.get_logger().error if state == 'prior_rejected'
+               else self.ros_node.get_logger().info)
+        log('map reuse: ' + json.dumps(status, sort_keys=True))
 
     def _make_pose(self, trans_data, now):
         trans = trans_data.getTranslation()
@@ -1082,13 +1271,94 @@ with dai.Pipeline() as p:
         if args.slam_database_path:
             # RTABMapSLAM detects loop closures but exposes no statistics
             # output, so the database is the only way to count them.
+            # setLoadDatabaseOnStart is stored but never read in 3.5.0:
+            # initialize() opens the path and RTAB-Map loads what is there.
+            print('RTABMapSLAM database: ' + prepare_database(
+                args.slam_database_path, args.slam_load_database), flush=True)
             slam.setDatabasePath(args.slam_database_path)
-            slam.setLoadDatabaseOnStart(False)
             slam.setSaveDatabaseOnClose(True)
-            print(f'RTABMapSLAM database will be saved to '
-                  f'{args.slam_database_path} on close')
 
     ros2Viewer = p.create(Ros2Node)
+
+    map_saver = None
+    if slam is not None and args.slam_database_path:
+        from px4_msgs.msg import VehicleStatus
+        from std_msgs.msg import Empty
+        ros_node = ros2Viewer.ros_node
+        save_status_pub = ros_node.create_publisher(
+            String, '/rtabmap/map_save',
+            QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       history=HistoryPolicy.KEEP_LAST, depth=1))
+
+        def report_save(status):
+            status['wall_time'] = time.time()
+            save_status_pub.publish(String(data=json.dumps(status, sort_keys=True)))
+            if status['state'] == 'failed':
+                log = ros_node.get_logger().error
+            elif status.get('map_intact') is False:
+                log = ros_node.get_logger().warning
+            else:
+                log = ros_node.get_logger().info
+            log('map save: ' + json.dumps(status, sort_keys=True))
+
+        def grid_known(msg):
+            return int((np.asarray(msg.data, dtype=np.int8) >= 0).sum()) if msg else 0
+
+        def before_save(_reason):
+            return {'grid': ros2Viewer.last_grid_msg,
+                    'grid_count': ros2Viewer.grid_count,
+                    'correction': ros2Viewer.odom_correction.copy()}
+
+        def after_save(_reason, before):
+            # Each save re-opens RTAB-Map as a new map, unlinked until a loop
+            # closure (one of three bench saves never linked). Unlinked, the map
+            # frame falls back to raw VIO and the grid to this session's nodes.
+            # Check both survived, from the first grid after the save.
+            extra = {}
+            if before['grid'] is not None:
+                extra['grid_sidecar'] = save_grid_sidecar(
+                    args.slam_database_path, before['grid'], {'saved_wall_time': time.time()})
+            deadline = time.monotonic() + 5.0
+            while ros2Viewer.grid_count <= before['grid_count'] and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if ros2Viewer.grid_count <= before['grid_count'] or before['grid'] is None:
+                extra['map_intact'] = None  # no grid to compare against
+                return extra
+            known_before = grid_known(before['grid'])
+            known_after = grid_known(ros2Viewer.last_grid_msg)
+            shift_m, yaw_deg = correction_delta(before['correction'], ros2Viewer.odom_correction)
+            extra.update(
+                grid_known_before=known_before, grid_known_after=known_after,
+                correction_shift_m=round(shift_m, 3), correction_shift_deg=round(yaw_deg, 2),
+                map_intact=bool(known_after >= 0.9 * known_before
+                              and shift_m < 0.10 and yaw_deg < 3.0))
+            return extra
+
+        map_saver = MapSaveTrigger(slam, args.slam_database_path, report_save,
+                                   before_save=before_save, after_save=after_save)
+        if args.slam_load_database:
+            prior = load_grid_sidecar(os.path.abspath(os.path.expanduser(args.slam_load_database)))
+            if prior is None:
+                ros_node.get_logger().warning(
+                    'map reuse: no saved grid next to the database; the planner '
+                    'will only see obstacles this session observes')
+            ros2Viewer.configure_reuse(prior, args.slam_load_database)
+        ros_node.create_subscription(
+            Empty, '/rtabmap/save_map', lambda _msg: map_saver.request('manual'), 1)
+        if args.slam_save_on_arm:
+            arming_edges = ArmingEdges()
+
+            def on_vehicle_status(msg):
+                edge = arming_edges.update(msg.arming_state)
+                if edge is not None:
+                    map_saver.request(edge)
+
+            ros_node.create_subscription(
+                VehicleStatus, '/fmu/out/vehicle_status_v1', on_vehicle_status,
+                QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                           history=HistoryPolicy.KEEP_LAST, depth=1))
 
     imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
     imu.setBatchReportThreshold(1)
@@ -1219,7 +1489,36 @@ with dai.Pipeline() as p:
     else:
         stereo.rectifiedLeft.link(featureTracker.inputImage)
         featureTracker.passthroughInputImage.link(odom.rect)
-        stereo.depth.link(odom.depth)
+        if args.vio_auto_reset:
+            from px4_msgs.msg import VehicleStatus
+            depth_gate = p.create(dai.node.Script)
+            depth_gate.setScript(VIO_DEPTH_GATE_SCRIPT)
+            depth_gate.inputs['depth'].setBlocking(False)
+            depth_gate.inputs['depth'].setMaxSize(2)
+            stereo.depth.link(depth_gate.inputs['depth'])
+            depth_gate.outputs['out'].link(odom.depth)
+            gate_queue = depth_gate.inputs['ctrl'].createInputQueue()
+            reset_controller = p.create(VioResetController)
+            odom.transform.link(reset_controller.inputVio)
+            reset_policy = VioResetPolicy(args.vio_reset_lost_s, args.vio_reset_cooldown_s)
+            reset_node = ros2Viewer.ros_node
+            reset_pub = reset_node.create_publisher(Int32, '/rtabmap/vio_reset_count', 10)
+
+            def on_vio_reset(count, lost_for):
+                reset_node.get_logger().warning(
+                    f'VIO lost for {lost_for:.1f} s while disarmed; reset #{count} '
+                    '(new odometry origin)')
+                reset_pub.publish(Int32(data=count))
+
+            reset_controller.configure(odom, gate_queue, reset_policy, on_vio_reset)
+            reset_node.create_subscription(
+                VehicleStatus, '/fmu/out/vehicle_status_v1',
+                lambda msg: reset_policy.set_arming_state(msg.arming_state),
+                QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                           history=HistoryPolicy.KEEP_LAST, depth=1))
+        else:
+            stereo.depth.link(odom.depth)
         featureTracker.outputFeatures.link(odom.features)
         featureTracker.outputFeatures.link(ros2Viewer.inputFeatures)
         rect_source = odom.passthroughRect
@@ -1261,5 +1560,12 @@ with dai.Pipeline() as p:
     except KeyboardInterrupt:
         pass
     finally:
+        if map_saver is not None and ros2Viewer.last_grid_msg is not None:
+            # RTAB-Map writes the database itself on close; keep its grid with it.
+            try:
+                save_grid_sidecar(args.slam_database_path, ros2Viewer.last_grid_msg,
+                                  {'saved_wall_time': time.time(), 'reason': 'close'})
+            except OSError as exc:
+                print(f'grid sidecar not saved on close: {exc}', flush=True)
         if rclpy.ok():
             rclpy.shutdown()
