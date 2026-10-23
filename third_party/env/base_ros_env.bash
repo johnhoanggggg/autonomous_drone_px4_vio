@@ -1,0 +1,9 @@
+source /opt/ros/jazzy/setup.bash
+source /home/john/ros2_ws/install/setup.bash
+export AMENT_PREFIX_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy:$AMENT_PREFIX_PATH
+export LD_LIBRARY_PATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib:/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+export PYTHONPATH=/home/john/depthai_v3_overlay/root/opt/ros/jazzy/lib/python3.12/site-packages:$PYTHONPATH
+source /home/john/depthai_v3_compat_ws/install/setup.bash
+source /home/john/depthai_v3_feature_ws/install/setup.bash
+source /home/john/autonomous_drone_px4_vio/ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
