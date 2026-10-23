@@ -131,7 +131,8 @@ def generate_launch_description():
         # The flight backend now bounds VIO queueing to about 0.12 s p95.
         # Retain the original fail-closed 0.30 s source-time budget rather than
         # masking a future perception backlog with a wider acceptance window.
-        'map_timeout': '3.0', 'pose_timeout': '0.5', 'max_vio_source_age': '0.30',
+        # map_timeout must match the monitor planner's (ros_planner_3d_monitor).
+        'map_timeout': '4.0', 'pose_timeout': '0.5', 'max_vio_source_age': '0.30',
         'path_timeout': '3.5', 'px4_timeout': '0.50',
         'vehicle_control_mode_timeout': '0.75', 'follower_rejoin_grace': '1.5',
         'route_equivalence_tolerance': '0.10',

@@ -63,6 +63,11 @@ def generate_launch_description():
         "planning_radius_xy": "3.0", "robot_radius": "0.25", "safety_margin": "0.10",
         "voxel_size": "0.05", "max_marker_voxels": "5000",
         "map_preparation_period": "2.0",
+        # Must match the flight adapter's map_timeout. 2026-10-09 flights: maps
+        # arrive ~0.8 s old about once a second, but 5% arrive 2.5-3.2 s old, so
+        # 3.0 s held the route (MAP_STALE 12% of a good flight) and ended two
+        # flights in PATH_STALE.
+        "map_timeout": "4.0",
         "planning_pose_drift_tolerance": "0.10",
         "start_recovery_connector_radius": "0.30",
         "route_margin": "0.10",
@@ -111,7 +116,7 @@ def generate_launch_description():
                 "planning_radius_xy", "robot_radius", "safety_margin", "voxel_size",
                 "max_marker_voxels", "process_monitor", "goal_height_mode", "exploration_route",
                 "current_goal_min_height_above_start", "min_route_height_above_start",
-                "map_preparation_period",
+                "map_preparation_period", "map_timeout",
                 "planning_pose_drift_tolerance", "start_recovery_connector_radius",
                 "route_margin")},
             "octomap_producer": "false", "simulate": "false",
