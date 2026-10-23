@@ -1,0 +1,664 @@
+diff --git a/rtabmap_odom/CMakeLists.txt b/rtabmap_odom/CMakeLists.txt
+index 9613050..31f6e84 100644
+--- a/rtabmap_odom/CMakeLists.txt
++++ b/rtabmap_odom/CMakeLists.txt
+@@ -136,4 +136,10 @@ install(DIRECTORY include/
+    FILES_MATCHING PATTERN "*.h"
+ )
+ 
++if(BUILD_TESTING)
++  find_package(ament_cmake_gtest REQUIRED)
++  ament_add_gtest(test_immutable_camera_info test/test_immutable_camera_info.cpp)
++  ament_target_dependencies(test_immutable_camera_info sensor_msgs)
++endif()
++
+ ament_package()
+diff --git a/rtabmap_odom/include/rtabmap_odom/ImmutableCameraInfo.h b/rtabmap_odom/include/rtabmap_odom/ImmutableCameraInfo.h
+new file mode 100644
+index 0000000..ebfd008
+--- /dev/null
++++ b/rtabmap_odom/include/rtabmap_odom/ImmutableCameraInfo.h
+@@ -0,0 +1,81 @@
++#pragma once
++
++#include <sensor_msgs/msg/camera_info.hpp>
++#include <sensor_msgs/msg/image.hpp>
++#include <cmath>
++#include <cstdint>
++#include <mutex>
++#include <string>
++
++namespace rtabmap_odom {
++// Experimental fixed-calibration contract. A late calibration change cannot
++// be detected retroactively. Any observed change latches closed until restart.
++class ImmutableCameraInfo {
++public:
++  using Info = sensor_msgs::msg::CameraInfo;
++  using Image = sensor_msgs::msg::Image;
++  bool observe(const Info & info) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!fault_.empty()) return false;
++    if (!valid(info)) return fail("invalid calibration");
++    Info identity = info;
++    identity.header.stamp = builtin_interfaces::msg::Time();
++    if (ready_ && identity != identity_) return fail("calibration changed; restart required");
++    if (!ready_) {
++      identity_ = identity;
++      info_ = info;
++      firstStamp_ = stamp(info.header.stamp);
++      ready_ = true;
++    }
++    return true;
++  }
++  Info::ConstSharedPtr forPair(const Image & image, const Image & depth) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!ready_ || !fault_.empty()) return {};
++    if (image.header.frame_id != info_.header.frame_id ||
++        depth.header.frame_id != info_.header.frame_id ||
++        image.width != info_.width || image.height != info_.height ||
++        depth.width != info_.width || depth.height != info_.height) {
++      fail("image/depth frame or dimensions changed; restart required");
++      return {};
++    }
++    const auto t = stamp(image.header.stamp);
++    const auto d = stamp(depth.header.stamp);
++    if (lastStamp_ >= 0 && (t <= lastStamp_ || d <= lastDepthStamp_)) {
++      fail("non-increasing image/depth time; restart required");
++      return {};
++    }
++    if (t < firstStamp_ || d < firstStamp_) return {};
++    lastStamp_ = t;
++    lastDepthStamp_ = d;
++    auto out = std::make_shared<Info>(info_);
++    out->header.stamp = image.header.stamp;
++    return out;
++  }
++  std::string fault() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return fault_;
++  }
++private:
++  static int64_t stamp(const builtin_interfaces::msg::Time & t) {
++    return int64_t(t.sec) * 1000000000LL + t.nanosec;
++  }
++  template<class Values> static bool finite(const Values & values) {
++    for (auto v : values) if (!std::isfinite(v)) return false;
++    return true;
++  }
++  static bool valid(const Info & i) {
++    return i.header.stamp.sec >= 0 && i.header.stamp.nanosec < 1000000000 &&
++      !i.header.frame_id.empty() && i.width > 0 && i.height > 0 &&
++      finite(i.d) && finite(i.k) && finite(i.r) && finite(i.p) &&
++      i.k[0] > 0 && i.k[4] > 0 && i.k[8] == 1 &&
++      i.p[0] > 0 && i.p[5] > 0 && i.p[10] == 1;
++  }
++  bool fail(const std::string & reason) { fault_ = reason; return false; }
++  mutable std::mutex mutex_;
++  Info info_, identity_;
++  bool ready_ = false;
++  int64_t firstStamp_ = 0, lastStamp_ = -1, lastDepthStamp_ = -1;
++  std::string fault_;
++};
++}
+diff --git a/rtabmap_odom/include/rtabmap_odom/OdometryROS.h b/rtabmap_odom/include/rtabmap_odom/OdometryROS.h
+index 4a1b7a8..f39049c 100644
+--- a/rtabmap_odom/include/rtabmap_odom/OdometryROS.h
++++ b/rtabmap_odom/include/rtabmap_odom/OdometryROS.h
+@@ -51,6 +51,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include <boost/thread.hpp>
+ 
++#include <atomic>
++#include <deque>
++
+ #include "rtabmap_util/ULogToRosout.h"
+ #include "rtabmap_sync/SyncDiagnostic.h"
+ 
+@@ -159,10 +162,15 @@ private:
+ 	// Safe-threading
+ 	UMutex imuMutex_;
+ 	UMutex dataMutex_;	
++	UMutex pendingDataMutex_;
+ 	USemaphore dataReady_;
+ 	rtabmap::SensorData dataToProcess_;
+ 	std_msgs::msg::Header dataHeaderToProcess_;
+ 	bool bufferedDataToProcess_;
++	rtabmap::SensorData pendingDataToProcess_;
++	std_msgs::msg::Header pendingDataHeaderToProcess_;
++	bool pendingDataAvailable_;
++	std::deque<std::pair<rtabmap::SensorData, std_msgs::msg::Header> > pendingDataQueue_;
+ 
+ 	bool paused_;
+ 	int resetCountdown_;
+@@ -182,9 +190,12 @@ private:
+ 	int odomStrategy_;
+ 	bool waitIMUToinit_;
+ 	bool alwaysCheckImuTf_;
++	bool keepLatestFrame_;
++	bool keepNextFrame_;
++	int processingQueueSize_;
+ 	bool imuProcessed_;
+-	int processedMsgs_;
+-	int droppedMsgs_;
++	std::atomic<int> processedMsgs_;
++	std::atomic<int> droppedMsgs_;
+ 	std::map<double, sensor_msgs::msg::Imu::ConstSharedPtr> imus_;
+ 	std::string configPath_;
+ 	rtabmap::Transform initialPose_;
+diff --git a/rtabmap_odom/include/rtabmap_odom/TimingAudit.h b/rtabmap_odom/include/rtabmap_odom/TimingAudit.h
+new file mode 100644
+index 0000000..530d9e5
+--- /dev/null
++++ b/rtabmap_odom/include/rtabmap_odom/TimingAudit.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++
++namespace rtabmap_odom {
++// Isolated diagnostic overlay only. Disabled unless explicitly requested.
++inline void timingAudit(const char *event, int64_t stamp)
++{
++    static const bool enabled = std::getenv("RTABMAP_TIMING_AUDIT") != nullptr;
++    if(!enabled) return;
++    const auto wall = std::chrono::steady_clock::now().time_since_epoch();
++    std::fprintf(stderr, "TIMING_AUDIT %s %lld %lld\n", event,
++        static_cast<long long>(stamp),
++        static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count()));
++}
++struct TimingAuditScope {
++    const char *event;
++    int64_t stamp;
++    ~TimingAuditScope() { timingAudit(event, stamp); }
++};
++}
+diff --git a/rtabmap_odom/include/rtabmap_odom/rgbd_odometry.hpp b/rtabmap_odom/include/rtabmap_odom/rgbd_odometry.hpp
+index 9343fa4..053f108 100644
+--- a/rtabmap_odom/include/rtabmap_odom/rgbd_odometry.hpp
++++ b/rtabmap_odom/include/rtabmap_odom/rgbd_odometry.hpp
+@@ -47,6 +47,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include <cv_bridge/cv_bridge.hpp>
+ #endif
+ 
++#include "rtabmap_odom/ImmutableCameraInfo.h"
++
+ namespace rtabmap_odom
+ {
+ 
+@@ -58,6 +60,17 @@ public:
+ 	virtual ~RGBDOdometry();
+ 
+ private:
++	void cachedPairCallback(const sensor_msgs::msg::Image::ConstSharedPtr image,
++			const sensor_msgs::msg::Image::ConstSharedPtr depth);
++	void initCachedSync();
++	ImmutableCameraInfo calibrationCache_;
++	bool cacheCameraInfo_ = false;
++	bool cacheApproxSync_ = true;
++	double cacheMaxInterval_ = 0.0;
++	typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::Image> CachedApproxPolicy;
++	typedef message_filters::sync_policies::ExactTime<sensor_msgs::msg::Image, sensor_msgs::msg::Image> CachedExactPolicy;
++	message_filters::Synchronizer<CachedApproxPolicy> * cachedApproxSync_ = nullptr;
++	message_filters::Synchronizer<CachedExactPolicy> * cachedExactSync_ = nullptr;
+ 	virtual void updateParameters(rtabmap::ParametersMap & parameters);
+ 	virtual void onOdomInit();
+ 
+diff --git a/rtabmap_odom/package.xml b/rtabmap_odom/package.xml
+index 245a8d4..a0a1c96 100644
+--- a/rtabmap_odom/package.xml
++++ b/rtabmap_odom/package.xml
+@@ -29,6 +29,7 @@
+   <depend>rtabmap_msgs</depend>
+   <depend>rtabmap_util</depend>
+   <depend>rtabmap_sync</depend>
++  <test_depend>ament_cmake_gtest</test_depend>
+ 
+   <export>
+ 	<build_type>ament_cmake</build_type>
+diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
+index c9955d9..c0a570e 100644
+--- a/rtabmap_odom/src/OdometryROS.cpp
++++ b/rtabmap_odom/src/OdometryROS.cpp
+@@ -54,6 +54,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include "rtabmap/utilite/UStl.h"
+ #include "rtabmap/utilite/UFile.h"
+ #include "rtabmap/utilite/UMath.h"
++#include "rtabmap_odom/TimingAudit.h"
+ 
+ #define BAD_COVARIANCE 9999
+ 
+@@ -81,6 +82,7 @@ OdometryROS::OdometryROS(const std::string & name, const rclcpp::NodeOptions & o
+ 	publishNullWhenLost_(true),
+ 	publishCompressedSensorData_(false),
+ 	qos_(RMW_QOS_POLICY_RELIABILITY_SYSTEM_DEFAULT),
++	pendingDataAvailable_(false),
+ 	paused_(false),
+ 	resetCountdown_(0),
+ 	resetCurrentCount_(0),
+@@ -97,6 +99,9 @@ OdometryROS::OdometryROS(const std::string & name, const rclcpp::NodeOptions & o
+ 	odomStrategy_(Parameters::defaultOdomStrategy()),
+ 	waitIMUToinit_(false),
+ 	alwaysCheckImuTf_(true),
++	keepLatestFrame_(false),
++	keepNextFrame_(false),
++	processingQueueSize_(0),
+ 	imuProcessed_(false),
+ 	processedMsgs_(0),
+ 	droppedMsgs_(0),
+@@ -150,6 +155,29 @@ OdometryROS::OdometryROS(const std::string & name, const rclcpp::NodeOptions & o
+ 
+ 	waitIMUToinit_ = this->declare_parameter("wait_imu_to_init", waitIMUToinit_);
+ 	alwaysCheckImuTf_ = this->declare_parameter("always_check_imu_tf", alwaysCheckImuTf_);
++	keepLatestFrame_ = this->declare_parameter("keep_latest_frame", keepLatestFrame_);
++	keepNextFrame_ = this->declare_parameter("keep_next_frame", keepNextFrame_);
++	processingQueueSize_ = this->declare_parameter("processing_queue_size", processingQueueSize_);
++	if(processingQueueSize_ < 0)
++	{
++		RCLCPP_WARN(this->get_logger(), "Odometry: processing_queue_size cannot be negative; disabling queued handoff.");
++		processingQueueSize_ = 0;
++	}
++	if((keepLatestFrame_ && keepNextFrame_) ||
++	   (processingQueueSize_ > 0 && (keepLatestFrame_ || keepNextFrame_)))
++	{
++		RCLCPP_WARN(this->get_logger(), "Odometry: only one pending-frame handoff mode can be enabled; disabling all handoff modes.");
++		keepLatestFrame_ = false;
++		keepNextFrame_ = false;
++		processingQueueSize_ = 0;
++	}
++	if((keepLatestFrame_ || keepNextFrame_ || processingQueueSize_ > 0) && waitIMUToinit_)
++	{
++		RCLCPP_WARN(this->get_logger(), "Odometry: pending-frame handoff is incompatible with wait_imu_to_init; disabling the handoff mode.");
++		keepLatestFrame_ = false;
++		keepNextFrame_ = false;
++		processingQueueSize_ = 0;
++	}
+ 	
+ 
+ 	configPath_ = uReplaceChar(configPath_, '~', UDirectory::homeDir());
+@@ -460,7 +488,61 @@ void OdometryROS::callbackIMU(const sensor_msgs::msg::Imu::SharedPtr msg)
+ 
+ void OdometryROS::processData(SensorData & data, const std_msgs::msg::Header & header)
+ {
++    timingAudit("enqueue", rclcpp::Time(header.stamp).nanoseconds());
+ 	//RCLCPP_WARN(get_logger(), "Received image: %f delay=%f", data.stamp(), (now() - header.stamp).seconds());
++	if(processingQueueSize_ > 0)
++	{
++		bool wakeWorker = false;
++		{
++			UScopeMutex lock(pendingDataMutex_);
++			if(pendingDataQueue_.size() >= static_cast<size_t>(processingQueueSize_))
++			{
++				// Preserve already queued temporal continuity and drop the new
++				// tuple, matching a bounded non-blocking FIFO input.
++				++droppedMsgs_;
++				return;
++			}
++			wakeWorker = pendingDataQueue_.empty();
++			pendingDataQueue_.push_back(std::make_pair(data, header));
++			++processedMsgs_;
++		}
++		if(wakeWorker)
++		{
++			dataReady_.release();
++		}
++		return;
++	}
++	if(keepLatestFrame_ || keepNextFrame_)
++	{
++		bool wakeWorker = false;
++		{
++			UScopeMutex lock(pendingDataMutex_);
++			if(pendingDataAvailable_)
++			{
++				// A depth-one pending queue either retains its oldest tuple or
++				// overwrites it with the latest, depending on the selected mode.
++				++droppedMsgs_;
++				if(keepLatestFrame_)
++				{
++					pendingDataToProcess_ = data;
++					pendingDataHeaderToProcess_ = header;
++				}
++			}
++			else
++			{
++				pendingDataAvailable_ = true;
++				wakeWorker = true;
++				++processedMsgs_;
++				pendingDataToProcess_ = data;
++				pendingDataHeaderToProcess_ = header;
++			}
++		}
++		if(wakeWorker)
++		{
++			dataReady_.release();
++		}
++		return;
++	}
+ 	if(dataMutex_.lockTry() == 0)
+ 	{
+ 		if(bufferedDataToProcess_) {
+@@ -499,10 +581,33 @@ void OdometryROS::mainLoop()
+ 	}
+ 
+ 	UScopeMutex lock(dataMutex_);
++	if(processingQueueSize_ > 0)
++	{
++		UScopeMutex pendingLock(pendingDataMutex_);
++		UASSERT(!pendingDataQueue_.empty());
++		dataToProcess_ = pendingDataQueue_.front().first;
++		dataHeaderToProcess_ = pendingDataQueue_.front().second;
++		pendingDataQueue_.pop_front();
++		if(!pendingDataQueue_.empty())
++		{
++			dataReady_.release();
++		}
++	}
++	else if(keepLatestFrame_ || keepNextFrame_)
++	{
++		UScopeMutex pendingLock(pendingDataMutex_);
++		UASSERT(pendingDataAvailable_);
++		dataToProcess_ = pendingDataToProcess_;
++		dataHeaderToProcess_ = pendingDataHeaderToProcess_;
++		pendingDataAvailable_ = false;
++	}
+ 
+ 	// aliases
+ 	SensorData & data = dataToProcess_;
+ 	std_msgs::msg::Header & header = dataHeaderToProcess_;
++    const auto auditStamp = rclcpp::Time(header.stamp).nanoseconds();
++    timingAudit("worker_dequeue", auditStamp);
++    TimingAuditScope auditScope{"worker_exit", auditStamp};
+ 
+ 	std::vector<std::pair<double, sensor_msgs::msg::Imu::ConstSharedPtr> > imus;
+ 	{
+@@ -747,7 +852,9 @@ void OdometryROS::mainLoop()
+ 	rtabmap::Transform pose;
+ 	if(!tooOldPreviousData)
+ 	{
++        timingAudit("core_begin", auditStamp);
+ 		pose = odometry_->process(data, guess_, &info);
++        timingAudit("core_end", auditStamp);
+ 	}
+ 	if(!pose.isNull())
+ 	{
+@@ -1063,6 +1170,13 @@ void OdometryROS::mainLoop()
+ 
+ 		if(odomInfoLitePub_->get_subscription_count()>0)
+ 		{
++			// The local bundle grows with every F2M keyframe and contains a
++			// complete camera model and pose per entry. Leaving it in the "lite"
++			// message eventually makes this topic hundreds of kilobytes per
++			// odometry update, which can starve the estimator when recorded.
++			infoMsg.local_bundle_ids.clear();
++			infoMsg.local_bundle_models.clear();
++			infoMsg.local_bundle_poses.clear();
+ 			infoMsg.word_inliers.clear();
+ 			infoMsg.word_matches.clear();
+ 			infoMsg.words_keys.clear();
+diff --git a/rtabmap_odom/src/nodelets/rgbd_odometry.cpp b/rtabmap_odom/src/nodelets/rgbd_odometry.cpp
+index 9976065..b6a5308 100644
+--- a/rtabmap_odom/src/nodelets/rgbd_odometry.cpp
++++ b/rtabmap_odom/src/nodelets/rgbd_odometry.cpp
+@@ -43,6 +43,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include <rtabmap/utilite/ULogger.h>
+ #include <rtabmap/utilite/UConversion.h>
+ #include <rtabmap/utilite/UStl.h>
++#include "rtabmap_odom/TimingAudit.h"
+ 
+ using namespace rtabmap;
+ 
+@@ -72,6 +73,8 @@ RGBDOdometry::RGBDOdometry(const rclcpp::NodeOptions & options) :
+ 
+ RGBDOdometry::~RGBDOdometry()
+ {
++	delete cachedApproxSync_;
++	delete cachedExactSync_;
+ 	delete approxSync_;
+ 	delete exactSync_;
+ 	delete approxSync2_;
+@@ -107,6 +110,16 @@ void RGBDOdometry::onOdomInit()
+ 	syncQueueSize_ = this->declare_parameter("sync_queue_size", syncQueueSize_);
+ 	int qosCamInfo = this->declare_parameter("qos_camera_info", (int)qos());
+ 	subscribeRGBD = this->declare_parameter("subscribe_rgbd", subscribeRGBD);
++	// Environment switch is confined to this experimental overlay. Explicit
++	// parameter overrides take precedence; neither stock launch nor defaults change.
++	const char * cacheEnv = std::getenv("RTABMAP_CACHE_CAMERA_INFO");
++	cacheCameraInfo_ = this->declare_parameter("cache_camera_info",
++		cacheEnv && std::string(cacheEnv) == "1");
++	if(cacheCameraInfo_ && subscribeRGBD)
++		throw std::runtime_error("cache_camera_info requires raw image/depth input");
++	cacheApproxSync_ = approxSync;
++	cacheMaxInterval_ = approxSyncMaxInterval;
++	RCLCPP_INFO(this->get_logger(), "RGBDOdometry: cache_camera_info = %s (experimental fixed calibration only)", cacheCameraInfo_?"true":"false");
+ 	rgbdCameras = this->declare_parameter("rgbd_cameras", rgbdCameras);
+ 	if(rgbdCameras < 0)
+ 	{
+@@ -368,7 +381,33 @@ void RGBDOdometry::onOdomInit()
+ 		image_depth_sub_.subscribe(this, depth_topic, depth_hints.getTransport(), rclcpp::QoS(topicQueueSize_).reliability((rmw_qos_reliability_policy_t)qos()).get_rmw_qos_profile(), options);
+ 		info_sub_.subscribe(this, "rgb/camera_info", RCLCPP_QOS(topicQueueSize_, qosCamInfo), options);
+ 
+-		if(approxSync)
++        if(std::getenv("RTABMAP_TIMING_AUDIT"))
++        {
++            image_mono_sub_.registerCallback(std::function<void(const sensor_msgs::msg::Image::ConstSharedPtr &)>(
++                [](const sensor_msgs::msg::Image::ConstSharedPtr &m) {
++                    timingAudit("raw_image", rclcpp::Time(m->header.stamp).nanoseconds());
++                }));
++            image_depth_sub_.registerCallback(std::function<void(const sensor_msgs::msg::Image::ConstSharedPtr &)>(
++                [](const sensor_msgs::msg::Image::ConstSharedPtr &m) {
++                    timingAudit("raw_depth", rclcpp::Time(m->header.stamp).nanoseconds());
++                }));
++            info_sub_.registerCallback(std::function<void(const sensor_msgs::msg::CameraInfo::ConstSharedPtr &)>(
++                [](const sensor_msgs::msg::CameraInfo::ConstSharedPtr &m) {
++                    timingAudit("raw_info", rclcpp::Time(m->header.stamp).nanoseconds());
++                }));
++        }
++
++		if(cacheCameraInfo_)
++		{
++			info_sub_.registerCallback(std::function<void(const sensor_msgs::msg::CameraInfo::ConstSharedPtr &)>(
++				[this](const sensor_msgs::msg::CameraInfo::ConstSharedPtr &m) {
++					if(!calibrationCache_.observe(*m))
++						RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
++							"Calibration cache blocked: %s", calibrationCache_.fault().c_str());
++				}));
++			initCachedSync();
++		}
++		else if(approxSync)
+ 		{
+ 			approxSync_ = new message_filters::Synchronizer<MyApproxSyncPolicy>(MyApproxSyncPolicy(syncQueueSize_), image_mono_sub_, image_depth_sub_, info_sub_);
+ 			if(approxSyncMaxInterval > 0.0)
+@@ -392,6 +431,8 @@ void RGBDOdometry::onOdomInit()
+ 				image_depth_sub_.getSubscriber().getTopic().c_str(),
+ 				info_sub_.getSubscriber()->get_topic_name());
+ 	}
++	if(cacheCameraInfo_)
++		subscribedTopicsMsg += "\nExperimental image/depth pair sync; CameraInfo observed independently (fixed calibration).";
+ 	initDiagnosticMsg(subscribedTopicsMsg, approxSync, subscribedTopic);
+ }
+ 
+@@ -582,6 +623,9 @@ void RGBDOdometry::callback(
+ 		const sensor_msgs::msg::Image::ConstSharedPtr depth,
+ 		const sensor_msgs::msg::CameraInfo::ConstSharedPtr cameraInfo)
+ {
++    const auto auditStamp = rclcpp::Time(image->header.stamp).nanoseconds();
++    timingAudit("sync_enter", auditStamp);
++    TimingAuditScope auditScope{"sync_exit", auditStamp};
+ 	tick(image->header.stamp);
+ 
+ 	if(!this->isPaused())
+@@ -781,8 +825,50 @@ void RGBDOdometry::callbackRGBD6(
+ 	}
+ }
+ 
++void RGBDOdometry::initCachedSync()
++{
++	delete cachedApproxSync_;
++	delete cachedExactSync_;
++	cachedApproxSync_ = nullptr;
++	cachedExactSync_ = nullptr;
++	if(cacheApproxSync_)
++	{
++		cachedApproxSync_ = new message_filters::Synchronizer<CachedApproxPolicy>(
++			CachedApproxPolicy(syncQueueSize_), image_mono_sub_, image_depth_sub_);
++		if(cacheMaxInterval_ > 0.0)
++			cachedApproxSync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(cacheMaxInterval_));
++		cachedApproxSync_->registerCallback(std::bind(&RGBDOdometry::cachedPairCallback, this,
++			std::placeholders::_1, std::placeholders::_2));
++	}
++	else
++	{
++		cachedExactSync_ = new message_filters::Synchronizer<CachedExactPolicy>(
++			CachedExactPolicy(syncQueueSize_), image_mono_sub_, image_depth_sub_);
++		cachedExactSync_->registerCallback(std::bind(&RGBDOdometry::cachedPairCallback, this,
++			std::placeholders::_1, std::placeholders::_2));
++	}
++}
++
++void RGBDOdometry::cachedPairCallback(const sensor_msgs::msg::Image::ConstSharedPtr image,
++		const sensor_msgs::msg::Image::ConstSharedPtr depth)
++{
++	auto info = calibrationCache_.forPair(*image, *depth);
++	if(!info)
++	{
++		timingAudit("cache_reject", rclcpp::Time(image->header.stamp).nanoseconds());
++		RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
++			"Calibration cache rejected pair (waiting for calibration/eligible time, or fault='%s')",
++			calibrationCache_.fault().c_str());
++		return;
++	}
++	callback(image, depth, info);
++}
++
+ void RGBDOdometry::flushCallbacks()
+ {
++	// Reset can run outside the data callback group. Do not destroy active pair
++	// synchronizers here. Keep their bounded queues, timestamp floor and fault
++	// latch across odometry resets; a new calibration/time epoch needs restart.
+ 	// flush callbacks
+ 	if(approxSync_)
+ 	{
+diff --git a/rtabmap_odom/test/CALIBRATION_CACHE.md b/rtabmap_odom/test/CALIBRATION_CACHE.md
+new file mode 100644
+index 0000000..2c9d1ad
+--- /dev/null
++++ b/rtabmap_odom/test/CALIBRATION_CACHE.md
+@@ -0,0 +1,39 @@
++# Experimental immutable CameraInfo input
++
++This isolated overlay declares `cache_camera_info` (default false). For existing
++launch files that do not forward it, `RTABMAP_CACHE_CAMERA_INFO=1` selects the
++default; an explicit ROS parameter override wins. No production launch changes
++are required. Timing tracing is separately enabled by `RTABMAP_TIMING_AUDIT=1`.
++
++Only raw, aligned, equal-resolution RGB/depth input is supported. Image/depth
++use the existing approximate/exact sync setting, queue size and max interval.
++CameraInfo is observed independently. The first valid calibration is copied;
++subsequent identity includes every field except header stamp. No frames older
++than the first calibration are accepted. Calibration changes/invalid values,
++image frame/dimension mismatches, or non-increasing accepted image/depth times
++latch the input closed until node restart. The cached copy is stamped for each
++image; the source message is never mutated.
++
++The camera must keep calibration fixed throughout a session. There is no cache
++expiry: disconnecting CameraInfo does not stop established image processing.
++A delayed change cannot be detected retroactively, and an already queued/in-flight
++odometry update may finish after a fault is observed. This is not a certified
++interlock and must not be connected to PX4 on the strength of replay results.
++
++Odometry reset retains the immutable identity, fault, timestamp floor and bounded
++pair queues. Synchronizers are not reconstructed from the reset service thread.
++Restart the node for a new time epoch or calibration. Paused input still advances
++the cache's monotonic timestamp check, without invoking the odometry core.
++
++Build and test from `/home/john/rtabmap_latest_frame_overlay` after sourcing
++`/home/john/rtabmap_parity_0_21_12/base_ros_env.bash`:
++
++```bash
++colcon build --packages-select rtabmap_odom --executor sequential --parallel-workers 1 --allow-overriding rtabmap_odom --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
++colcon test --packages-select rtabmap_odom --event-handlers console_direct+
++colcon test-result --test-result-base build/rtabmap_odom --verbose
++```
++
++Replay runner (also source this overlay's `install/local_setup.bash`):
++`python3 /home/john/ros_parity_optimizer_audit_20260913/run_pnp3_cached_calibration.py`.
++Output names are intentionally exclusive; use fresh names for subsequent runs.
+diff --git a/rtabmap_odom/test/test_immutable_camera_info.cpp b/rtabmap_odom/test/test_immutable_camera_info.cpp
+new file mode 100644
+index 0000000..5454d97
+--- /dev/null
++++ b/rtabmap_odom/test/test_immutable_camera_info.cpp
+@@ -0,0 +1,71 @@
++#include "rtabmap_odom/ImmutableCameraInfo.h"
++#include <gtest/gtest.h>
++#include <limits>
++using Cache = rtabmap_odom::ImmutableCameraInfo;
++static Cache::Info info() {
++  Cache::Info i;
++  i.header.frame_id = "optical"; i.header.stamp.sec = 10;
++  i.width = 640; i.height = 400;
++  i.k = {400,0,320,0,400,200,0,0,1};
++  i.r = {1,0,0,0,1,0,0,0,1};
++  i.p = {400,0,320,0,0,400,200,0,0,0,1,0};
++  return i;
++}
++static Cache::Image frame(int sec = 10) {
++  Cache::Image i; i.header = info().header; i.header.stamp.sec = sec;
++  i.width = 640; i.height = 400; return i;
++}
++TEST(Cache, WaitsForCalibration) { Cache c; EXPECT_FALSE(c.forPair(frame(), frame())); }
++TEST(Cache, RestampsWithoutChangingIdentity) {
++  Cache c; ASSERT_TRUE(c.observe(info())); auto i = info(); i.header.stamp.sec = 12;
++  EXPECT_TRUE(c.observe(i)); auto out = c.forPair(frame(11), frame(11)); ASSERT_TRUE(out);
++  EXPECT_EQ(out->header.stamp.sec, 11); EXPECT_EQ(out->k, i.k);
++}
++TEST(Cache, RejectsFutureCalibrationForOldFrames) {
++  Cache c; ASSERT_TRUE(c.observe(info())); EXPECT_FALSE(c.forPair(frame(9), frame(9)));
++  EXPECT_TRUE(c.forPair(frame(), frame()));
++}
++TEST(Cache, LatchesEverySemanticChange) {
++  for(int field = 0; field < 12; ++field) {
++    Cache c; ASSERT_TRUE(c.observe(info())); auto changed = info();
++    switch(field) {
++      case 0: changed.header.frame_id = "other"; break;
++      case 1: ++changed.width; break; case 2: ++changed.height; break;
++      case 3: changed.distortion_model = "plumb_bob"; break;
++      case 4: changed.d.push_back(0.1); break; case 5: changed.k[2] += 1; break;
++      case 6: changed.r[0] += 0.1; break; case 7: changed.p[2] += 1; break;
++      case 8: ++changed.binning_x; break; case 9: ++changed.binning_y; break;
++      case 10: ++changed.roi.x_offset; break; case 11: changed.roi.do_rectify = true; break;
++    }
++    EXPECT_FALSE(c.observe(changed)); EXPECT_FALSE(c.observe(info()));
++    EXPECT_FALSE(c.forPair(frame(), frame())); EXPECT_FALSE(c.fault().empty());
++  }
++}
++TEST(Cache, InvalidCalibrationLatches) {
++  for(int field = 0; field < 5; ++field) {
++    Cache c; auto i = info();
++    if(field == 0) i.k[0] = 0;
++    if(field == 1) i.p[0] = std::numeric_limits<double>::quiet_NaN();
++    if(field == 2) i.width = 0;
++    if(field == 3) i.header.frame_id.clear();
++    if(field == 4) i.d.push_back(std::numeric_limits<double>::infinity());
++    EXPECT_FALSE(c.observe(i)); EXPECT_FALSE(c.observe(info()));
++  }
++}
++TEST(Cache, ImageMismatchLatches) {
++  for(int field = 0; field < 4; ++field) {
++    Cache c; ASSERT_TRUE(c.observe(info())); auto a = frame(), b = frame();
++    if(field == 0) a.header.frame_id = "other";
++    if(field == 1) b.header.frame_id = "other";
++    if(field == 2) a.width = 0;
++    if(field == 3) b.height = 0;
++    EXPECT_FALSE(c.forPair(a,b)); EXPECT_FALSE(c.forPair(frame(),frame()));
++  }
++}
++TEST(Cache, NonIncreasingTimesLatch) {
++  for(int field = 0; field < 3; ++field) {
++    Cache c; ASSERT_TRUE(c.observe(info())); ASSERT_TRUE(c.forPair(frame(11),frame(11)));
++    EXPECT_FALSE(c.forPair(frame(field == 0 ? 9 : field == 1 ? 11 : 12), frame(11)));
++    EXPECT_FALSE(c.forPair(frame(13),frame(13)));
++  }
++}

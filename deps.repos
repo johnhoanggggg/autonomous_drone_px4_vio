@@ -10,11 +10,16 @@
 #                              in src/depthai-ros, then colcon build depthai_ros_driver.
 #   ~/depthai_v3_compat_ws     not on GitHub: copy third_party/depthai_ros_msgs_v3 from this repo to its src/
 #                              and colcon build (message-only rebuild against the system Fast-CDR).
+#   ~/rtabmap_latest_frame_overlay  rtabmap_ros 0.22.1-jazzy + patches/rtabmap_ros_0.22.1_jazzy_latest_frame.patch
+#                              (latest-frame odometry, cached camera info, timing audit); colcon build rtabmap_odom.
+#                              The 3D backend (scripts/ros_rtabmap_backend) sources its install/local_setup.bash.
+#   ~/rtabmap_parity_0_21_12   only base_ros_env.bash is used by the flight stack (copy in third_party/env/);
+#                              the RTAB-Map 0.21.12 source build there was a diagnostic parity tool.
 #   ~/depthai_v3_overlay       six ros-jazzy debs unpacked with `dpkg -x` into root/: depthai-v3 3.6.1,
 #                              depthai-{ros-driver,bridge,ros-msgs,descriptions}-v3 3.2.1, backward-ros 1.0.8.
 #                              The .debs are kept in ~/depthai_v3_overlay/debs on the Pi.
 #
-# Source order: README.md, the ros_rtabmap_oak_v3_tracked launch section.
+# Build and source order: README.md, "Rebuilding from scratch".
 repositories:
   ros2_ws/src/px4_msgs:
     type: git
@@ -32,3 +37,7 @@ repositories:
     type: git
     url: https://github.com/luxonis/depthai-ros.git
     version: 59dd172ccac1974c4b14ac12d05090e36836c72d
+  rtabmap_latest_frame_overlay/src/rtabmap_ros:
+    type: git
+    url: https://github.com/introlab/rtabmap_ros.git
+    version: e73e7690cbb56af23a894bf6c4ee266e55772fc2
