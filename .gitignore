@@ -25,8 +25,13 @@ ros2_ws/src/px4_vio_bridge/log/
 ros2_ws/flight_logs/
 /flight_logs/
 
-# Local runtime output
-/reports/
+# Local runtime output. reports/ is ignored except its analysis scripts, which
+# are the only copy of the plot/render tooling (animate3d.py, render_global.py,
+# the paper figure scripts). before/ dirs are source snapshots, not tooling.
+/reports/**
+!/reports/**/
+!/reports/**/*.py
+reports/**/before/
 *.tlog
 *.tlog.raw
 *.ulg
