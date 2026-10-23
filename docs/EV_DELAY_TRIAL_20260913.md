@@ -1,6 +1,6 @@
 # VIO timing correction trial — 13 September 2026
 
-> **Trial flown:** [12:11 braking results](ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/ANALYSIS.md). Three legs; third-hold settling timeout. Less peak overspeed, mixed initial braking and persistent 16.3 cm hold swing. 225 ms remains saved; no tolerance/gain changes. The preparation below is historical.
+> **Trial flown:** [12:11 braking results](../ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/ANALYSIS.md). Three legs; third-hold settling timeout. Less peak overspeed, mixed initial braking and persistent 16.3 cm hold swing. 225 ms remains saved; no tolerance/gain changes. The preparation below is historical.
 
 **Saved `EKF2_EV_DELAY: 270 → 225 ms` over NSH while disarmed.** The
 readback confirms 225.0000 with the saved marker. The vehicle remained
@@ -113,10 +113,10 @@ The MAVLink venv lacks pytest; tests ran successfully with system Python.
 All four ULogs analyzed successfully. No runtime source changed, so no ROS
 build or flight-control tests were required for this calibration/tool change.
 
-Artifacts: [timing plot](reports/ev_delay_20260913.png),
-[analysis JSON](reports/ev_delay_20260913.json),
-[before snapshot](reports/ev_delay_before_20260913.txt),
-[guarded write and readback](reports/ev_delay_trial_20260913.txt).
+Artifacts: [timing plot](../reports/ev_delay_20260913.png),
+[analysis JSON](../reports/ev_delay_20260913.json),
+[before snapshot](../reports/ev_delay_before_20260913.txt),
+[guarded write and readback](../reports/ev_delay_trial_20260913.txt).
 
 Independent read-only audits cover native VIO timestamps and the separate
 trajectory-vector discontinuity. The latter remains a software limitation;

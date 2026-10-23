@@ -10,7 +10,7 @@
 
 > **Latest work, 2026-09-13:** [strict command-vector fix and unresolved physical response](CLUTTER_TRACKING_FIX_20260913.md). C++ global adapter enables strict vector acceleration limits and stops at unrounded corners; joins cannot snap small offsets. Added and loaded estimator diagnostic topics over NSH. No further gain/tolerance changes or physical tests. This is not demonstrated tunnel readiness.
 
-> **225 ms trial flown, 2026-09-13 12:11:** [results](ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/ANALYSIS.md). Three legs, third hold timed out; longest joint gate pass 0.848 s at 0.06 m/s versus 1.598 s at 0.08 m/s. Third-leg initial overshoot 9.7 cm, hold swing 16.3 cm, first reversal 2.03 s after brake marker. Reduced overspeed is not proof of corrected braking. EV delay stays 225; no further writes.
+> **225 ms trial flown, 2026-09-13 12:11:** [results](../ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/ANALYSIS.md). Three legs, third hold timed out; longest joint gate pass 0.848 s at 0.06 m/s versus 1.598 s at 0.08 m/s. Third-leg initial overshoot 9.7 cm, hold swing 16.3 cm, first reversal 2.03 s after brake marker. Reduced overspeed is not proof of corrected braking. EV delay stays 225; no further writes.
 
 > **Current trial, 2026-09-13:** [EV_DELAY_TRIAL_20260913.md](EV_DELAY_TRIAL_20260913.md).
 > Existing smooth lateral-stop tests establish oscillation independent of the

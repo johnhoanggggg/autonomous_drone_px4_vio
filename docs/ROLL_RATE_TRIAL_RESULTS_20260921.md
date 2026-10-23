@@ -107,11 +107,11 @@ this analysis.
 
 ## Artifacts and reproduction
 
-- [Whole flights](reports/roll_rate_0854_0914_20260921/all_flights.png)
-- [Equal-duration first holds](reports/roll_rate_0854_0914_20260921/first_hold_comparison.png)
-- [Metrics](reports/roll_rate_0854_0914_20260921/comparison.json)
-- [Timestamp pairing](reports/roll_rate_0854_0914_20260921/alignment.json)
-- [Analysis script](reports/roll_rate_0854_0914_20260921/analyze.py)
+- [Whole flights](../reports/roll_rate_0854_0914_20260921/all_flights.png)
+- [Equal-duration first holds](../reports/roll_rate_0854_0914_20260921/first_hold_comparison.png)
+- [Metrics](../reports/roll_rate_0854_0914_20260921/comparison.json)
+- [Timestamp pairing](../reports/roll_rate_0854_0914_20260921/alignment.json)
+- [Analysis script](../reports/roll_rate_0854_0914_20260921/analyze.py)
 
 Reproduce with `.venv-mavlink/bin/python3
 reports/roll_rate_0854_0914_20260921/analyze.py`. File sizes, exact pairing,

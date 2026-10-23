@@ -56,7 +56,7 @@ while actual yaw rate is about **−2.1°/s**. The problem is visible in the
 attitude/rate cascade itself, not just in a comparison of the nose with the
 route tangent. Roll and pitch also miss the requested corrections.
 
-![Attitude and rate comparison](reports/hover_turn_085348_control.png)
+![Attitude and rate comparison](../reports/hover_turn_085348_control.png)
 
 The motor commands do not hit their upper bound during these hover windows.
 One motor reaches 1.0 for roughly 8 ms around **25.57 s**, during landing; that
@@ -116,7 +116,7 @@ an ESC low-voltage cutoff. PX4's
 [tuning guide](https://docs.px4.io/main/en/config_mc/pid_tuning_guide_multicopter)
 notes that the PWM-to-thrust relationship depends strongly on battery voltage.
 
-![Position error, voltage, and corrective motor demand](reports/hover_turn_085348_overview.png)
+![Position error, voltage, and corrective motor demand](../reports/hover_turn_085348_overview.png)
 
 ## Comparison with the successful historical yaw test
 

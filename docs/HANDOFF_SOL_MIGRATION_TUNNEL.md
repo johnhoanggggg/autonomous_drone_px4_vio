@@ -215,7 +215,7 @@ The ULog records firmware `d6f12ad1c4f70ad3230afd7d86e971421e02fef4`,
 No parameter changes appear in the ULog. These are flight-recorded settings,
 not a fresh live readback or suggested replacements.
 
-[Entrance braking plot](reports/migration_tunnel_20260921_0726/onboard/entrance_braking.png).
+[Entrance braking plot](../reports/migration_tunnel_20260921_0726/onboard/entrance_braking.png).
 The same folder contains `alignment.json`, `control.csv/json`,
 `attitude.csv/json/png` and raw ULog. Reproduce the two analyses with:
 
@@ -235,9 +235,9 @@ The same folder contains `alignment.json`, `control.csv/json`,
 
 Local reports (git-ignored, retained in this workspace):
 
-- [Trajectory on map](reports/migration_tunnel_20260921_0726/flight_maps.png)
-- [Speed, positions, clearance and yaw](reports/migration_tunnel_20260921_0726/flight_performance.png)
-- [Metrics](reports/migration_tunnel_20260921_0726/metrics.json)
+- [Trajectory on map](../reports/migration_tunnel_20260921_0726/flight_maps.png)
+- [Speed, positions, clearance and yaw](../reports/migration_tunnel_20260921_0726/flight_performance.png)
+- [Metrics](../reports/migration_tunnel_20260921_0726/metrics.json)
 - `reports/migration_tunnel_20260921_0726/072654.json`: decoded messages.
 - Same folder: `extract.py`, `analyze.py`, `probe.cpp`, `probe`, event text,
   decode-error counts, extraction/build/check logs.

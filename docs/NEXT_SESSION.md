@@ -1,7 +1,7 @@
 # Current tunnel work — 2026-09-21
 
 **Newest global damping flights:** read
-[the 11:16–11:21 comparison](reports/global_damping_flights_20260921/REVIEW.md)
+[the 11:16–11:21 comparison](../reports/global_damping_flights_20260921/REVIEW.md)
 first. Of four recordings, two were real flights with damping gain 0.75. The
 11:17 flight reached the goal, held it continuously for 3.00 s and initiated
 normal goal landing; 11:21 did not reach the goal and landed on the VIO reset

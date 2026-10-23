@@ -65,7 +65,7 @@ implemented in the active C++ adapter; the legacy Python adapter is unchanged.
 
 ## Recorded-state comparison
 
-![Heading, gate and command comparison](reports/heading_reversal_095742.png)
+![Heading, gate and command comparison](../reports/heading_reversal_095742.png)
 
 37 recorded command samples, 12.8–14.65 s:
 

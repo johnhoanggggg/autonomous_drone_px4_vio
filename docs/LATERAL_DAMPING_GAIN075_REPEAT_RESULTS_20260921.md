@@ -89,10 +89,10 @@ and truncated MCAP were handled using the matched onboard file
 1,433 exact PX4 local-position timestamp matches and zero x-position
 difference; it does not rely on host/SD filenames.
 
-- [Complete sequence plot](reports/damping075_repeat_20260921/flight.png)
-- [Equal-duration hold plot](reports/damping075_repeat_20260921/holds_first3.png)
-- [Full synchronized metrics](reports/damping075_repeat_20260921/analysis.json)
-- [Reproducible analysis](reports/damping075_repeat_20260921/analyze.py)
+- [Complete sequence plot](../reports/damping075_repeat_20260921/flight.png)
+- [Equal-duration hold plot](../reports/damping075_repeat_20260921/holds_first3.png)
+- [Full synchronized metrics](../reports/damping075_repeat_20260921/analysis.json)
+- [Reproducible analysis](../reports/damping075_repeat_20260921/analyze.py)
 
 The analysis asserts exact log pairing, fixed hold references, zero hold
 reference velocity, bounded acceleration, stable estimator reset counters and

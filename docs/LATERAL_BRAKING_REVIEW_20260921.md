@@ -168,9 +168,9 @@ This is a check of proposed **commands**, not a closed-loop simulation or proof
 of reduced stopping distance. The actual measured trajectory remains the
 recorded baseline; do not claim a predicted improvement from the plot.
 
-- [Motion/control and candidate-command plot](reports/lateral_braking_20260921/braking_and_damping.png)
-- [Fresh numerical results](reports/lateral_braking_20260921/summary.json)
-- [Offline analysis script](reports/lateral_braking_20260921/analyze.py)
+- [Motion/control and candidate-command plot](../reports/lateral_braking_20260921/braking_and_damping.png)
+- [Fresh numerical results](../reports/lateral_braking_20260921/summary.json)
+- [Offline analysis script](../reports/lateral_braking_20260921/analyze.py)
 
 Reproduce from the repository root:
 

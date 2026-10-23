@@ -31,7 +31,7 @@ The third MCAP has a truncated final record; its earlier data and the complete
 ULog cover the impact and landing decision. Times here use the earliest selected
 topic from `analyze_yaw_tracking.py`, not elapsed time since arming.
 
-![Flight comparison](reports/heading_flights_20260908.png)
+![Flight comparison](../reports/heading_flights_20260908.png)
 
 ## Second flight: leftward then rightward excursions
 
@@ -73,7 +73,7 @@ with PX4 data. Control demand and response themselves are paired on the onboard
 clock. Tilt-equivalent acceleration assumes near-hover vertical thrust; it is
 not measured translational acceleration.
 
-![Third flight braking](reports/heading_flight_032636_braking.png)
+![Third flight braking](../reports/heading_flight_032636_braking.png)
 
 The attitude log independently supports delayed/insufficient corrective response:
 at about **16.5 s**, roll target is **-2.89 degrees**, measured roll **-0.02

@@ -48,7 +48,7 @@ After leg 2 initially stops, the stationary-target hold ranges from **+10.8 cm t
 Those later excursions must not be mislabeled as the initial braking overshoot.
 The measured settling gate correctly waits before permitting the next leg.
 
-![Lateral positions, velocities and heading](reports/lateral_stop_043031.png)
+![Lateral positions, velocities and heading](../reports/lateral_stop_043031.png)
 
 During t=22–31.5 s, published XY position has exactly zero range and horizontal
 velocity/acceleration feedforward are exactly zero. Yaw reference is constant
@@ -109,7 +109,7 @@ the controller's yaw correction; the split alone does not identify which motor
 or component is responsible. During the third-leg window mean requested yaw rate
 is +6.26°/s while measured mean is -2.25°/s.
 
-![Onboard control and yaw compensation](reports/lateral_stop_043031_onboard.png)
+![Onboard control and yaw compensation](../reports/lateral_stop_043031_onboard.png)
 
 Loaded-voltage medians from onboard windows fall approximately
 11.05 → 10.88 → 10.78 → 10.70 V. These windows occur at different times and do not

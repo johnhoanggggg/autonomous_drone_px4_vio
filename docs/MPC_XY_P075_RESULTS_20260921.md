@@ -94,11 +94,11 @@ accepting a larger final-hold swing.
 
 ## Artifacts and verification
 
-- [Whole flights](reports/mpc_xy_p075_20260921/all_flights.png)
-- [Equal-duration first holds](reports/mpc_xy_p075_20260921/first_hold_comparison.png)
-- [Metrics](reports/mpc_xy_p075_20260921/comparison.json)
-- [Timestamp pairing](reports/mpc_xy_p075_20260921/alignment.json)
-- [Analysis](reports/mpc_xy_p075_20260921/analyze.py)
+- [Whole flights](../reports/mpc_xy_p075_20260921/all_flights.png)
+- [Equal-duration first holds](../reports/mpc_xy_p075_20260921/first_hold_comparison.png)
+- [Metrics](../reports/mpc_xy_p075_20260921/comparison.json)
+- [Timestamp pairing](../reports/mpc_xy_p075_20260921/alignment.json)
+- [Analysis](../reports/mpc_xy_p075_20260921/analyze.py)
 
 Reproduce with `.venv-mavlink/bin/python3
 reports/mpc_xy_p075_20260921/analyze.py`. Assertions cover file sizes, exact

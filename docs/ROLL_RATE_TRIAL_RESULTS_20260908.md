@@ -5,7 +5,7 @@ decreased during the four moving legs, and the second stop improved substantiall
 but the third still overshot 11.6 cm and the final stationary hold spanned 26.7 cm.
 Growing yaw compensation persists. **Restored MC_ROLLRATE_P from 0.165 to 0.150
 over USB while disarmed**, with readback verified. No other parameter was written.
-[Rollback evidence](reports/roll_rate_p_rollback_20260908T050832Z.txt).
+[Rollback evidence](../reports/roll_rate_p_rollback_20260908T050832Z.txt).
 
 ## Recordings and completeness
 
@@ -85,7 +85,7 @@ During the first three seconds of the final hold, roll-rate error worsens from
 2.71 to 4.82°/s and roll-angle error from 0.92 to 1.41°. That phase also requests
 more roll motion, so it cannot isolate rate-loop quality either.
 
-![Matched-phase comparison](reports/lateral_tuning_comparison.png)
+![Matched-phase comparison](../reports/lateral_tuning_comparison.png)
 
 ## Yaw compensation and actuator allocation
 

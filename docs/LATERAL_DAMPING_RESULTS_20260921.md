@@ -123,10 +123,10 @@ copy the helper into the successful tunnel controller.
 
 ## Artifacts and validation
 
-- [All three flights](reports/lateral_damping_flights_20260921/all_flights.png)
-- [Equal-duration first-stop comparison](reports/lateral_damping_flights_20260921/first_stop_comparison.png)
-- [Metrics and alignment](reports/lateral_damping_flights_20260921/comparison.json)
-- [Analysis script](reports/lateral_damping_flights_20260921/analyze.py)
+- [All three flights](../reports/lateral_damping_flights_20260921/all_flights.png)
+- [Equal-duration first-stop comparison](../reports/lateral_damping_flights_20260921/first_stop_comparison.png)
+- [Metrics and alignment](../reports/lateral_damping_flights_20260921/comparison.json)
+- [Analysis script](../reports/lateral_damping_flights_20260921/analyze.py)
 
 The same git-ignored folder holds decoded bag data, alignment evidence and
 the three onboard files. Reproduce with:

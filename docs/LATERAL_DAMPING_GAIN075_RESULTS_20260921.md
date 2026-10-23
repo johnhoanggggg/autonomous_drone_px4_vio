@@ -130,11 +130,11 @@ Default damping remains disabled; default gain remains 0.5.
 
 ## Artifacts and verification
 
-- [Full flights](reports/lateral_damping_0827_20260921/all_flights.png)
-- [Equal-duration first stops](reports/lateral_damping_0827_20260921/first_stop_comparison.png)
-- [Controller response](reports/lateral_damping_0827_20260921/control_response.png)
-- [Metrics](reports/lateral_damping_0827_20260921/comparison.json)
-- [Alignment](reports/lateral_damping_0827_20260921/alignment.json)
+- [Full flights](../reports/lateral_damping_0827_20260921/all_flights.png)
+- [Equal-duration first stops](../reports/lateral_damping_0827_20260921/first_stop_comparison.png)
+- [Controller response](../reports/lateral_damping_0827_20260921/control_response.png)
+- [Metrics](../reports/lateral_damping_0827_20260921/comparison.json)
+- [Alignment](../reports/lateral_damping_0827_20260921/alignment.json)
 
 Reproduce using .venv-mavlink/bin/python on
 reports/lateral_damping_0827_20260921/align.py and then analyze.py;

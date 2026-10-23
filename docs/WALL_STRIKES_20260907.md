@@ -52,7 +52,7 @@ is **−0.33 m/s²** while tilt is equivalent to **+0.18 m/s²**. Later, Y veloc
 remains around −0.16 m/s while braking demand is positive, and the route
 restarts before that drift has settled.
 
-![Measured demand and response](reports/wall_strike_control_response.png)
+![Measured demand and response](../reports/wall_strike_control_response.png)
 
 Tilt-equivalent acceleration is computed from the recorded quaternion and a
 near-hover thrust assumption. It is **not measured translational acceleration**
@@ -140,7 +140,7 @@ collision avoidance. No flight was launched.
 The custom SD logger configuration omitted `vehicle_attitude_setpoint`,
 `vehicle_rates_setpoint`, and `vehicle_angular_velocity`. Added all three at
 5 ms intervals and read back the file. Original contents are saved locally in
-[`reports/logger_topics_before_20260907.txt`](reports/logger_topics_before_20260907.txt).
+[`reports/logger_topics_before_20260907.txt`](../reports/logger_topics_before_20260907.txt).
 The attempted long-name SD backup failed; the local backup is the rollback
 source. The new logging configuration should be loaded after the next PX4
 reboot. No logger restart or reboot was issued during this work.

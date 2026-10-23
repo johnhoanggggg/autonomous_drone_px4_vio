@@ -51,7 +51,7 @@ unsaturated integral update is 0.0000073 normalized torque; p99 is 0.0000503.
 This is a consistency check, not a substitute for recording `rate_ctrl_status`.
 Yaw is excluded because its published torque has an additional low-pass filter.
 
-![Run 3 attitude and rate response before impact](reports/run3_braking_attitude.png)
+![Run 3 attitude and rate response before impact](../reports/run3_braking_attitude.png)
 
 These observations justify investigating roll/pitch response. They do not yet
 select a gain change or distinguish controller tuning, motor/ESC response,

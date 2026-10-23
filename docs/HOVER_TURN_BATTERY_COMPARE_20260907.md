@@ -56,7 +56,7 @@ are measured at the same phase of the sequence.
 | Roll rate error RMS | 3.38°/s | 5.06°/s |
 | Z error RMS | 0.7 cm | 1.2 cm |
 
-![Full versus low battery](reports/hover_turn_battery_compare.png)
+![Full versus low battery](../reports/hover_turn_battery_compare.png)
 
 Aligned on the end of the return yaw ramp, the two flights track each other
 closely through takeoff, the outbound turn, the first hold and the return

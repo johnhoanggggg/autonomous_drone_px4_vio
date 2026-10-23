@@ -10,7 +10,7 @@ written was **MC_ROLLRATE_P: 0.150 -> 0.165 (+10%)**. Readback showed `0.1650`
 with the `+` saved marker: this persists across reboot. No flight was started.
 
 Raw before/after evidence, including MC, MPC and external-vision parameter
-snapshots: [roll_rate_p_trial_20260908T045445Z.txt](reports/roll_rate_p_trial_20260908T045445Z.txt).
+snapshots: [roll_rate_p_trial_20260908T045445Z.txt](../reports/roll_rate_p_trial_20260908T045445Z.txt).
 Roll I=0.10, D=0.003, K=1 and attitude P=4 remain at baseline. Pitch, yaw,
 position/velocity gains, estimator timing and limits were not adjusted.
 

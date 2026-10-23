@@ -34,9 +34,9 @@ no further control gains were changed. EV delay remains the saved 225 ms trial.
   field in multicopter rate control; its false value is not a missing-reset
   diagnosis. [Firmware source](https://raw.githubusercontent.com/PX4/PX4-Autopilot/d6f12ad1c4f70ad3230afd7d86e971421e02fef4/src/modules/mc_rate_control/MulticopterRateControl.cpp).
 
-See [latest braking results](ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/ANALYSIS.md),
-[control-response plot](ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/render/control_response/chain.png),
-and [detailed response investigation](reports/braking_response_20260913/ANALYSIS.md).
+See [latest braking results](../ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/ANALYSIS.md),
+[control-response plot](../ros2_ws/flight_logs/offboard_lateral_stop_20260913T121110Z/render/control_response/chain.png),
+and [detailed response investigation](../reports/braking_response_20260913/ANALYSIS.md).
 The two tunnel render folders remain inside their respective flight folders.
 
 ## Implementation

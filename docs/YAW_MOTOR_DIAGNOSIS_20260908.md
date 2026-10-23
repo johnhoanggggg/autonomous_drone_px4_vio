@@ -42,7 +42,7 @@ These equations are checked against the exact firmware's
 [filter implementation](https://raw.githubusercontent.com/PX4/PX4-Autopilot/d6f12ad1c4f70ad3230afd7d86e971421e02fef4/src/lib/mathlib/math/filter/AlphaFilter.hpp)
 and [rotor effectiveness equation](https://raw.githubusercontent.com/PX4/PX4-Autopilot/d6f12ad1c4f70ad3230afd7d86e971421e02fef4/src/modules/control_allocator/VehicleActuatorEffectiveness/ActuatorEffectivenessRotors.cpp).
 
-![Yaw command chain](reports/yaw_motor_chain_20260908.png)
+![Yaw command chain](../reports/yaw_motor_chain_20260908.png)
 
 ## Heading consistency
 
@@ -63,8 +63,8 @@ not a claim that physical yaw was constant.
 ## Live output/configuration audit
 
 PX4 was disarmed. Raw snapshots:
-[rotors/PWM](reports/yaw_motor_live_20260908.txt),
-[PX4IO/yaw/bias status](reports/yaw_backend_live_20260908.txt).
+[rotors/PWM](../reports/yaw_motor_live_20260908.txt),
+[PX4IO/yaw/bias status](../reports/yaw_backend_live_20260908.txt).
 
 - Actual motor backend is **PX4IO MAIN PWM**, functions 101–104 on MAIN 1–4.
   The `pwm_out` module is the separate AUX backend and has no assigned motors.

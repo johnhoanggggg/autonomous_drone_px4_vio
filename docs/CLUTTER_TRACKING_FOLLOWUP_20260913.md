@@ -21,8 +21,8 @@ clearances. The sign is +map-x here, not a claim about body-frame right.
 Onboard logs pair exactly with the bags. Added EV diagnostics recorded
 successfully: no rejected position/yaw fusion updates or position resets in
 the analyzed flight windows. This does not rule out smooth VIO bias or drift.
-See the [flight analysis](reports/new_flights_20260913/ANALYSIS.md) and
-[onboard comparison](reports/new_onboard_20260913/README.md).
+See the [flight analysis](../reports/new_flights_20260913/ANALYSIS.md) and
+[onboard comparison](../reports/new_onboard_20260913/README.md).
 
 ## Change made
 
@@ -53,8 +53,8 @@ wall margins, flight speeds, yaw settings and PX4 gains were not changed.
 
 ## Saved flight renders
 
-- [12:56:31](ros2_ws/flight_logs/offboard_global_20260913T125631Z/render/index.html)
-- [12:57:30](ros2_ws/flight_logs/offboard_global_20260913T125730Z/render/index.html)
+- [12:56:31](../ros2_ws/flight_logs/offboard_global_20260913T125631Z/render/index.html)
+- [12:57:30](../ros2_ws/flight_logs/offboard_global_20260913T125730Z/render/index.html)
 
 The second MCAP has a truncated trailing record and empty metadata. Valid
 messages were recovered by direct sequential reading; the original recording
