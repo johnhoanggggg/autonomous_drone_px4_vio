@@ -6,6 +6,7 @@ disagree, trust the README. Dates are when each note was written.
 
 ## Reference
 
+- [fyp_paper_2026.pdf](fyp_paper_2026.pdf): the 2026 FYP paper (v5, 10-19); the best single overview of the design and results.
 - [README_full_20260921.md](README_full_20260921.md): the previous 2,300-line README: launch reference, flight parameters, measured facts, known issues (current to 09-21).
 - [CODEX_WORKFLOW.md](CODEX_WORKFLOW.md): how coding-agent sessions were run on this repo.
 - [NEXT_SESSION.md](NEXT_SESSION.md): the to-do list as it stood on 09-21 (2D tunnel work); superseded.

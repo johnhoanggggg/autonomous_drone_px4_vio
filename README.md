@@ -239,24 +239,46 @@ ros2 launch px4_vio_bridge offboard_square.launch.py auto_arm:=false climb_timeo
 
 Run each props-off with `auto_arm:=false` first, then again with `auto_arm:=true`.
 
-### 2. 2D planner flight
+### 2. 2D planner flight (the 10-04 settings)
 
-Three terminals. Terminal 1 (camera, VIO, SLAM, PX4 bridge, Foxglove):
+Three terminals. These are the values the 10-04 room flight recorded on `/rtabmap/config`,
+`/planner/config`, `/planner/follower/config` and `/planner/flight/config` (it reached
+its goal and landed 47 s after arming). Most of them are now the launch defaults, so
+only the differences are passed.
+
+Terminal 1, camera, VIO, SLAM, PX4 bridge and Foxglove (defaults: 640x400 at 20 fps,
+500 features, 3 cm occupancy grid with ray tracing, 0.25 m footprint):
 
 ```bash
-ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py slam_publish_grid:=true \
-  slam_grid_3d:=false slam_grid_ray_tracing:=true slam_grid_cell_size:=0.03 \
-  slam_grid_footprint_radius:=0.25
+ros2 launch px4_vio_bridge rtabmap_slam_px4.launch.py
 ```
 
-Terminal 2 (planner and follower; cannot move the drone): the
-`global_planner_monitor.launch.py cpp_nodes:=true ...` command, and terminal 3 (the
-adapter, which arms): `offboard_global_planner.launch.py cpp_nodes:=true ...`. Both
-take a dozen tuned arguments that must agree with each other. Copy them from
-[the full README's quick start](docs/README_full_20260921.md#quick-start--the-three-terminals),
-which also explains each one. Click a goal in Foxglove's 3D panel (Publish tool on
-`/waypoint/clicked`, fixed frame `world`) and check `/planner/follower/valid` is true
-before starting terminal 3.
+Terminal 2, the A* planner and route follower (publishes no PX4 topics, cannot move the drone):
+
+```bash
+ros2 launch px4_vio_bridge global_planner_monitor.launch.py cpp_nodes:=true safety_margin:=0.0
+```
+
+`safety_margin:=0.0` plans with a 0.25 m clearance (just the robot radius) so it can
+route through a doorway; the default 0.03 m is safer in open rooms. The other defaults
+that matter: lookahead 0.25 m, carrot speed 0.20 m/s and acceleration 0.30 m/s²,
+cross-track fault at 0.08 m, `path_retain_tolerance` 0.04 m. The last must stay below
+`max_cross_track` (the launch refuses otherwise).
+
+Click a goal in Foxglove's 3D panel (Publish tool on `/waypoint/clicked`, fixed frame
+`world`) and check `/planner/follower/valid` is true. Then terminal 3, the flight
+adapter (this one arms; run it with `auto_arm:=false` props-off first):
+
+```bash
+ros2 launch px4_vio_bridge offboard_global_planner.launch.py cpp_nodes:=true auto_arm:=true \
+  hover_height:=0.40 geofence_radius:=20.0 corner_fillets:=true
+```
+
+Defaults it relies on: route speed 0.20 m/s and acceleration 0.30 m/s², corner
+blending on, land after 6 s of planner faults, `max_flight_time` 60 s. The 20 m
+geofence is effectively off, so the room's walls and the RC kill are the limit; use
+the default 3 m for anything new. Every argument is explained in
+[the full README's quick start](docs/README_full_20260921.md#quick-start--the-three-terminals).
 
 ### 3. 3D planner flight (the 10-09 settings)
 
@@ -349,8 +371,8 @@ Roughly in order of how much they will bite you.
 - [docs/INDEX.md](docs/INDEX.md): every earlier handoff and investigation note, one line
   each. [docs/README_full_20260921.md](docs/README_full_20260921.md) is the previous
   README: launch reference, parameter rationale, measurements. It is current to 09-21.
-- The 2026 FYP paper (method, results, figures) is not in this repo: ask John for the
-  PDF, and add it to `docs/` when you have it.
+- [docs/fyp_paper_2026.pdf](docs/fyp_paper_2026.pdf): the 2026 FYP paper (version 5,
+  2026-10-19): design rationale, method, results and figures. Read it first.
 - Branches: `main` is the current code. `voxel-perception-tuning` and
   `fix/velocity-aware-stop-recovery` hold experiments that never merged. Tags
   `flown-20261004` and `flown-20261009` mark the code that flew on those days.
