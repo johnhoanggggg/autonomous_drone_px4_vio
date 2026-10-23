@@ -1,0 +1,34 @@
+# External source checkouts this stack builds against, pinned to the commits on
+# the drone Pi (2026-10-23). Keys are paths under $HOME, so on a fresh machine:
+#
+#   cd ~ && vcs import < autonomous_drone_px4_vio/deps.repos
+#
+# then per workspace:
+#   ~/ros2_ws                  px4_msgs (v1.17.0) and open_vins. Sourced before ros2_ws/.
+#   ~/depthai_ros_v3_ws        depthai-ros v3.3.0-kilted (reference build).
+#   ~/depthai_v3_feature_ws    depthai-ros v3.2.1-jazzy; `git apply` patches/depthai_ros_driver_v3_feature_tracker_params.patch
+#                              in src/depthai-ros, then colcon build depthai_ros_driver.
+#   ~/depthai_v3_compat_ws     not on GitHub: copy third_party/depthai_ros_msgs_v3 from this repo to its src/
+#                              and colcon build (message-only rebuild against the system Fast-CDR).
+#   ~/depthai_v3_overlay       six ros-jazzy debs unpacked with `dpkg -x` into root/: depthai-v3 3.6.1,
+#                              depthai-{ros-driver,bridge,ros-msgs,descriptions}-v3 3.2.1, backward-ros 1.0.8.
+#                              The .debs are kept in ~/depthai_v3_overlay/debs on the Pi.
+#
+# Source order: README.md, the ros_rtabmap_oak_v3_tracked launch section.
+repositories:
+  ros2_ws/src/px4_msgs:
+    type: git
+    url: https://github.com/PX4/px4_msgs.git
+    version: 86d8239e962f6939e05c3737784f60c02fa884db
+  ros2_ws/src/open_vins:
+    type: git
+    url: https://github.com/rpng/open_vins
+    version: 69488123ed9362dd44b6f28e7f4680abbff1442b
+  depthai_ros_v3_ws/src/depthai-ros:
+    type: git
+    url: https://github.com/luxonis/depthai-ros.git
+    version: 89333065b9b17a80698069240d40a2e640fddc45
+  depthai_v3_feature_ws/src/depthai-ros:
+    type: git
+    url: https://github.com/luxonis/depthai-ros.git
+    version: 59dd172ccac1974c4b14ac12d05090e36836c72d
