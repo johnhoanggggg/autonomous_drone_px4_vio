@@ -34,6 +34,9 @@ ros2_ws/flight_logs/
 *.db3
 *.mcap
 *.params
+# Except the full PX4 parameter backups from scripts/dump_params.py: they are the
+# only record of the FC config before each tuning change, and ~35 KB each.
+!params_backup_*.params
 # MAVProxy drops mav.parm into its working directory automatically. Nothing in
 # this project reads it; the real backups are params_backup_*.params from
 # scripts/dump_params.py (different format). It was committed by accident in the

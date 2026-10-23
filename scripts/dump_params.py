@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
 """Dump all PX4 parameters over MAVLink to a QGC-compatible .params file for backup."""
+import struct
 import sys
 import time
 from datetime import datetime, timezone
 
 from pymavlink import mavutil
+
+# MAV_PARAM_TYPE integer types -> struct code. PX4 encodes integer params
+# bytewise: the float in PARAM_VALUE carries the integer's raw bits, so writing
+# it as a float gives 1.26e-44 for RC_MAP_KILL_SW=9, which QGC loads as 0.
+INT_TYPES = {1: "<B", 2: "<b", 3: "<H", 4: "<h", 5: "<I", 6: "<i"}
+
+
+def format_value(value: float, ptype: int) -> str:
+    if ptype in INT_TYPES:
+        raw = struct.pack("<f", value)
+        size = struct.calcsize(INT_TYPES[ptype])
+        return str(struct.unpack(INT_TYPES[ptype], raw[:size])[0])
+    return repr(value)
 
 
 def main() -> None:
@@ -50,7 +64,7 @@ def main() -> None:
         f.write("# Vehicle Component Name Value Type\n")
         for name in sorted(params.keys()):
             value, ptype, _ = params[name]
-            f.write(f"1\t1\t{name}\t{value}\t{ptype}\n")
+            f.write(f"1\t1\t{name}\t{format_value(value, ptype)}\t{ptype}\n")
 
     print(f"Wrote backup to {out_path}")
 
